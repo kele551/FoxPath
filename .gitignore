@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+build/
+dist/
+logs/
+*.spec
+
+# exe 走 Release 附件, 不进仓库
+*.exe
+*.bak*
+
+# 图标处理过程的临时预览
+_icon_preview.png
+_ref_256.png
+_avatar_preview.png
