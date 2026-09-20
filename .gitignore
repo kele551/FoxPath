@@ -13,3 +13,11 @@ logs/
 _icon_preview.png
 _ref_256.png
 _avatar_preview.png
+_fox_preview.png
+
+# 旧包备份
+*.old-*
+backups/
+
+# 代理状态快照(运行时生成)
+.proxy-backup.json

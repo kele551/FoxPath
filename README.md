@@ -1,8 +1,22 @@
 # 狐径 FoxPath
 
+![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.0-blue)
+
 GitHub 直连助手。本机代理 + PAC，绕过 DNS 和 hosts，直连当前实测可用的 GitHub 官方 IP。
 
 **不用管理员权限，不改 hosts，不改系统 DNS。**
+
+## 目录
+
+- [解决什么问题](#解决什么问题)
+- [原理](#原理)
+- [用法](#用法)
+- [核心机制](#核心机制)
+- [从源码构建](#从源码构建)
+- [已知边界](#已知边界)
+- [版本记录](#版本记录)
+- [联系与反馈](#联系与反馈)
+- [许可](#许可)
 
 ## 解决什么问题
 
@@ -58,9 +72,13 @@ python build_exe.py                   # 打包成 狐径-v1.0.0.exe
 | 文件 | 说明 |
 | --- | --- |
 | `github_direct.py` | 主程序：代理、PAC、体检、控制面板 |
+| `Fix-GitHub.ps1` | PowerShell 版：手动改系统代理 / PAC，适合不跑常驻进程的场景 |
+| `Run-GitHubFix.bat` | 一键拉起 `Fix-GitHub.ps1` |
 | `build_exe.py` | PyInstaller 打包脚本 |
 | `make_icon_from_user_image.py` | 图标生成（抠图 + 圆角底 + 多尺寸 ICO） |
 | `app.ico` | 程序图标 |
+| `release-notes.md` | 发行说明 |
+| `使用说明.txt` | 中文使用说明 |
 
 打包注意：PyInstaller 的 `--clean` 参数在某些受限环境下会因批量删缓存被拦，脚本里已去掉。
 
@@ -69,6 +87,14 @@ python build_exe.py                   # 打包成 狐径-v1.0.0.exe
 - 只代理 `github.com` / `www.github.com`。GitHub 的 CSS/JS/头像在 `githubassets.com`、`githubusercontent.com` 上，这些域名直连本来就通，**走代理反而连不上**，会导致页面只剩裸 HTML、按钮点不动。
 - 不代理 `api.github.com`（本来就通），Git 命令行操作不受影响。
 - 绿色单文件，无需安装；但**不能**用 `nohup ... &` 在 shell 里后台启动，那样命令结束进程会被终止。要常驻就双击运行或开开机自启。
+
+## 版本记录
+
+| 版本 | 日期 | 说明 |
+| --- | --- | --- |
+| v1.0.0 | 2026-09-19 | 首个版本：本地代理 + PAC、每 5 分钟 IP 体检、候选池自动刷新、全灭自愈、退出还原 |
+
+详细发行说明见 [release-notes.md](release-notes.md)。
 
 ## 联系与反馈
 
