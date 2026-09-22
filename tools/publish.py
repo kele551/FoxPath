@@ -14,6 +14,9 @@ GitHub 侧走 `F:\Harness\tools\github_push.py`（纯 API，不用 github.com �
     python tools/publish.py release 1.0.6 --skip-build # 已有 exe，只做发布
     python tools/publish.py release 1.0.6 --notes 文件.md
 
+不带 --notes 时读 release-notes.md，但会校验它首行的版本号与本次要发的版本一致：
+不一致（还是上一版的文案）直接中止，不拿旧文案发新版。
+
 release 依次做:
     ① 改版本号 (github_direct.py 的 APP_VERSION + README 徽章)
     ② 打包 (build_exe.py) -> FoxPath.exe（文件名不带版本号）
@@ -55,6 +58,8 @@ VER_FILES = [
     ('github_direct.py', re.compile(r"(APP_VERSION\s*=\s*')[0-9.]+(')"),
      lambda v: r"\g<1>%s\g<2>" % v),
     ('README.md', re.compile(r'(version-v)[0-9.]+(-blue)'),
+     lambda v: r"\g<1>%s\g<2>" % v),
+    ('publish_files.py', re.compile(r"^(VERSION\s*=\s*'v)[0-9.]+(')", re.M),
      lambda v: r"\g<1>%s\g<2>" % v),
 ]
 
@@ -225,6 +230,37 @@ def verify(ver, assets):
     return ok
 
 
+def load_notes(ver, notes_file=None):
+    """取本次的发布说明。
+
+    优先 --notes 指定的文件；否则读 release-notes.md —— 但那份文件的首行版本号必须与
+    本次要发的版本一致。以前是无条件拿它当文案，于是"忘了带 --notes"就会把上一版的
+    说明发到新版发行页上（张冠李戴）。现在不一致直接中止，宁可停下来也不发错。
+    """
+    if notes_file:
+        p = Path(notes_file)
+        if not p.exists():
+            sys.exit('--notes 指定的文件不存在: %s' % p)
+        return p.read_text(encoding='utf-8')
+
+    rn = REPO_DIR / 'release-notes.md'
+    if not rn.exists():
+        sys.exit('既没有 --notes，也找不到 release-notes.md，无法确定发布说明。\n'
+                 '请补一份 release-notes.md（首行形如「狐径 FoxPath v%s — 标题」）'
+                 '或用 --notes <文件> 指定。' % ver)
+    text = rn.read_text(encoding='utf-8')
+    first = next((l for l in text.splitlines() if l.strip()), '')
+    m = re.search(r'v?(\d+(?:\.\d+)+)', first)
+    if not m:
+        sys.exit('release-notes.md 首行没有版本号（应形如「狐径 FoxPath v%s — 标题」）:\n  %s' % (ver, first))
+    if m.group(1) != ver:
+        sys.exit('release-notes.md 还是 v%s 的文案，本次要发的是 v%s —— 直接发会让发行页挂着旧说明。\n'
+                 '请先把 release-notes.md 改成 v%s 的内容，或用 --notes <文件> 指定。'
+                 % (m.group(1), ver, ver))
+    print('   发布说明: release-notes.md (首行版本 v%s, 与本次一致)' % m.group(1))
+    return text
+
+
 # ---------- 入口 ----------
 def cmd_release(ver, skip_build=False, notes_file=None, with_github=False):
     try:
@@ -236,13 +272,7 @@ def cmd_release(ver, skip_build=False, notes_file=None, with_github=False):
         sys.exit('没有令牌, 先跑: python tools/publish.py set-token <令牌>')
     t0 = time.time()
 
-    notes = None
-    if notes_file:
-        notes = Path(notes_file).read_text(encoding='utf-8')
-    else:
-        rn = REPO_DIR / 'release-notes.md'
-        if rn.exists():
-            notes = rn.read_text(encoding='utf-8')
+    notes = load_notes(ver, notes_file)
 
     bump_version(ver)
     if not skip_build:
