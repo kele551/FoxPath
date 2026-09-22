@@ -47,6 +47,7 @@ TOKEN_CANDIDATES = [
 ]
 PY = r'F:\Harness\toolchain\python\envs\default\Scripts\python.exe'
 GIT_EXEC_PATH = r'F:/Harness/toolchain/PortableGit/versions/1.2.0/mingw64/bin'
+GIT_EXE = GIT_EXEC_PATH + '/git.exe'        # 绝对路径: 有的执行环境按名字找不到 git(WinError 2)
 GH_PUSH = r'F:\Harness\tools\github_push.py'
 EXE_NAME = 'FoxPath.exe'            # version.json 里写的就是这个名字
 
@@ -112,6 +113,9 @@ def run(cmd, cwd=REPO_DIR, check=True):
     e = os.environ.copy()
     e['GIT_EXEC_PATH'] = GIT_EXEC_PATH
     e['PATH'] = GIT_EXEC_PATH.replace('/', os.sep) + os.pathsep + e.get('PATH', '')
+    cmd = list(cmd)
+    if cmd and cmd[0] == 'git':             # 不靠 PATH 找, 直接用绝对路径
+        cmd[0] = GIT_EXE.replace('/', os.sep)
     print('   $', ' '.join(cmd))
     r = subprocess.run(cmd, cwd=str(cwd), env=e,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
