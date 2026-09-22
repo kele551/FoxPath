@@ -128,11 +128,18 @@ def run(cmd, cwd=REPO_DIR, check=True):
 
 def git_commit_push(ver):
     run(['git', 'add', '-A'])
-    run(['git', '-c', 'user.name=kele551', '-c', 'user.email=75219857@qq.com',
-         'commit', '-m', 'release: v%s' % ver])
-    run(['git', 'tag', '-a', 'v%s' % ver, '-m', 'v%s' % ver])
+    if run(['git', 'diff', '--cached', '--name-only']).strip():
+        run(['git', '-c', 'user.name=kele551', '-c', 'user.email=75219857@qq.com',
+             'commit', '-m', 'release: v%s' % ver])
+    else:
+        print('   工作区没有新改动, 跳过本次提交(只补发版)')
+    if not run(['git', 'tag', '-l', 'v%s' % ver]).strip():
+        run(['git', '-c', 'user.name=kele551', '-c', 'user.email=75219857@qq.com',
+             'tag', '-a', 'v%s' % ver, '-m', 'v%s' % ver])   # 打 tag 同样要显式带身份
+        run(['git', 'push', 'origin', 'v%s' % ver])
+    else:
+        print('   tag v%s 已存在, 不重复创建' % ver)
     run(['git', 'push', 'origin', BRANCH])
-    run(['git', 'push', 'origin', 'v%s' % ver])
     print('④ 代码与 tag 已推 Gitee')
 
 
