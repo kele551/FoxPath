@@ -35,7 +35,7 @@ FILES = [
     'create_icon_octocat.py',
 ]
 
-VERSION = 'v1.0.1'      # 提交信息里的版本号, 改版本时同步改这里
+VERSION = 'v1.0.5'      # 提交信息里的版本号, 改版本时同步改这里(已并入 tools/publish.py 的自动改版)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
