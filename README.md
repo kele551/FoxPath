@@ -1,6 +1,8 @@
 # 狐径 FoxPath
 
-![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.1-blue)
+> 作者：**海风（kele551）** · 仓库：https://gitee.com/kele551/FoxPath （GitHub 同名镜像）
+
+![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.5-blue)
 
 GitHub 直连助手。本机代理 + PAC，绕过 DNS 和 hosts，直连当前实测可用的 GitHub 官方 IP。
 
@@ -50,16 +52,31 @@ GitHub 直连助手。本机代理 + PAC，绕过 DNS 和 hosts，直连当前�
 
 ## 用法
 
-1. 从 [Releases](../../releases) 下载 `FoxPath-v1.0.1.exe`
+1. 从 [Releases](../../releases) 下载 `FoxPath.exe`
 2. 双击运行 → 浏览器自动打开控制面板 `http://127.0.0.1:8788/ui`
 3. 勾选「开机自启」即可后台常驻
 
 **首次启动请等 15～20 秒**：程序要并发体检 49 个候选 IP，体检完成前代理还没完全生效。
 
-> 下载文件名故意用 ASCII（`FoxPath-v1.0.1.exe`）。GitHub / Gitee 上传附件时会把中文
+### 控制面板上有什么
+
+控制面板 `http://127.0.0.1:8788/ui`，从上到下四块：
+
+| 区块 | 显示什么 | 能做什么 |
+|---|---|---|
+| **版本与升级** | 当前版本 `=====>` 新版本（没有新版时右边是 `—`） | `检查更新` 问一次升级源；真有新版才出现 `立即升级`。点了以后自动下载 → 校验 SHA256 → 覆盖 exe → 重启，下面一条渐变色进度条跟着走 |
+| **加速状态** | 出口 IP（含延迟）、加速状态（已启用 / 未启用）、上次体检时间 | `启用加速`、`停用并还原`、`立即重测`、`退出并还原`，以及 `开机自启` 勾选框 |
+| **当前可用 IP** | 按延迟排序的可用 IP 表，每 5 分钟自动刷新 | 看当前线路还剩几个能用。一个都没有时会自动重拉官方 IP 表并回退系统 DNS —— 反馈问题时把这栏的数字一起贴上 |
+| **日志** | `foxpath.log` 的尾部，自动滚到最新 | 打不开 GitHub 先看这里 |
+
+> 升级不用手动换文件：新版下完先校验 SHA256，通过后交给一个小助手 ——
+> 让旧程序退出并还原系统代理 → 覆盖 exe → 自动重启。校验不过就放弃，不会留半成品。
+
+> 从 v1.0.3 起文件名不再带版本号（固定 FoxPath.exe），**版本号写进 exe 的属性里**（鼠标悬停或右键-属性-详细信息可见）。
+> 下载文件名故意用 ASCII（`FoxPath.exe`）。GitHub / Gitee 上传附件时会把中文
 > 文件名改坏（实测 `狐径-v1.0.0.exe` 传上去变成了 `-v1.0.0.exe`），所以对外一律用 ASCII 名。
 
-**出过问题想自救**：`FoxPath-v1.0.1.exe --restore` 只做一件事 —— 把系统代理里本程序留下的
+**出过问题想自救**：`FoxPath.exe --restore` 只做一件事 —— 把系统代理里本程序留下的
 PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者你直接把 exe 删了但
 `AutoConfigURL` 还指向 `127.0.0.1:8788`，跑这一条就能收干净。
 
@@ -76,6 +93,8 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
   还原备份固定存在 `%LOCALAPPDATA%\FoxPath\proxy-backup.json`（不再依赖 exe 同级是否可写）；
   备份写不进去时**不会**去改注册表（宁可不开，也不留下无法还原的状态）。
   另有一条 `--restore`：即使备份没了、程序也删了，也能把残留的 PAC 设置收干净。
+- **在线升级**：控制面板最上面那张卡片里检查更新，升级源读仓库的 `version.json`（Gitee raw 优先、GitHub 兜底）；
+  新版下到 `.new`、比对 SHA256 通过后才交给小助手覆盖并重启。程序没有"安装"这一步，升级就是换 exe。
 - **单实例**：用 Windows 命名互斥保证只有一个实例；重复双击不会起两个进程去抢 8787/8788。
 
 ## 从源码构建
@@ -83,7 +102,7 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 ```bash
 pip install pyinstaller
 
-python build_exe.py                   # 打包成 FoxPath-v1.0.1.exe
+python build_exe.py                   # 打包成 FoxPath.exe
 ```
 
 > 图标不用管：`app.ico` 已经入库。仓库里那几个 `create_icon*.py` /
@@ -125,10 +144,16 @@ python build_exe.py                   # 打包成 FoxPath-v1.0.1.exe
 
 ## 版本记录
 
+> 上一次对外发布是 **v1.0.1**；`v1.0.2` ~ `v1.0.5` 是本机迭代版本，未单独发版，改动会一并进下一版发行版。
+
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
 | v1.0.0 | 2026-09-19 | 首个版本：本地代理 + PAC、每 5 分钟 IP 体检、候选池自动刷新、全灭自愈、退出还原 |
 | v1.0.1 | 2026-09-22 | 修「还原不了系统代理」一类缺陷：重复启用不再污染备份、备份失败不再改注册表、静默模式也注册退出还原、加单实例与端口占用提示、日志落文件、新增 `--restore`；`Fix-GitHub.ps1` 补 UTF-8 BOM（此前无法运行）；打包脚本改为 ASCII 产物名 + 版本号单一来源；修正文档与实现不一致之处 |
+| v1.0.2 | 2026-09-22 | 修「双击没反应」：程序已在后台时，第二次双击改为**直接打开正在运行的控制面板**再退出（以前只写一行日志就静默退出，用户以为程序坏了） |
+| v1.0.3 | 2026-09-22 | 重做图标（去白底卡片、清掉残留边框、裁到狐狸本体居中放大，重出七档尺寸）；产物改名 `FoxPath.exe` 不带版本号，版本号写进 exe 属性 |
+| v1.0.4 | 2026-09-22 | 加作者署名（源码文件头、控制面板底部、日志、exe 属性、README 统一为「海风（kele551）」）；README 里的私人邮箱换成 Issues 链接 |
+| v1.0.5 | 2026-09-22 | **网页版在线升级**：控制面板里检查更新、版本迁移动画 + 渐变色进度条，下载到 `.new` 校验 SHA256 后由独立小助手接管（先让旧程序退出并还原系统代理 → 覆盖 → 重启） |
 
 详细发行说明见 [release-notes.md](release-notes.md)。
 
@@ -136,7 +161,7 @@ python build_exe.py                   # 打包成 FoxPath-v1.0.1.exe
 
 遇到打不开、体检全灭、或者觉得哪里不好用，欢迎直接邮件反馈，我会看：
 
-**75219857@qq.com**
+[仓库 Issues](https://gitee.com/kele551/FoxPath/issues)
 
 反馈时如果能顺手附上控制面板里「可用 IP」那一栏的数字，定位会快很多。
 
