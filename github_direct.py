@@ -33,6 +33,7 @@ hosts 还要管理员权限。
 
 import atexit
 import ctypes
+import ipaddress
 import json
 import os
 import queue
@@ -40,7 +41,6 @@ import select
 import socket
 import socketserver
 import ssl
-import subprocess
 import sys
 import threading
 import time
@@ -50,10 +50,15 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = '狐径'
-APP_VERSION = '1.0.0'
+APP_VERSION = '1.0.1'
 PROXY_PORT = 8787
 PANEL_PORT = 8788
 CHECK_INTERVAL = 300          # 5 分钟重测一轮
+
+# PAC 只代理这两个主机；代理内部也用同一份名单，保证"PAC 会送来的"和
+# "代理愿意走 IP 池的"完全一致。githubassets/githubusercontent/api.github.com
+# 一律 DIRECT —— 它们直连本来就通，走代理反而会坏（见 README 已知边界）。
+PROXY_HOSTS = ('github.com', 'www.github.com')
 
 # GitHub 官方 IP 池。140.82.112.0/20 是 GitHub 主站段, 20.x 那几个是官方
 # 在 api.github.com/meta 里单独列出的 web 地址。启动时会联网补充 /meta。
@@ -68,17 +73,63 @@ CANDIDATE_IPS = [
     '20.201.28.151',
 ]
 
-GITHUB_SUFFIXES = ('github.com',)
-
 REG_INTERNET = r'Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 REG_RUN = r'Software\Microsoft\Windows\CurrentVersion\Run'
 
 _log_q = queue.Queue()
 
 
+def alert(title, text):
+    """exe 是 --noconsole 的: 致命错误只写日志的话, 用户双击后看到的是"没反应"。
+    有控制台时不弹窗(免得命令行下被打断), 只在冻结的 exe 或没有 stdout 时弹。"""
+    try:
+        if getattr(sys, 'frozen', False) or sys.stdout is None:
+            ctypes.windll.user32.MessageBoxW(None, text, title, 0x10)   # MB_ICONERROR
+    except Exception:
+        pass
+
+
+def _data_dir():
+    """本程序自己的数据目录: %LOCALAPPDATA%\\FoxPath。
+
+    以前备份和日志都写在 exe 同级, 而 exe 可能被放在只读目录、U 盘或
+    Program Files 下 —— 备份写失败时旧代码是静默 continue, 于是退出时
+    还原不了系统代理, 注册表里就留下一个指向死端口的 PAC。
+    (2026-09-22 实测: 程序已删除, AutoConfigURL 仍指向 127.0.0.1:8788/pac)
+    """
+    base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+    d = os.path.join(base, 'FoxPath')
+    try:
+        os.makedirs(d, exist_ok=True)
+        return d
+    except Exception:
+        return os.path.expanduser('~')
+
+
+DATA_DIR = _data_dir()
+LOG_FILE = os.path.join(DATA_DIR, 'foxpath.log')
+BACKUP_FILE = os.path.join(DATA_DIR, 'proxy-backup.json')
+LOG_MAX = 512 * 1024
+
+
+def _log_to_file(line):
+    """exe 是 --noconsole 的, 屏幕上看不到任何东西; 日志必须落文件。"""
+    try:
+        if os.path.isfile(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX:
+            with open(LOG_FILE, 'r', encoding='utf-8', errors='replace') as f:
+                tail = f.readlines()[-500:]
+            with open(LOG_FILE, 'w', encoding='utf-8') as f:
+                f.writelines(tail)
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+    except Exception:
+        pass
+
+
 def log(msg):
-    line = '[%s] %s' % (time.strftime('%H:%M:%S'), msg)
+    line = '[%s] %s' % (time.strftime('%Y-%m-%d %H:%M:%S'), msg)
     _log_q.put(line)
+    _log_to_file(line)
     try:
         print(line, flush=True)
     except Exception:
@@ -96,8 +147,14 @@ def recent_logs(n=200):
 
 
 def is_github_host(host):
+    """只认 PAC 会送来的那两个主机(精确匹配)。
+
+    旧版是 endswith('.github.com') —— 那会把 api.github.com / gist.github.com
+    也当成"该走 IP 池"的, 而候选池里全是 **web** 段地址, 拿它去连 api 是不对的。
+    现在与 PAC 用同一份 PROXY_HOSTS, 名单只有一个来源。
+    """
     host = (host or '').lower().split(':')[0]
-    return any(host == s or host.endswith('.' + s) for s in GITHUB_SUFFIXES)
+    return host in PROXY_HOSTS
 
 
 # ------------------------------------------------------------------- 注册表
@@ -158,7 +215,7 @@ class Health(object):
                     return None
                 # TLS 握手通了还不够: 某些 IP 的证书对, 但只跑 API/CDN,
                 # 直接访问 github.com 会返回 4xx, 这种不能要。
-                # 这里用 HEAD 试一发; 如果 HTTP 测试自己超时(偶尔发生),
+                # 这里发一发 GET /; 如果 HTTP 测试自己超时(偶尔发生),
                 # 不因此判死, 毕竟 TLS 已经验证通过, 但返回 4xx/5xx 就判死。
                 try:
                     s.settimeout(2.0)
@@ -169,7 +226,9 @@ class Health(object):
                         parts = first.split()
                         if len(parts) >= 2:
                             status = parts[1]
-                            if status.startswith(b'4') or status.startswith(b'5'):
+                            # README 写的是"必须返回 2xx/3xx", 这里也照此收紧:
+                            # 只拒 4xx/5xx 的话, 1xx 和畸形状态码会被放进来。
+                            if not (status.startswith(b'2') or status.startswith(b'3')):
                                 return None
                 except (socket.timeout, TimeoutError, OSError):
                     pass
@@ -223,9 +282,17 @@ def fetch_official_ips():
             data = json.loads(r.read().decode('utf-8'))
         ips = []
         for cidr in data.get('web', []):
-            ip = cidr.split('/')[0]
-            if ':' not in ip and (ip.count('.') == 3):
-                ips.append(ip)
+            # 只取 IPv4 网段的**第一个可用主机地址**。旧代码是 cidr.split('/')[0],
+            # 对 140.82.112.0/20 拿到的是网段地址 140.82.112.0 —— 它永远探测失败,
+            # 白占一个并发名额。
+            try:
+                net = ipaddress.ip_network(cidr, strict=False)
+            except ValueError:
+                continue
+            if net.version != 4:
+                continue
+            first = next(net.hosts(), None) or net.network_address
+            ips.append(str(first))
         for third in (112, 113, 114, 115, 116):
             for last in (3, 4):
                 ips.append('140.82.%d.%d' % (third, last))
@@ -400,53 +467,115 @@ class ProxyHandler(socketserver.StreamRequestHandler):
 
 
 class ProxyServer(socketserver.ThreadingTCPServer):
+    # Windows 上 SO_REUSEADDR 允许**第二个** socket 抢占同一端口, 行为未定义;
+    # 正常情况下应该用 SO_EXCLUSIVEADDRUSE 让第二个实例直接失败。这里靠
+    # 下面的 single_instance() 命名互斥来保证只有一个实例, 更直接。
     allow_reuse_address = True
     daemon_threads = True
 
 
+def single_instance():
+    """Windows 命名互斥: 已经有一个在跑就返回 False。
+
+    没有这道闸时, 连点两次 exe 会起两个实例, 两个都去 bind 8787/8788,
+    还会各写一遍注册表 —— 退出哪个、还原到哪一份都是随机的。
+    """
+    if os.name != 'nt':
+        return True
+    try:
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.CreateMutexW(None, False, 'Local\\FoxPath_SingleInstance')
+        if ctypes.get_last_error() == 183:      # ERROR_ALREADY_EXISTS
+            return False
+        return True
+    except Exception:
+        return True
+
+
 def start_proxy():
-    srv = ProxyServer(('127.0.0.1', PROXY_PORT), ProxyHandler)
+    try:
+        srv = ProxyServer(('127.0.0.1', PROXY_PORT), ProxyHandler)
+    except OSError as e:
+        log('!! 端口 %d 被占用, 代理起不来: %s' % (PROXY_PORT, e))
+        tip = ('多半是上一个狐径没退干净。请在任务管理器结束它, 或先跑一次:\n'
+               '    %s --restore' % os.path.basename(
+                   sys.executable if getattr(sys, 'frozen', False) else __file__))
+        log('   ' + tip.replace('\n', ' '))
+        alert('狐径: 端口被占用', '本机 %d 端口已被占用, 狐径起不来。\n\n%s\n\n日志: %s'
+              % (PROXY_PORT, tip, LOG_FILE))
+        raise SystemExit(2)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     log('代理已启动 127.0.0.1:%d' % PROXY_PORT)
 
 
 # ------------------------------------------------------------------- 开关
 
-def _backup_file():
+def _legacy_backup_file():
+    """v1.0.0 曾把备份写在 exe 同级(.proxy-backup.json), 仍兼容读取一次。"""
     if getattr(sys, 'frozen', False):
         base = os.path.dirname(sys.executable)
     else:
         base = os.path.dirname(os.path.abspath(__file__))
-    if not os.access(base, os.W_OK):
-        base = os.path.join(os.path.expanduser('~'), 'GitHubDirectFix')
-        os.makedirs(base, exist_ok=True)
     return os.path.join(base, '.proxy-backup.json')
 
 
+def _load_backup():
+    for p in (BACKUP_FILE, _legacy_backup_file()):
+        try:
+            with open(p, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            continue
+    return None
+
+
 def enable_proxy():
+    # 已经在启用状态就不要再"备份"一次 —— 否则备份里存的会是我们自己的
+    # PAC 地址, 之后「停用并还原」只会把我们的地址写回去, 等于永远还原不了。
+    # (旧版每次点「启用加速」都会覆盖备份, 这是最容易复现的一处缺陷。)
+    if proxy_on():
+        log('加速已处于启用状态, 不重复备份 / 不改写')
+        return True
     saved = {
         'AutoConfigURL': reg_get(REG_INTERNET, 'AutoConfigURL'),
         'ProxyEnable': reg_get(REG_INTERNET, 'ProxyEnable'),
         'ProxyServer': reg_get(REG_INTERNET, 'ProxyServer'),
     }
     try:
-        with open(_backup_file(), 'w', encoding='utf-8') as f:
+        with open(BACKUP_FILE, 'w', encoding='utf-8') as f:
             json.dump(saved, f, ensure_ascii=False)
-    except Exception:
-        pass
+    except Exception as e:
+        # 备份写不进去就绝不改注册表 —— 否则退出时无法还原, 用户会被留在
+        # "PAC 指向死端口"的状态里(这正是 v1.0.0 踩过的坑)。
+        log('!! 无法保存还原备份(%s), 为安全起见不改系统代理' % e)
+        return False
+    if saved.get('ProxyEnable') and saved.get('ProxyServer'):
+        # 一旦设置了 PAC, WinINET 会优先用它, 静态代理(ProxyEnable=1)就被旁路了。
+        # 家用场景一般没有静态代理; 万一有, 至少要让用户知道发生了什么。
+        log('注意: 你原本设了静态代理 %s —— 启用期间 PAC 优先级更高, '
+            '其它网站会直连而不是走原代理; 停用时会自动还原'
+            % saved.get('ProxyServer'))
     reg_set(REG_INTERNET, 'AutoConfigURL', 'http://127.0.0.1:%d/pac' % PANEL_PORT)
     notify_proxy_change()
-    log('加速已开启')
+    log('加速已开启 (原设置已备份到 %s)' % BACKUP_FILE)
     return True
 
 
 def disable_proxy():
-    saved = {}
-    try:
-        with open(_backup_file(), 'r', encoding='utf-8') as f:
-            saved = json.load(f)
-    except Exception:
-        pass
+    saved = _load_backup()
+    if saved is None:
+        # 没有备份时要分两种情况, 不能一律删:
+        #   a) 当前值确实指向本程序 -> 是本程序留下的残留, 清掉(用户删程序后
+        #      系统里永远是死端口的 PAC, 2026-09-22 实测就是这种状态);
+        #   b) 当前值指向别处(公司 PAC / 其它工具下发的) -> **保持原样**。
+        #      那份地址我们既没备份也无从得知, 删了就永久回不来。
+        if not proxy_on():
+            log('没有还原备份, 且当前系统代理不是本程序所设 —— 保持原样, 不做任何修改')
+            return False
+        log('没有找到还原备份, 只清掉本程序的 PAC 设置(原值已无从得知)')
+        saved = {}
     reg_set(REG_INTERNET, 'AutoConfigURL', saved.get('AutoConfigURL') or None)
     if saved.get('ProxyServer'):
         reg_set(REG_INTERNET, 'ProxyServer', saved['ProxyServer'])
@@ -489,7 +618,7 @@ def autostart_on():
 
 PANEL_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
-<title>狐径 FoxPath v1.0.0</title>
+<title>狐径 FoxPath __VERSION__</title>
 <style>
  *{box-sizing:border-box}
  body{margin:0;padding:28px;background:#fff;color:#1a1a1a;
@@ -515,7 +644,7 @@ PANEL_HTML = """<!doctype html>
  pre{background:#f8fafc;border:1px solid #e5e7eb;border-radius:6px;padding:12px;
      height:190px;overflow:auto;font:12px/1.7 Consolas,monospace;margin:0;color:#374151}
 </style></head><body>
-<h1>狐径 FoxPath v1.0.0</h1>
+<h1>狐径 FoxPath __VERSION__</h1>
 <div class="sub">本机代理接管 GitHub 流量，直连当前实测可用的官方 IP。不改 hosts、不用管理员权限。</div>
 
 <div class="card">
@@ -576,6 +705,9 @@ refresh(); setInterval(refresh,3000);
 """
 
 
+PANEL_PAGE = PANEL_HTML.replace('__VERSION__', APP_VERSION)
+
+
 class PanelHandler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -596,7 +728,7 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._send(200, (PAC_TEMPLATE % PROXY_PORT).encode('ascii'),
                        'application/x-ns-proxy-autoconfig')
         elif path in ('/', '/ui'):
-            self._send(200, PANEL_HTML.encode('utf-8'))
+            self._send(200, PANEL_PAGE.encode('utf-8'))
         elif path == '/api/status':
             good, ts = HEALTH.snapshot()
             data = {
@@ -613,7 +745,28 @@ class PanelHandler(BaseHTTPRequestHandler):
         else:
             self._send(404, b'not found')
 
+    def _same_origin(self):
+        """只接受来自本机面板页面的请求。
+
+        面板虽然只监听 127.0.0.1, 但**任何本机程序或网页**都能往这个端口发 POST
+        (简单请求不触发预检)。校验 Host 与 Origin, 挡掉网页 CSRF 与 DNS rebinding ——
+        否则一个恶意页面就能把加速关掉, 甚至在无备份时清掉用户的 PAC。
+        """
+        host = (self.headers.get('Host') or '').lower()
+        if host not in ('127.0.0.1:%d' % PANEL_PORT, 'localhost:%d' % PANEL_PORT):
+            return False
+        origin = self.headers.get('Origin')
+        if not origin:
+            return True          # 同源 fetch 有些浏览器不带 Origin; Host 已经校验过
+        o = origin.lower()
+        return (o == 'http://127.0.0.1:%d' % PANEL_PORT
+                or o == 'http://localhost:%d' % PANEL_PORT)
+
     def do_POST(self):
+        if not self._same_origin():
+            log('已拒绝一个非同源的面板请求(Host/Origin 校验未通过)')
+            self._send(403, b'forbidden', 'text/plain; charset=utf-8')
+            return
         path = self.path.split('?')[0]
         query = self.path.split('?')[1] if '?' in self.path else ''
         if path == '/api/enable':
@@ -636,23 +789,17 @@ class PanelHandler(BaseHTTPRequestHandler):
 
 
 def start_panel():
-    srv = ThreadingHTTPServer(('127.0.0.1', PANEL_PORT), PanelHandler)
+    try:
+        srv = ThreadingHTTPServer(('127.0.0.1', PANEL_PORT), PanelHandler)
+    except OSError as e:
+        log('!! 端口 %d 被占用, 控制面板起不来: %s' % (PANEL_PORT, e))
+        alert('狐径: 端口被占用', '本机 %d 端口已被占用, 控制面板起不来。\n\n'
+              '多半是上一个狐径没退干净, 请在任务管理器结束它。\n\n日志: %s'
+              % (PANEL_PORT, LOG_FILE))
+        raise SystemExit(2)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     log('控制面板 http://127.0.0.1:%d' % PANEL_PORT)
     return srv
-
-
-_last_meta_ts = [0.0]
-META_TTL = 6 * 3600      # 官方 IP 表最多缓存 6 小时
-
-
-def refresh_meta(force=False):
-    """需要时重拉 api.github.com/meta。返回本轮候选池。"""
-    global _last_meta_ts
-    if force or (time.time() - _last_meta_ts[0]) > META_TTL:
-        if fetch_official_ips():
-            _last_meta_ts[0] = time.time()
-    return CANDIDATES
 
 
 def health_loop():
@@ -690,22 +837,57 @@ def on_exit():
 
 def main():
     args = [a.lower() for a in sys.argv[1:]]
-    log('%s v%s 启动' % (APP_NAME, APP_VERSION))
+    log('%s v%s 启动 (日志: %s)' % (APP_NAME, APP_VERSION, LOG_FILE))
+
+    # 只做还原, 不起代理/面板 —— 用于"程序已经删了 / 起不来, 但注册表里
+    # 还留着指向 127.0.0.1:8788 的 PAC"这种死局的一键自救。
+    if ('--restore' in args) or ('--repair' in args):
+        log('只做还原: 清理本程序的系统代理设置')
+        disable_proxy()
+        return
+
+    # 焊死历史坑: PAC 模板必须是纯 ASCII。带上中文注释后 encode('ascii') 会抛
+    # UnicodeEncodeError -> /pac 返回 500 -> 浏览器拿不到 PAC -> 加速完全失效,
+    # 而且症状是"页面能开、按钮点不动", 极难定位。
+    try:
+        PAC_TEMPLATE.encode('ascii')
+    except UnicodeEncodeError as e:
+        # 只记日志是不够的: 那样程序照常启用 PAC, /pac 却因 encode('ascii') 抛异常
+        # 返回 500, 浏览器拿不到 PAC, 症状是"网页能开但按钮点不动", 极难定位。
+        # 所以这里直接拒绝启动。
+        msg = ('PAC 模板含非 ASCII 字符(位置 %d)。\n\n'
+               '这会让 /pac 接口返回 500, 浏览器取不到 PAC, 加速完全失效。\n'
+               '请把 PAC_TEMPLATE 里的注释改回英文后重新打包。' % e.start)
+        log('!! ' + msg.replace('\n', ' '))
+        alert('狐径: 内部错误', msg)
+        raise SystemExit(3)
+
+    if not single_instance():
+        log('已有实例在运行, 本次直接退出(不动系统代理)')
+        return
+
     start_proxy()
     start_panel()
     fetch_official_ips()
     threading.Thread(target=health_loop, daemon=True).start()
 
     if '--silent' in args:
+        # 静默模式(开机自启用)以前**没有**注册退出还原 —— 这正是"程序关了,
+        # PAC 却留在注册表里"的根因。现在两种模式都注册。
+        atexit.register(on_exit)
         if not proxy_on():
             enable_proxy()
+        elif _load_backup() is None:
+            log('注意: 系统代理已指向本程序, 但没有还原备份 —— 退出时会直接清除该 PAC')
         log('静默模式, 每 5 分钟自动体检')
         while True:
             time.sleep(60)
     else:
+        atexit.register(on_exit)
         if not proxy_on():
             enable_proxy()
-        atexit.register(on_exit)
+        elif _load_backup() is None:
+            log('注意: 系统代理已指向本程序, 但没有还原备份 —— 退出时会直接清除该 PAC')
         try:
             webbrowser.open('http://127.0.0.1:%d/ui' % PANEL_PORT)
         except Exception:
@@ -720,4 +902,14 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        import traceback
+        tb = traceback.format_exc()
+        log('启动/运行失败:\n' + tb)
+        alert('狐径: 启动失败', '程序启动时出错, 已写入日志:\n%s\n\n%s'
+              % (LOG_FILE, tb[-800:]))
+        raise

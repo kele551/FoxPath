@@ -1,10 +1,14 @@
-狐径 FoxPath v1.0.0 用法
+狐径 FoxPath v1.0.1 用法
 =======================
 
-1. 双击「狐径-v1.0.0.exe」运行
+1. 双击「FoxPath-v1.0.1.exe」运行
    - 会自动打开浏览器控制面板 http://127.0.0.1:8788/ui
-   - 会自动把系统代理设成自带的 PAC(只影响 github.com / githubusercontent.com / githubassets.com)
+   - 会自动把系统代理设成自带的 PAC, 只接管 github.com / www.github.com 两个域名
+     (githubassets.com / githubusercontent.com / api.github.com 保持直连 —— 它们本来就通,
+      走代理反而会让页面样式脚本加载失败、按钮点不动)
    - 其他网站完全走原路线, 不受影响
+   - 屏幕上看不到窗口是正常的: exe 没有控制台, 日志写在
+     %LOCALAPPDATA%\FoxPath\foxpath.log
 
 2. 控制面板按钮
    - 启用加速 / 停用并还原：手动控制 PAC
@@ -14,14 +18,35 @@
 
 3. 工作原理
    - 本机监听 127.0.0.1:8787 作为 HTTP/HTTPS 代理
-   - 只代理 GitHub 相关域名，其余域名 PAC 返回 DIRECT
+   - 只代理 github.com / www.github.com 两个域名，其余域名 PAC 返回 DIRECT
    - 每 5 分钟重测一次 GitHub 官方 IP，挑能 TLS 握手 + HTTP 首包正常的写进候选表
    - 连接时优先用候选表里的 IP 直连；候选表全灭时，会重拉官方 IP 表并回退到系统 DNS
 
 4. 卸载
    - 运行一次后点「退出并还原」
    - 勾了「开机自启」的话再点一次取消
-   - 删除本目录即可，没有任何安装残留
+   - 卸载会留下什么见第 8 节; 本程序不写系统目录, 删掉本目录即可
+   - 万一 exe 已经删掉、系统代理却还指着本程序, 用这条命令收尾:
+       FoxPath-v1.0.1.exe --restore
+     (只清掉本程序写进系统的代理设置, 不起代理、不开面板)
 
-5. 版本号
-   v1.0.0 — 2026-09-19
+5. 如果打不开 GitHub
+   - 先看日志 %LOCALAPPDATA%\FoxPath\foxpath.log
+   - 控制面板「可用 IP」那栏如果是空的, 说明当前线路一个候选 IP 都不通,
+     程序会自动重拉官方 IP 表并回退系统 DNS(等于没装本程序)
+
+6. 版本号
+   v1.0.1 — 2026-09-22
+   v1.0.0 — 2026-09-19 首个版本
+
+7. 注意: 本目录里还有一个旧版的 Run-GitHubFix.bat
+   - 那是**另一套做法**, 和上面这个 exe 无关: 它直接改系统 hosts 文件 + 装计划任务,
+     需要管理员权限(会弹 UAC), 会修改 C:\Windows\System32\drivers\etc\hosts
+   - 两套方案二选一, 别同时用; 只想用推荐方案的话, 不用理它
+   - 如果之前跑过它, 用 Fix-GitHub.ps1 -Uninstall 收尾(现在会一并清理 hosts 里的自动段)
+
+8. 卸载会留下什么
+   - 勾过开机自启的, 先在面板里取消(会删掉 HKCU 注册表的 Run 项)
+   - 程序自己会清掉系统代理设置; 如果没清干净(比如被强制结束), 跑一次 --restore
+   - 数据目录 %LOCALAPPDATA%\FoxPath\ 里只有日志和一份代理还原备份, 可以整个删掉
+   - 最后删掉 exe 所在目录即可

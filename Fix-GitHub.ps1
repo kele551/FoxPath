@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
     GitHubDirectFix - GitHub 直连 IP 自动维护工具
 
@@ -162,10 +162,64 @@ function Measure-GitHubIps {
 
 # ---------------------------------------------------------------- hosts 读写
 
+function Read-HostsLines {
+    # hosts 可能是 UTF-8(带/不带 BOM), 也可能是本机 ANSI(中文 Windows 上是 GBK)
+    # 写的中文注释。**一律按 UTF-8 读会把 GBK 内容读成 U+FFFD, 再写回就永久损坏了。**
+    # 所以按字节嗅探编码, 并把结论带出去供写回时使用。
+    $bytes = [System.IO.File]::ReadAllBytes($HostsPath)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        $txt = [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+        return [pscustomobject]@{ Lines = ($txt -split "`r?`n"); Enc = 'utf8bom' }
+    }
+    $txt = [System.Text.Encoding]::UTF8.GetString($bytes)
+    if ($txt.IndexOf([char]0xFFFD) -lt 0) {
+        return [pscustomobject]@{ Lines = ($txt -split "`r?`n"); Enc = 'utf8' }
+    }
+    $txt = [System.Text.Encoding]::Default.GetString($bytes)
+    return [pscustomobject]@{ Lines = ($txt -split "`r?`n"); Enc = 'ansi' }
+}
+
+function Write-HostsLines {
+    param([string[]]$Lines, [string]$Enc)
+    $text = ($Lines -join "`r`n") + "`r`n"
+    switch ($Enc) {
+        'utf8bom' { [System.IO.File]::WriteAllText($HostsPath, $text, (New-Object System.Text.UTF8Encoding($true))) }
+        'utf8'    { [System.IO.File]::WriteAllText($HostsPath, $text, (New-Object System.Text.UTF8Encoding($false))) }
+        default   { [System.IO.File]::WriteAllText($HostsPath, $text, [System.Text.Encoding]::Default) }
+    }
+}
+
+function Remove-HostsBlock {
+    # -Uninstall 以前只删计划任务, **hosts 里的自动段和被接管的行全部留在系统里**,
+    # 钉死的 IP 继续生效。这里把自动段删掉, 并把被接管的行还原。
+    if (-not (Test-Path $HostsPath)) { return 0 }
+    $h = Read-HostsLines
+    $out = New-Object System.Collections.Generic.List[string]
+    $inBlock = $false; $removed = 0; $restored = 0
+    foreach ($l in $h.Lines) {
+        if ($l.Trim() -eq $BlockBegin) { $inBlock = $true; continue }
+        if ($l.Trim() -eq $BlockEnd)   { $inBlock = $false; continue }
+        if ($inBlock) { $removed++; continue }
+        $m = [regex]::Match($l, '^\s*#\s*\[taken over by GitHubDirectFix\]\s*(.+)$')
+        if ($m.Success) { $out.Add($m.Groups[1].Value); $restored++; continue }
+        $out.Add($l)
+    }
+    while ($out.Count -gt 0 -and $out[$out.Count - 1].Trim() -eq '') { $out.RemoveAt($out.Count - 1) }
+    if ($removed -gt 0 -or $restored -gt 0) {
+        $null = Backup-HostsFile
+        Write-HostsLines $out.ToArray() $h.Enc
+        try { Clear-DnsClientCache -ErrorAction Stop } catch { }
+        Write-AppLog ("已从 hosts 移除自动段 $removed 行, 还原被接管的绑定 $restored 行")
+    } else {
+        Write-AppLog 'hosts 里没有本程序留下的内容, 无需清理'
+    }
+    return ($removed + $restored)
+}
+
 function Get-CurrentPins {
     $pins = @()
     if (-not (Test-Path $HostsPath)) { return $pins }
-    foreach ($l in (Get-Content -Path $HostsPath -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+    foreach ($l in (Read-HostsLines).Lines) {
         if ($l -match '^\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s+(.+?)\s*$') {
             $names = $Matches[2] -split '\s+' | Where-Object { $_ }
             if ($names -contains 'github.com') {
@@ -179,7 +233,9 @@ function Get-CurrentPins {
 function Update-HostsFile {
     param([string[]]$Ips)
 
-    $lines = Get-Content -Path $HostsPath -Encoding UTF8 -ErrorAction SilentlyContinue
+    $hosts = Read-HostsLines
+    $enc   = $hosts.Enc
+    $lines = $hosts.Lines
     $out   = New-Object System.Collections.Generic.List[string]
     $inBlock  = $false
     $tookOver = 0
@@ -211,8 +267,9 @@ function Update-HostsFile {
     $out.Add($BlockEnd)
 
     $bak = Backup-HostsFile
-    # hosts 用 ASCII 写, 防止中文注释被其他工具写成乱码
-    [System.IO.File]::WriteAllLines($HostsPath, $out, (New-Object System.Text.UTF8Encoding($false)))
+    # 按**读进来时的编码**写回。旧代码固定用 UTF-8 写, 注释还说"用 ASCII 写" ——
+    # 两者都不对: GBK 的 hosts 会被永久改成乱码。
+    Write-HostsLines $out.ToArray() $enc
 
     try { Clear-DnsClientCache -ErrorAction Stop } catch { }
     try { & "$env:SystemRoot\System32\ipconfig.exe" /flushdns | Out-Null } catch { }
@@ -222,26 +279,55 @@ function Update-HostsFile {
 
 # ---------------------------------------------------------------- 计划任务
 
+function Invoke-SchTasks {
+    # 跑 schtasks 并把输出记进日志, 返回退出码。
+    # !! 必须临时把 ErrorActionPreference 降成 Continue !!
+    # 本机实测(PS 5.1.26100): schtasks 的报错走 stderr, 经 2>&1 合并后变成
+    # ErrorRecord, 在 EAP='Stop' 下**第一行就抛 RemoteException** —— 后面的
+    # 日志和"退出码 N"判断统统执行不到。表现就是: 点了没反应,
+    # GUI 里那句"安装失败, 需要用管理员身份运行。"永远不弹。
+    param([string[]]$Arguments)
+    $savedEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out  = & "$env:SystemRoot\System32\schtasks.exe" @Arguments 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedEAP
+    }
+    foreach ($o in @($out)) { Write-AppLog ('schtasks: ' + $o) }
+    return $code
+}
+
 function Install-Schedule {
     $ps1  = Join-Path $AppDir 'Fix-GitHub.ps1'
     $tr   = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Fix -Silent' -f $ps1
-    $args = @('/Create', '/TN', $TaskName, '/TR', $tr, '/SC', 'MINUTE', '/MO', '15', '/RL', 'HIGHEST', '/F')
-    & "$env:SystemRoot\System32\schtasks.exe" $args 2>&1 | ForEach-Object { Write-AppLog "schtasks: $_" }
-    if ($LASTEXITCODE -eq 0) {
+    # 变量别叫 $args —— 那是 PowerShell 的自动变量(功能上没坏, 但会被分析器报).
+    $schtasksArgs = @('/Create', '/TN', $TaskName, '/TR', $tr, '/SC', 'MINUTE', '/MO', '15', '/RL', 'HIGHEST', '/F')
+    if ($ps1 -match '\s') {
+        # PS 5.1 给原生程序传含空格的参数时不会转义内层引号, /TR 会被拆成两段
+        # (实测: 路径含空格时接收方 argv 变成 2 个), 计划任务装不上。
+        Write-AppLog ('警告: 脚本路径含空格(' + $ps1 + '), 计划任务很可能装不上 —— 请把整个目录挪到不含空格的路径(例如 D:\FoxPath)再试')
+    }
+    $code = Invoke-SchTasks -Arguments $schtasksArgs
+    if ($code -eq 0) {
         Write-AppLog "计划任务已安装: 每 15 分钟自动维护一次"
         return $true
     }
-    Write-AppLog "计划任务安装失败, 退出码 $LASTEXITCODE (需要管理员权限)"
+    Write-AppLog "计划任务安装失败, 退出码 $code (需要管理员权限)"
     return $false
 }
 
 function Uninstall-Schedule {
-    & "$env:SystemRoot\System32\schtasks.exe" /Delete /TN $TaskName /F 2>&1 | ForEach-Object { Write-AppLog "schtasks: $_" }
-    if ($LASTEXITCODE -eq 0) {
+    $code = Invoke-SchTasks -Arguments @('/Delete', '/TN', $TaskName, '/F')
+    # 光删任务不够: -Fix 往 hosts 里写过自动段、也接管过手写绑定。
+    # 以前 -Uninstall 完全不碰它们, 于是"卸载"之后 IP 还被钉在系统里。
+    $null = Remove-HostsBlock
+    if ($code -eq 0) {
         Write-AppLog '计划任务已移除'
         return $true
     }
-    Write-AppLog "移除失败, 退出码 $LASTEXITCODE"
+    Write-AppLog "移除失败, 退出码 $code"
     return $false
 }
 
@@ -398,8 +484,10 @@ function Show-Gui {
 
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 
-if ($Uninstall) { Uninstall-Schedule; exit 0 }
-if ($Install)   { Install-Schedule;   exit 0 }
+# 退出码要能反映结果: 以前四个分支一律 exit 0, 调用方(和脚本外的批处理)
+# 拿不到任何失败信号。
+if ($Uninstall) { if (Uninstall-Schedule) { exit 0 } else { exit 1 } }
+if ($Install)   { if (Install-Schedule)   { exit 0 } else { exit 2 } }
 if ($Fix)       { $null = Invoke-Fix;  exit 0 }
 if ($Status)    { Get-StatusText | Write-Host; exit 0 }
 

@@ -1,10 +1,14 @@
 # 狐径 FoxPath
 
-![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.0-blue)
+![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.1-blue)
 
 GitHub 直连助手。本机代理 + PAC，绕过 DNS 和 hosts，直连当前实测可用的 GitHub 官方 IP。
 
-**不用管理员权限，不改 hosts，不改系统 DNS。**
+**主程序（`github_direct.py` / 发布的 exe）不用管理员权限，不改 hosts，不改系统 DNS。**
+
+> 仓库里另有一个**互不相干的旧版方案** `Fix-GitHub.ps1`（配合 `Run-GitHubFix.bat`）：
+> 它走的是完全不同的路子 —— 直接改系统 `hosts` 文件 + 装一个计划任务定时换 IP，
+> **需要管理员权限，会改 hosts**。两套方案二选一，别同时用。详见下方文件表。
 
 ## 目录
 
@@ -42,15 +46,25 @@ GitHub 直连助手。本机代理 + PAC，绕过 DNS 和 hosts，直连当前�
 | 改 hosts（要管理员、IP 死了就失效） | 本机代理 + PAC，写在 HKCU，普通用户权限即可 |
 | 依赖系统 DNS 解析 | 不查 DNS，直连实测能用的官方 IP |
 | IP 失效后彻底打不开 | 每 5 分钟重测一轮，死 IP 自动换 |
-| 程序退出后系统代理指向空端口，比原来更糟 | PAC 写了 `PROXY ...; DIRECT` 兜底，退出自动还原 |
+| 程序退出后系统代理指向空端口，比原来更糟 | 退出/点「退出并还原」都会还原；PAC 带 `DIRECT` 兜底；还有 `--restore` 一键收尾 |
 
 ## 用法
 
-1. 从 [Releases](../../releases) 下载 `狐径-v1.0.0.exe`
+1. 从 [Releases](../../releases) 下载 `FoxPath-v1.0.1.exe`
 2. 双击运行 → 浏览器自动打开控制面板 `http://127.0.0.1:8788/ui`
 3. 勾选「开机自启」即可后台常驻
 
 **首次启动请等 15～20 秒**：程序要并发体检 49 个候选 IP，体检完成前代理还没完全生效。
+
+> 下载文件名故意用 ASCII（`FoxPath-v1.0.1.exe`）。GitHub / Gitee 上传附件时会把中文
+> 文件名改坏（实测 `狐径-v1.0.0.exe` 传上去变成了 `-v1.0.0.exe`），所以对外一律用 ASCII 名。
+
+**出过问题想自救**：`FoxPath-v1.0.1.exe --restore` 只做一件事 —— 把系统代理里本程序留下的
+PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者你直接把 exe 删了但
+`AutoConfigURL` 还指向 `127.0.0.1:8788`，跑这一条就能收干净。
+
+**日志在哪**：`%LOCALAPPDATA%\FoxPath\foxpath.log`（exe 是无窗口的，屏幕上什么都看不到，
+有问题先看这个文件）。
 
 ## 核心机制
 
@@ -58,41 +72,63 @@ GitHub 直连助手。本机代理 + PAC，绕过 DNS 和 hosts，直连当前�
   最后这条很关键——有些 IP 证书是对的，但只服务 API/CDN，访问 github.com 首页会返回 400，必须过滤掉。
 - **候选池刷新**：定期从 `api.github.com/meta` 重拉 GitHub 官方公布的 IP 段，官方换 IP 了也能跟上。
 - **自愈**：候选全部失效时，依次尝试重拉官方表 → 查询系统 DNS → 放宽超时重测。三步都不通才判定真不通，此时退回系统解析（和没装本程序一样，不会更糟）。
-- **退出安全**：正常退出或点「退出并还原」都会把系统代理恢复成运行前的状态。
+- **退出安全**：正常退出和**静默模式（开机自启）**都会把系统代理恢复成运行前的状态；
+  还原备份固定存在 `%LOCALAPPDATA%\FoxPath\proxy-backup.json`（不再依赖 exe 同级是否可写）；
+  备份写不进去时**不会**去改注册表（宁可不开，也不留下无法还原的状态）。
+  另有一条 `--restore`：即使备份没了、程序也删了，也能把残留的 PAC 设置收干净。
+- **单实例**：用 Windows 命名互斥保证只有一个实例；重复双击不会起两个进程去抢 8787/8788。
 
 ## 从源码构建
 
 ```bash
-pip install pyinstaller pillow
+pip install pyinstaller
 
-python make_icon_from_user_image.py   # 生成 app.ico
-python build_exe.py                   # 打包成 狐径-v1.0.0.exe
+python build_exe.py                   # 打包成 FoxPath-v1.0.1.exe
 ```
+
+> 图标不用管：`app.ico` 已经入库。仓库里那几个 `create_icon*.py` /
+> `make_icon_from_user_image.py` 是当初做图标用的一次性脚本，里面的输入输出路径都写死在
+> 作者本机（还有一个依赖本机剪贴板缓存），**在别的机器上跑不通**，正常构建不需要它们。
 
 | 文件 | 说明 |
 | --- | --- |
-| `github_direct.py` | 主程序：代理、PAC、体检、控制面板 |
-| `Fix-GitHub.ps1` | PowerShell 版：手动改系统代理 / PAC，适合不跑常驻进程的场景 |
-| `Run-GitHubFix.bat` | 一键拉起 `Fix-GitHub.ps1` |
+| `github_direct.py` | 主程序：代理、PAC、体检、控制面板（推荐用这个） |
+| `Fix-GitHub.ps1` | **旧版备用方案**：往 `hosts` 里钉 IP + 装计划任务定时换；**需要管理员权限**，与主程序是两套互不干扰的做法，二选一即可 |
+| `Run-GitHubFix.bat` | 以管理员身份拉起 `Fix-GitHub.ps1`（会弹 UAC） |
 | `build_exe.py` | PyInstaller 打包脚本 |
 | `make_icon_from_user_image.py` | 图标生成（抠图 + 圆角底 + 多尺寸 ICO） |
 | `app.ico` | 程序图标 |
 | `release-notes.md` | 发行说明 |
 | `使用说明.txt` | 中文使用说明 |
 
-打包注意：PyInstaller 的 `--clean` 参数在某些受限环境下会因批量删缓存被拦，脚本里已去掉。
+打包注意：
+
+- PyInstaller 的 `--clean` 参数在某些受限环境下会因批量删缓存被拦，脚本里已去掉。
+- 产物名与版本号都从 `github_direct.py` 的 `APP_VERSION` 推导，只有一个来源，不用改两处。
+- **`.ps1` 文件必须保存为「UTF-8 带 BOM」**。PowerShell 5.1 对没有 BOM 的文件按 ANSI 读，
+  中文会变乱码，字符串/花括号被破坏后直接 ParserError —— `Fix-GitHub.ps1` 在 v1.0.1 之前
+  就是这样：文件本身完整，但因为没有 BOM 而**从未成功运行过**。
 
 ## 已知边界
 
 - 只代理 `github.com` / `www.github.com`。GitHub 的 CSS/JS/头像在 `githubassets.com`、`githubusercontent.com` 上，这些域名直连本来就通，**走代理反而连不上**，会导致页面只剩裸 HTML、按钮点不动。
 - 不代理 `api.github.com`（本来就通），Git 命令行操作不受影响。
 - 绿色单文件，无需安装；但**不能**用 `nohup ... &` 在 shell 里后台启动，那样命令结束进程会被终止。要常驻就双击运行或开开机自启。
+- 如果程序被**强制结束**（任务管理器结束进程、关机时强杀），`atexit` 不会执行，系统代理可能仍指向本程序。
+  下次启动本程序会自动接管；如果不再用了，跑一次 `--restore` 即可收干净。
+- 控制面板只监听 `127.0.0.1`，不对局域网开放；接口已做 Host/Origin 同源校验（挡网页 CSRF 与 DNS rebinding），
+  但没有做用户鉴权 —— 本机上以你的身份运行的程序仍然可以调用它。
+- **如果你原本设了「静态代理」（Internet 选项里手动填的代理服务器）**：一旦启用本程序，PAC 会优先于静态代理，
+  而你手动设的那个代理在启用期间不再生效（其它网站会直连）。停用/退出时会自动还原。程序检测到这种情况会在
+  日志里明确写一行提醒。
+- 遇到端口被占用、启动失败等情况，exe 会弹一个错误框并写明日志位置，不再"点了没反应"。
 
 ## 版本记录
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
 | v1.0.0 | 2026-09-19 | 首个版本：本地代理 + PAC、每 5 分钟 IP 体检、候选池自动刷新、全灭自愈、退出还原 |
+| v1.0.1 | 2026-09-22 | 修「还原不了系统代理」一类缺陷：重复启用不再污染备份、备份失败不再改注册表、静默模式也注册退出还原、加单实例与端口占用提示、日志落文件、新增 `--restore`；`Fix-GitHub.ps1` 补 UTF-8 BOM（此前无法运行）；打包脚本改为 ASCII 产物名 + 版本号单一来源；修正文档与实现不一致之处 |
 
 详细发行说明见 [release-notes.md](release-notes.md)。
 
