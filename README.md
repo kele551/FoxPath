@@ -52,7 +52,7 @@ GitHub 直连助手。本机代理 + PAC，绕过 DNS 和 hosts，直连当前�
 
 ## 用法
 
-1. 从 [Releases](../../releases) 下载 `FoxPath.exe`
+1. 从 [Releases](https://gitee.com/kele551/FoxPath/releases) 下载 `FoxPath.exe`
 2. 双击运行 → 浏览器自动打开控制面板 `http://127.0.0.1:8788/ui`
 3. 勾选「开机自启」即可后台常驻
 
