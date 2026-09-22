@@ -18,6 +18,35 @@ SRC = os.path.join(HERE, 'github_direct.py')
 ICO = os.path.join(HERE, 'app.ico')
 
 
+VERSION_TEMPLATE = """VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=%(vts)s,
+    prodvers=%(vts)s,
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable('040904B0', [
+        StringStruct('CompanyName', 'HaiFeng (kele551)'),
+        StringStruct('FileDescription', 'FoxPath'),
+        StringStruct('FileVersion', '%(ver)s'),
+        StringStruct('InternalName', 'FoxPath'),
+        StringStruct('LegalCopyright', 'Copyright (C) 2026 HaiFeng (kele551)'),
+        StringStruct('OriginalFilename', 'FoxPath.exe'),
+        StringStruct('ProductName', 'FoxPath'),
+        StringStruct('ProductVersion', '%(ver)s'),
+        StringStruct('Comments', 'gitee.com/kele551/FoxPath')
+      ])
+    ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)"""
+
 def read_version():
     """版本号以 github_direct.py 的 APP_VERSION 为唯一来源, 免得两处各写各的。"""
     with open(SRC, 'r', encoding='utf-8') as f:
@@ -33,8 +62,17 @@ def main():
             raise SystemExit('缺文件, 没法打包: ' + p)
 
     ver = read_version()
-    name = 'FoxPath-v%s' % ver
-    print('版本号: %s   产物: %s.exe' % (ver, name))
+    # 2026-09-22 用户要求: 文件名不带版本号(鼠标悬停/属性里看版本), 所以产物固定叫 FoxPath.exe
+    name = 'FoxPath'
+    # 把版本信息写进 exe 的资源, 悬停与"属性-详细信息"才看得到
+    _bd = os.path.join(HERE, 'build')
+    os.makedirs(_bd, exist_ok=True)
+    verfile = os.path.join(_bd, 'version_info.txt')
+    _n = [int(x) for x in re.findall(r'\d+', ver)]
+    _n = (_n + [0, 0, 0, 0])[:4]
+    with open(verfile, 'w', encoding='utf-8') as _f:
+        _f.write(VERSION_TEMPLATE % {'ver': ver, 'vts': tuple(_n)})
+    print('版本号: %s   产物: %s.exe (版本号写进 exe 资源, 文件名不带版本)' % (ver, name))
 
     target = os.path.join(HERE, name + '.exe')
     # 覆盖已存在的 exe 在受限环境里会被安全策略拦(删不动在用的文件),
@@ -56,6 +94,7 @@ def main():
         '--distpath', HERE,
         '--workpath', os.path.join(HERE, 'build'),
         '--specpath', os.path.join(HERE, 'build'),
+        '--version-file', verfile,
         '--icon', ICO,
         SRC,
     ]

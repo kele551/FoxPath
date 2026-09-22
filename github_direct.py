@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-GitHub 直连助手 —— 绿色单文件版 (v1.0.0)
+GitHub 直连助手 —— 绿色单文件版
+
+作者:  海风（kele551）    https://gitee.com/kele551/FoxPath
+协作:  小腾（只在源码里留档，不出现在界面上）
 
 干什么
 ------
@@ -50,7 +53,11 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = '狐径'
-APP_VERSION = '1.0.1'
+APP_VERSION = '1.0.5'
+# 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
+AUTHOR = '海风（kele551）'
+AUTHOR_ASCII = 'HaiFeng (kele551)'
+HOMEPAGE = 'gitee.com/kele551/FoxPath'
 PROXY_PORT = 8787
 PANEL_PORT = 8788
 CHECK_INTERVAL = 300          # 5 分钟重测一轮
@@ -617,6 +624,225 @@ def autostart_on():
 
 # ------------------------------------------------------------------- 控制面板
 
+# ------------------------------------------------------------------ 在线升级
+# 用户 2026-09-22 要求:「第二个程序做升级功能」。
+# 狐径跟壁纸助手不一样: 它没有"脚本层", 程序就是一个 exe —— 升级就是换 exe。
+# 做法: 下载到 <exe>.new -> 校验 sha256 -> 交给一个独立小助手
+#       (先让旧程序自己退出并还原代理 -> 覆盖 -> 再启动新的)。
+# 不需要管理员权限: D:\Program Files 的 ACL 允许普通用户写(实测过)。
+# 升级源: 仓库里的 version.json, Gitee raw 优先、GitHub 兜底;
+#         测试时可在数据目录放一个 update_url.txt 指到本地文件。
+UPDATE_URLS = (
+    'https://gitee.com/kele551/FoxPath/raw/main/version.json',
+    'https://raw.githubusercontent.com/kele551/FoxPath/main/version.json',
+)
+UPDATE_CACHE = os.path.join(DATA_DIR, 'update.json')
+UPDATE_URL_TXT = os.path.join(DATA_DIR, 'update_url.txt')
+UPDATE_LOCK = threading.Lock()
+UPDATE = {
+    'phase': 'idle',      # idle / checking / downloading / verifying / applying / done / failed
+    'got': 0, 'total': 0, 'pct': 0, 'msg': '', 'error': '',
+    'local': APP_VERSION, 'remote': '', 'notes': '', 'exe_url': '', 'exe_sha': '',
+}
+
+
+def ver_tuple(v):
+    try:
+        return tuple(int(x) for x in str(v).strip().split('.'))
+    except Exception:
+        return (0,)
+
+
+def cmp_ver(a, b):
+    """比大小: a>b 返回 1, 相等 0, a<b 返回 -1。"""
+    ta, tb = ver_tuple(a), ver_tuple(b)
+    n = max(len(ta), len(tb))
+    ta = ta + (0,) * (n - len(ta))
+    tb = tb + (0,) * (n - len(tb))
+    return (ta > tb) - (ta < tb)
+
+
+def _update_set(**kw):
+    with UPDATE_LOCK:
+        UPDATE.update(kw)
+
+
+def _update_get():
+    with UPDATE_LOCK:
+        return dict(UPDATE)
+
+
+def read_update_info(use_cache=True):
+    """读升级信息; use_cache=True 时 6 小时内不重复联网。"""
+    if use_cache and os.path.isfile(UPDATE_CACHE):
+        try:
+            with open(UPDATE_CACHE, encoding='utf-8') as f:
+                c = json.load(f)
+            if time.time() - float(c.get('_checked', 0)) < 6 * 3600:
+                return c
+        except Exception:
+            pass
+    urls = list(UPDATE_URLS)
+    try:
+        if os.path.isfile(UPDATE_URL_TXT):
+            with open(UPDATE_URL_TXT, encoding='utf-8') as f:
+                u = f.read().strip()
+            if u:
+                urls = [u]
+    except Exception:
+        pass
+    for u in urls:
+        try:
+            if u.startswith(('http://', 'https://')):
+                req = urllib.request.Request(u, headers={'User-Agent': 'FoxPath'})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    raw = r.read().decode('utf-8', 'replace')
+            else:
+                with open(u, encoding='utf-8') as f:
+                    raw = f.read()
+            info = json.loads(raw)
+            if not info.get('version'):
+                continue
+            info['_checked'] = time.time()
+            info['_source'] = u
+            try:
+                with open(UPDATE_CACHE, 'w', encoding='utf-8') as f:
+                    json.dump(info, f, ensure_ascii=False)
+            except Exception:
+                pass
+            return info
+        except Exception as e:
+            log('升级检查失败(%s): %s' % (u, e))
+            continue
+    return None
+
+
+def update_exe_node(info):
+    """取"要换的 exe"; 兼容 exe / launcher 两种字段名。"""
+    for k in ('exe', 'launcher'):
+        n = (info or {}).get(k)
+        if isinstance(n, dict) and n.get('url'):
+            return n
+    return None
+
+
+def do_update_check():
+    _update_set(phase='checking', msg='正在检查升级源…', error='')
+    info = read_update_info()
+    if not info:
+        _update_set(phase='failed', error='net', msg='连不上升级源(或还没发布升级信息)')
+        return _update_get()
+    node = update_exe_node(info) or {}
+    remote = str(info.get('version') or '')
+    newer = cmp_ver(remote, APP_VERSION) > 0
+    _update_set(local=APP_VERSION, remote=remote, notes=str(info.get('notes') or ''),
+                phase='idle', exe_url=node.get('url', ''), exe_sha=str(node.get('sha256') or '').upper(),
+                total=int(node.get('size') or 0),
+                msg=('有新版本 v' + remote + ' 可以升级') if newer else '已是最新版')
+    return _update_get()
+
+
+def _download_to(path, url, total_hint=0):
+    """边下边报进度; 返回 (sha256, None) 或 (None, 错误说明)。"""
+    import hashlib
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'FoxPath'})
+        h = hashlib.sha256()
+        got = 0
+        with urllib.request.urlopen(req, timeout=60) as r:
+            total = int(r.headers.get('Content-Length') or total_hint or 0)
+            _update_set(total=total)
+            with open(path, 'wb') as f:
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    h.update(chunk)
+                    got += len(chunk)
+                    _update_set(got=got, pct=(int(got * 100 / total) if total else 0),
+                                phase='downloading', msg='正在下载新版本')
+        return h.hexdigest().upper(), None
+    except Exception as e:
+        return None, str(e)
+
+
+def _spawn_helper(exe, new, ver):
+    """独立小助手(PowerShell, UTF-8 带 BOM): 等本进程退出 -> 覆盖 -> 再启动。
+    不用 .cmd —— cmd.exe 按控制台代码页读 .cmd, 中文路径会变问号(壁纸助手那边实测过)。"""
+    import subprocess
+    helper = os.path.join(DATA_DIR, 'update-apply.ps1')
+    logf = os.path.join(DATA_DIR, 'update.log')
+    q = lambda s: "'" + str(s).replace("'", "''") + "'"
+    lines = [
+        "$ErrorActionPreference = 'Continue'",
+        '$exe = ' + q(exe),
+        '$new = ' + q(new),
+        '$log = ' + q(logf),
+        "function W($m) { try { Add-Content -LiteralPath $log -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $m) -Encoding UTF8 } catch {} }",
+        "W '开始覆盖主程序 (新版本 v" + str(ver) + ")'",
+        "Start-Sleep -Seconds 2",
+        "try { Invoke-WebRequest 'http://127.0.0.1:" + str(PANEL_PORT) + "/api/quit' -Method POST -TimeoutSec 8 -UseBasicParsing | Out-Null } catch { W ('调 /api/quit 出错: ' + $_.Exception.Message) }",
+        "$nm = [System.IO.Path]::GetFileNameWithoutExtension($exe)",
+        "$n = 0",
+        "while ($n -lt 90) { if (-not (Get-Process -Name $nm -ErrorAction SilentlyContinue)) { break }; Start-Sleep -Seconds 1; $n++ }",
+        "W ('进程已退出, 等了 ' + $n + ' 秒')",
+        "try { Move-Item -LiteralPath $new -Destination $exe -Force; W '已覆盖主程序' } catch { W ('覆盖失败: ' + $_.Exception.Message) }",
+        "Start-Process -FilePath $exe",
+        "W '已用新版本重新启动'",
+        "$k = 0",
+        "while ($k -lt 10) { try { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 500; $k++ } }",
+    ]
+    try:
+        with open(helper, 'w', encoding='utf-8-sig', newline='\r\n') as f:
+            f.write('\n'.join(lines) + '\n')
+        # 只用 CREATE_NO_WINDOW(0x08000000), **不要** DETACHED_PROCESS:
+        # 后者让 powershell.exe 拿不到控制台, 进程会立刻退出、脚本一行都不执行
+        # (沙箱实测: 同一个脚本手动跑完全正常, 换成 DETACHED 就一条日志都没有)。
+        flags = 0x08000000 if os.name == 'nt' else 0
+        devnull = open(os.devnull, 'wb')
+        subprocess.Popen(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                          '-WindowStyle', 'Hidden', '-File', helper],
+                         creationflags=flags, stdin=devnull, stdout=devnull,
+                         stderr=devnull, close_fds=True)
+        return True
+    except Exception as e:
+        log('升级: 放小助手失败 %s' % e)
+        return False
+
+
+def apply_update_async():
+    """后台线程: 下载 -> 校验 -> 叫小助手覆盖并重启。"""
+    info = read_update_info()
+    node = update_exe_node(info)
+    if not node:
+        _update_set(phase='failed', error='no_info', msg='升级信息里没有下载地址')
+        return
+    exe = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
+    new = exe + '.new'
+    _update_set(phase='downloading', got=0, pct=0, error='', msg='正在下载新版本')
+    sha, err = _download_to(new, node['url'], int(node.get('size') or 0))
+    if not sha:
+        _update_set(phase='failed', error=err, msg='下载失败: %s' % err)
+        log('升级: 下载失败 %s' % err)
+        return
+    _update_set(phase='verifying', msg='正在校验安装包')
+    want = str(node.get('sha256') or '').upper().strip()
+    if want and sha != want:
+        _update_set(phase='failed', error='sha', msg='校验不过(期望 %s, 实际 %s), 已放弃' % (want[:16], sha[:16]))
+        log('升级: 校验不过, 已放弃; 期望 %s 实际 %s' % (want[:16], sha[:16]))
+        try:
+            os.remove(new)
+        except Exception:
+            pass
+        return
+    if not _spawn_helper(exe, new, node.get('version') or (info or {}).get('version') or ''):
+        _update_set(phase='failed', error='helper', msg='放小助手失败')
+        return
+    _update_set(phase='applying', pct=100, msg='校验通过, 正在覆盖并重启…')
+    log('升级: 已下好 %d 字节 (sha256=%s) 并通过校验, 交给小助手覆盖'
+        % (os.path.getsize(new), sha[:16]))
+
 PANEL_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>狐径 FoxPath __VERSION__</title>
@@ -644,10 +870,29 @@ PANEL_HTML = """<!doctype html>
  th{color:#6b7280;font-weight:500}
  pre{background:#f8fafc;border:1px solid #e5e7eb;border-radius:6px;padding:12px;
      height:190px;overflow:auto;font:12px/1.7 Consolas,monospace;margin:0;color:#374151}
-</style></head><body>
+ .upd-ver{font:600 15px/1.5 Consolas,monospace;color:#0f766e}
+ .upd-track{font:600 15px/1.5 Consolas,monospace;color:#cbd5e1;white-space:pre}
+ .upd-bar{height:10px;background:#eef2f4;border-radius:6px;overflow:hidden;margin-top:10px}
+ .upd-bar > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#0f766e,#22c1ae);
+   transition:width .25s ease}
+ .upd-note{color:#6b7280;font-size:13px;margin-top:8px}
+ .upd-ok{color:#0f766e;font-weight:600}
+ .upd-err{color:#b91c1c;font-weight:600}</style></head><body>
 <h1>狐径 FoxPath __VERSION__</h1>
 <div class="sub">本机代理接管 GitHub 流量，直连当前实测可用的官方 IP。不改 hosts、不用管理员权限。</div>
 
+<div class="card" id="updCard">
+  <div class="row" style="margin-bottom:6px">
+    <span class="k">版本</span>
+    <span class="upd-ver" id="uvLocal">__VERSION__</span>
+    <span class="upd-track" id="uvArrow">   =====>   </span>
+    <span class="upd-ver" id="uvRemote">—</span>
+    <button class="primary" id="btnUpdCheck">检查更新</button>
+    <button class="primary" id="btnUpdGo" style="display:none">立即升级</button>
+  </div>
+  <div class="upd-bar" id="updBarWrap" style="display:none"><i id="updBar"></i></div>
+  <div class="upd-note" id="updMsg">点「检查更新」看看有没有新版本。</div>
+</div>
 <div class="card">
   <div class="row" style="margin-bottom:10px">
     <span class="k">出口 IP</span><span class="big" id="ip">检测中…</span>
@@ -702,11 +947,68 @@ document.getElementById('btnQuit').onclick = ()=>{
   }
 };
 refresh(); setInterval(refresh,3000);
-</script></body></html>
+</script>
+<script>
+/* 在线升级: 版本迁移动画 + 渐变进度条 + 状态轮询 */
+(function(){
+  var U={bar:document.getElementById('updBar'),wrap:document.getElementById('updBarWrap'),
+         msg:document.getElementById('updMsg'),remote:document.getElementById('uvRemote'),
+         arrow:document.getElementById('uvArrow'),go:document.getElementById('btnUpdGo'),
+         local:document.getElementById('uvLocal'),anim:null,timer:null};
+  if(!U.msg) return;
+  function spin(on){
+    if(U.anim){clearInterval(U.anim);U.anim=null;}
+    if(!on){U.arrow.textContent='   =====>   ';return;}
+    var fr=['o--------->','=o-------->','==o------->','===o------>','====o----->',
+            '=====o---->','======o--->','=======o-->','========o->','=========>'];
+    var i=0; U.anim=setInterval(function(){U.arrow.textContent='   '+fr[i%fr.length]+'   ';i++;},85);
+  }
+  function kb(n){return Math.round((n||0)/1024)+' KB';}
+  function paint(v){
+    U.remote.textContent = v.remote ? ('v'+v.remote) : '—';
+    var busy = (v.phase==='downloading'||v.phase==='verifying'||v.phase==='applying');
+    spin(v.phase==='checking');
+    if(v.phase==='downloading'){
+      U.wrap.style.display='block';
+      U.bar.style.width=(v.pct||0)+'%';
+      U.msg.textContent='正在下载新版本  '+kb(v.got)+(v.total?(' / '+kb(v.total)+'   '+(v.pct||0)+'%'):'');
+      U.go.style.display='none';
+    } else if(v.phase==='verifying'||v.phase==='applying'){
+      U.wrap.style.display='block'; U.bar.style.width='100%';
+      U.msg.innerHTML='<span class="upd-ok">'+v.msg+'</span>';
+      U.go.style.display='none';
+    } else if(v.phase==='failed'){
+      U.wrap.style.display='block';
+      U.msg.innerHTML='<span class="upd-err">升级没有完成：'+(v.msg||'')+'</span>';
+    } else if(v.remote && v.remote!==v.local){
+      U.msg.innerHTML='<span class="upd-ok">发现新版本 v'+v.remote+'</span>'+(v.notes?('  '+v.notes):'');
+      U.go.style.display=''; U.wrap.style.display='none'; U.bar.style.width='0';
+    } else {
+      U.msg.textContent=v.msg||'已是最新版';
+      U.go.style.display='none'; U.wrap.style.display='none';
+    }
+    var b=(v.phase!=='idle'&&v.phase!=='failed');
+    if(b&&!U.timer){U.timer=setInterval(tick,400);}
+    if(!b&&U.timer){clearInterval(U.timer);U.timer=null;}
+  }
+  function tick(){ api('/api/update/status').then(paint); }
+  document.getElementById('btnUpdCheck').onclick=function(){
+    U.msg.textContent='正在检查升级源…'; spin(true);
+    act('/api/update/check').then(tick);
+  };
+  document.getElementById('btnUpdGo').onclick=function(){
+    U.go.style.display='none'; U.wrap.style.display='block'; U.bar.style.width='0';
+    act('/api/update/start').then(tick);
+  };
+  tick();
+})();
+</script><div style="margin:16px 0 6px;text-align:center;font-size:12px;color:#8a8a8f">狐径 FoxPath · 作者 __AUTHOR__ · __HOMEPAGE__</div>
+</body></html>
 """
 
 
-PANEL_PAGE = PANEL_HTML.replace('__VERSION__', APP_VERSION)
+PANEL_PAGE = (PANEL_HTML.replace('__VERSION__', APP_VERSION)
+              .replace('__AUTHOR__', AUTHOR).replace('__HOMEPAGE__', HOMEPAGE))
 
 
 class PanelHandler(BaseHTTPRequestHandler):
@@ -742,6 +1044,9 @@ class PanelHandler(BaseHTTPRequestHandler):
                 'logs': recent_logs(),
             }
             self._send(200, json.dumps(data, ensure_ascii=False).encode('utf-8'),
+                       'application/json; charset=utf-8')
+        elif path == '/api/update/status':
+            self._send(200, json.dumps(_update_get(), ensure_ascii=False).encode('utf-8'),
                        'application/json; charset=utf-8')
         else:
             self._send(404, b'not found')
@@ -781,6 +1086,15 @@ class PanelHandler(BaseHTTPRequestHandler):
             log('收到退出指令, 正在还原系统代理')
             disable_proxy()
             threading.Thread(target=lambda: (time.sleep(0.3), os._exit(0)), daemon=True).start()
+        elif path == '/api/update/check':
+            st = do_update_check()
+            log('手动检查升级: ' + str(st.get('msg')))
+        elif path == '/api/update/start':
+            if UPDATE.get('phase') in ('downloading', 'verifying', 'applying'):
+                pass
+            else:
+                threading.Thread(target=apply_update_async, daemon=True).start()
+                log('收到升级指令, 开始下载新版本')
         elif path == '/api/autostart':
             set_autostart('on=1' in query)
         length = int(self.headers.get('Content-Length') or 0)
@@ -843,6 +1157,7 @@ def main():
     args = [a.lower() for a in sys.argv[1:]]
     _START_TS[0] = time.time()
     log('%s v%s 启动 (日志: %s)' % (APP_NAME, APP_VERSION, LOG_FILE))
+    log('作者: %s   https://%s' % (AUTHOR, HOMEPAGE))
 
     # 只做还原, 不起代理/面板 —— 用于"程序已经删了 / 起不来, 但注册表里
     # 还留着指向 127.0.0.1:8788 的 PAC"这种死局的一键自救。
@@ -868,7 +1183,18 @@ def main():
         raise SystemExit(3)
 
     if not single_instance():
-        log('已有实例在运行, 本次直接退出(不动系统代理)')
+        log('已有实例在运行')
+        # 2026-09-22 修: 以前这里直接 return。程序是 --noconsole 的、又没有托盘图标,
+        # 用户第二次双击时屏幕上什么都不会出现 —— 只能判断成"程序打不开"。
+        # 现在把**已经在跑的那个控制面板**交给默认浏览器打开, 并写清日志。
+        if '--silent' not in args:
+            try:
+                webbrowser.open('http://127.0.0.1:%d' % PANEL_PORT)
+                log('已把正在运行的控制面板交给浏览器打开(本次不再重复启动)')
+            except Exception as e:
+                log('打开控制面板失败: %s' % e)
+        else:
+            log('静默模式: 已有实例在运行, 本次直接退出(不动系统代理)')
         return
 
     start_proxy()
