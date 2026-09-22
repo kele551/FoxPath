@@ -163,7 +163,7 @@ python build_exe.py                   # 打包成 FoxPath.exe
 
 [仓库 Issues](https://gitee.com/kele551/FoxPath/issues)
 
-反馈时如果能顺手附上控制面板里「可用 IP」那一栏的数字，定位会快很多。
+反馈时如果能顺手附上控制面板里「当前可用 IP」那一栏的数字，定位会快很多。
 
 ## 许可
 
