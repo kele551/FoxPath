@@ -17,6 +17,7 @@ _fox_preview.png
 
 # 旧包备份
 *.old-*
+*.old
 backups/
 
 # 代理状态快照(运行时生成)

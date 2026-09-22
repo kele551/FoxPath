@@ -81,7 +81,7 @@ def make_icon():
     shadow = Image.new('RGBA', (size, size), (0, 0, 0, 0))
     sh_mask = Image.new('L', (size, size), 0)
     ImageDraw.Draw(sh_mask).rounded_rectangle((12, 12, size-1, size-1), radius=radius, fill=30)
-    shadow = Image.composite((0, 0, 0, 30), Image.new('RGBA', (size, size), (0,0,0,0)), sh_mask)
+    shadow = Image.composite(Image.new('RGBA', (256, 256), (0, 0, 0, 30)), Image.new('RGBA', (size, size), (0,0,0,0)), sh_mask)
     final = Image.alpha_composite(shadow, canvas)
     # 6. 生成 ICO: 用 256x256 作为基础, Pillow 自动缩放生成所有尺寸
     base = final.resize((256, 256), Image.LANCZOS)
