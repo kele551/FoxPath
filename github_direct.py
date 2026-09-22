@@ -77,6 +77,7 @@ REG_INTERNET = r'Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 REG_RUN = r'Software\Microsoft\Windows\CurrentVersion\Run'
 
 _log_q = queue.Queue()
+_START_TS = [0.0]          # 进程启动时刻, 体检日志里用它显示"已运行多久"
 
 
 def alert(title, text):
@@ -812,15 +813,18 @@ def health_loop():
             fetch_official_ips()
             good = HEALTH.refresh(CANDIDATES)
 
+        # 体检日志就是狐径的心跳: 带上"已运行多久", 长跑日志才能一眼看出
+        # 它是持续在跑、还是中途死过又重开。
+        up_min = int((time.time() - _START_TS[0]) / 60) if _START_TS[0] else 0
         if good:
-            log('体检: 可用 %d/%d -> %s' % (
-                len(good), len(CANDIDATES),
+            log('体检: 可用 %d/%d 已运行%d分钟 -> %s' % (
+                len(good), len(CANDIDATES), up_min,
                 ', '.join('%s(%dms)' % (i, m) for i, m in good[:3])))
         else:
             good = recover()
             if good:
-                log('自愈成功: 可用 %d 个, 最快 %s(%dms)'
-                    % (len(good), good[0][0], good[0][1]))
+                log('自愈成功(已运行%d分钟): 可用 %d 个, 最快 %s(%dms)'
+                    % (up_min, len(good), good[0][0], good[0][1]))
 
         time.sleep(CHECK_INTERVAL)
 
@@ -837,6 +841,7 @@ def on_exit():
 
 def main():
     args = [a.lower() for a in sys.argv[1:]]
+    _START_TS[0] = time.time()
     log('%s v%s 启动 (日志: %s)' % (APP_NAME, APP_VERSION, LOG_FILE))
 
     # 只做还原, 不起代理/面板 —— 用于"程序已经删了 / 起不来, 但注册表里
