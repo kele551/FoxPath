@@ -2,7 +2,7 @@
 
 > 作者：**海风（kele551）** · 仓库：https://gitee.com/kele551/FoxPath （GitHub 同名镜像）
 
-![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.5-blue)
+![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.5-blue) ![Downloads](https://img.shields.io/github/downloads/kele551/FoxPath/total?label=downloads&color=green)
 
 GitHub 直连助手。本机代理 + PAC，绕过 DNS 和 hosts，直连当前实测可用的 GitHub 官方 IP。
 
