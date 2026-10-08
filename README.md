@@ -4,7 +4,7 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.6-blue) ![Downloads](https://img.shields.io/github/downloads/kele551/FoxPath/total?label=downloads&color=green)
 
-GitHub 直连助手。本机代理 + PAC，绕过 DNS 和 hosts，直连当前实测可用的 GitHub 官方 IP。
+GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，直连当前实测可用的 GitHub 官方 IP。
 
 **主程序（`github_direct.py` / 发布的 exe）不用管理员权限，不改 hosts，不改系统 DNS。**
 
@@ -32,7 +32,7 @@ GitHub 直连助手。本机代理 + PAC，绕过 DNS 和 hosts，直连当前�
 - `api.github.com` 一直是通的，只有 `github.com` 网页打不开
 - 手动往 hosts 里钉 IP，过两天又失效
 
-根因通常不在墙，而在**本地 DNS 解析出来的那个 GitHub IP 在当前线路上不通**。浏览器老实地按 DNS 走，就卡死了。
+根因通常不在网络本身，而在**本地域名解析出来的那个 GitHub IP 在当前线路上不通**。浏览器按解析结果走，就会卡住。
 
 狐径不查 DNS——它自己拿着一批 GitHub 官方 IP 逐个实测握手，挑能用的直连。
 
@@ -40,7 +40,7 @@ GitHub 直连助手。本机代理 + PAC，绕过 DNS 和 hosts，直连当前�
 
 ```
 浏览器 ──PAC──> 狐径本地代理 127.0.0.1:8787 ──> 实测可用的 GitHub 官方 IP
-              （代理 github.com + raw/附件）    （绕过 DNS）
+              （接管 github.com + raw/附件）    （不依赖域名解析）
 ```
 
 | 传统做法 | 狐径 |

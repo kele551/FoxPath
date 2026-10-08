@@ -4,7 +4,7 @@
 用法:
     GH_TOKEN=<token> python publish_files.py
 
-用 API 逐个上传文件, 绕过 git push(本机 git push 走代理有问题)。
+用 API 逐个上传文件, 不依赖 git push(本机 git push 走代理有问题)。
 """
 import base64
 import json
