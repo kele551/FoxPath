@@ -47,13 +47,14 @@ import ssl
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = '狐径'
-APP_VERSION = '1.0.5'
+APP_VERSION = '1.0.6'
 # 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
 AUTHOR = '海风（kele551）'
 AUTHOR_ASCII = 'HaiFeng (kele551)'
@@ -67,18 +68,140 @@ CHECK_INTERVAL = 300          # 5 分钟重测一轮
 # 一律 DIRECT —— 它们直连本来就通，走代理反而会坏（见 README 已知边界）。
 PROXY_HOSTS = ('github.com', 'www.github.com')
 
-# GitHub 官方 IP 池。140.82.112.0/20 是 GitHub 主站段, 20.x 那几个是官方
-# 在 api.github.com/meta 里单独列出的 web 地址。启动时会联网补充 /meta。
+# 2026-10-08 按用户需求（GitHub issue #1）增加：raw 文件与发布附件下载。
+# **它们必须走自己的 IP 池**（见下面 CANDIDATE_IPS_RAW）：官方 meta 里
+# 185.199.108.0/22 才是这些主机的段；塞进 github.com 的池子会连到错误服务器，
+# 页面脚本会全废（这正是以前"不能代理 githubusercontent"的真正原因）。
+# 注意：这里刻意**不含** avatars / camo / githubassets —— 那些是页面渲染用的，
+# 保持直连，就不会重演当年的坑。
+PROXY_HOSTS_RAW = ('raw.githubusercontent.com', 'objects.githubusercontent.com')
+
+# GitHub 官方 IP 池（2026-10-08 从 api.github.com/meta 全量对齐）。
+# 以前只有 15 个手写地址：联通/移动拉不到 /meta 时就只剩这些旧地址，
+# 很多已经不通 —— 那正是"某些线路用不了"的根因。现在把官方公布的全带上，
+# 即使在线同步失败也有足够多的候选。IPv6 单独一组：移动/联通的 IPv6
+# 常常反而是通的，而以前的代码直接 continue 掉了 IPv6。
 CANDIDATE_IPS = [
-    '140.82.112.3', '140.82.112.4',
-    '140.82.113.3', '140.82.113.4',
-    '140.82.114.3', '140.82.114.4',
-    '140.82.115.3', '140.82.115.4',
-    '140.82.116.3', '140.82.116.4',
-    '20.27.177.113', '20.27.177.114',
-    '20.200.245.247', '20.205.243.166',
-    '20.201.28.151',
+    '20.201.28.151', '20.205.243.166', '20.205.243.161', '20.87.245.0',
+    '20.87.245.2', '4.237.22.38', '4.237.22.36', '4.228.31.150',
+    '4.228.31.144', '20.207.73.82', '20.207.73.81', '20.27.177.113',
+    '20.27.177.119', '20.200.245.247', '20.200.245.244', '20.175.192.147',
+    '20.233.83.145', '20.233.83.148', '20.29.134.23', '20.29.134.22',
+    '20.199.39.232', '20.217.135.5', '20.217.135.1', '4.225.11.194',
+    '4.225.11.199', '4.208.26.197', '4.208.26.193', '20.26.156.215',
+    '20.26.156.213', '172.182.252.133', '172.182.252.130', '4.249.131.164',
+    '48.202.248.40', '48.204.201.5', '140.82.112.3', '140.82.112.4',
+    '140.82.113.3', '140.82.113.4', '140.82.114.3', '140.82.114.4',
+    '140.82.115.3', '140.82.115.4', '140.82.116.3', '140.82.116.4',
+    '20.27.177.114',
 ]
+
+# github.com 的真实 IPv6 地址。官方 JSON 里只给网段（2606:50c0::/32），
+# 国内 DNS 又拿不到 AAAA，所以这里写实测可用的地址；
+# 移动/联通的 IPv6 常常反而是通的，IPv4 全灭时这一组就是活路。
+# 本机实测3个握手通过
+# raw.githubusercontent.com / objects.githubusercontent.com 专用池
+# （官方 web 段里的 185.199.108.0/22；本机已用 SNI=raw.githubusercontent.com
+#   实测证书覆盖 githubusercontent.com，见 CHANGELOG）
+CANDIDATE_IPS_RAW = [
+    '185.199.108.133',
+    '185.199.109.133',
+    '185.199.110.133',
+    '185.199.111.133',
+]
+
+# IPv6 候选（**目前为空是有意的**）：
+# 2026-10-08 实测：官方 meta 只给网段（2606:50c0::/32、2a0a:a440::/29），
+# 照着网段猜出来的地址在 HTTP 层返回 "500 Domain Not Found" —— 说明它们并不真的
+# 服务 github.com，写进去只会白占探测名额。真实地址从两个地方来：
+#   1) 用户自己 DNS 解析出的 AAAA（见 dns_fallback_ips，很多家宽 DNS 会给）；
+#   2) 将来我们往 meta.json 的 web6 字段里放实测可用的地址。
+CANDIDATE_IPS_V6 = []
+
+# ── 手动指定 IP（2026-10-08 加）──────────────────────────────────────────────
+# 现场救急用：自动探测一个都不通时，让用户填一个他这条线能连上的官方 IP。
+# 存在数据目录里，重启后仍然生效；填空 = 清除。
+MANUAL_IP_FILE = 'manual-ip.txt'
+_MANUAL_IP = ['']          # 内存缓存，免得每次都用磁盘
+_META_SOURCE = ['']        # 上次成功同步 IP 表的来源（体检信息里要报出来）
+
+
+def _manual_ip_path():
+    return os.path.join(_data_dir(), MANUAL_IP_FILE)
+
+
+def _valid_ip(s):
+    try:
+        ipaddress.ip_address((s or '').strip())
+        return True
+    except Exception:
+        return False
+
+
+def load_manual_ip():
+    try:
+        with open(_manual_ip_path(), encoding='utf-8') as f:
+            ip = f.read().strip()
+    except Exception:
+        return ''
+    return ip if _valid_ip(ip) else ''
+
+
+def save_manual_ip(ip):
+    """保存/清除手动 IP，返回 (成功?, 一句话说明)。"""
+    ip = (ip or '').strip()
+    if ip and not _valid_ip(ip):
+        return False, '不是合法的 IP 地址：%s' % ip
+    try:
+        if ip:
+            with open(_manual_ip_path(), 'w', encoding='utf-8') as f:
+                f.write(ip)
+        else:
+            try:
+                os.remove(_manual_ip_path())
+            except OSError:
+                pass
+    except Exception as e:
+        return False, '写入失败：%s' % e
+    _MANUAL_IP[0] = ip
+    return True, ('已记住手动 IP %s（会优先使用）' % ip) if ip else '已清除手动 IP'
+
+
+def candidate_list():
+    """当前候选：手动指定的 IP 永远排第一，其余用池子（含 IPv6）。"""
+    if not _MANUAL_IP[0]:
+        _MANUAL_IP[0] = load_manual_ip()
+    out = list(CANDIDATES)
+    for ip in (CANDIDATE_IPS_V6 or []):
+        if ip not in out:
+            out.append(ip)
+    if _MANUAL_IP[0] and _MANUAL_IP[0] in out:
+        out.remove(_MANUAL_IP[0])
+    return ([_MANUAL_IP[0]] if _MANUAL_IP[0] else []) + out
+
+
+def diag_text():
+    """一行"线路体检"—— 客户复制这一行发来，就能定位卡在哪一环。"""
+    good, ts = HEALTH.snapshot()
+    v4 = [g for g in good if ':' not in g[0]]
+    v6 = [g for g in good if ':' in g[0]]
+    cand = candidate_list()
+    all4 = [ip for ip in cand if ':' not in ip]
+    all6 = [ip for ip in cand if ':' in ip]
+    fastest = ('%s(%dms)' % (good[0][0], good[0][1])) if good else '无'
+    up_min = int((time.time() - _START_TS[0]) / 60) if _START_TS[0] else 0
+    last = time.strftime('%m-%d %H:%M:%S', time.localtime(ts)) if ts else '还没体检过'
+    raw_good, _ = HEALTH_RAW.snapshot()
+    head = ('狐径体检 v%s | IPv4 可用 %d/%d | IPv6 可用 %d/%d | raw 可用 %d/%d | '
+            '表源 %s | 最快 %s | 系统代理 %s | 手动IP %s | 上次体检 %s | 已运行 %d 分钟'
+            % (APP_VERSION, len(v4), len(all4), len(v6), len(all6),
+               len(raw_good), len(CANDIDATE_IPS_RAW),
+               _META_SOURCE[0] or '未同步(用内置表)', fastest,
+               '已开启' if proxy_on() else '未开启', _MANUAL_IP[0] or '无', last, up_min))
+    detail = ('停用' if not good else
+              '可用清单: ' + ', '.join('%s(%dms)' % (i, m) for i, m in good[:8]))
+    return head + '\n' + detail
+
 
 REG_INTERNET = r'Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 REG_RUN = r'Software\Microsoft\Windows\CurrentVersion\Run'
@@ -154,6 +277,12 @@ def recent_logs(n=200):
     return out[-n:]
 
 
+def is_raw_host(host):
+    """raw 文件 / 发布附件下载（走自己的 IP 池）。"""
+    host = (host or '').lower().split(':')[0]
+    return host in PROXY_HOSTS_RAW
+
+
 def is_github_host(host):
     """只认 PAC 会送来的那两个主机(精确匹配)。
 
@@ -200,14 +329,25 @@ def notify_proxy_change():
 
 # ------------------------------------------------------------------- IP 体检
 
+class _SkipHttp(Exception):
+    """内部用：跳过 HTTP 状态检查。"""
+
+
 class Health(object):
-    def __init__(self):
+    def __init__(self, sni='github.com', expect='github.com', http_path='/'):
         self._lock = threading.Lock()
         self._good = []
         self._last = 0.0
+        # 2026-10-08: 不同主机群用不同的 SNI 与证书期望值 ——
+        # github.com 池: SNI=github.com, 证书要含 github.com;
+        # raw/附件池:    SNI=raw.githubusercontent.com, 证书要含 githubusercontent.com。
+        self.sni = sni
+        self.expect = expect
+        # HTTP 检查用的路径；None = 只验 TLS+证书（raw 池就是这样：
+        # raw.githubusercontent.com 的根路径必然返回 400，用它判死会误杀好 IP）
+        self.http_path = http_path
 
-    @staticmethod
-    def _probe(ip, timeout=3.0):
+    def _probe(self, ip, timeout=3.0):
         t0 = time.time()
         try:
             raw = socket.create_connection((ip, 443), timeout=timeout)
@@ -215,10 +355,10 @@ class Health(object):
             return None
         try:
             ctx = ssl.create_default_context()
-            with ctx.wrap_socket(raw, server_hostname='github.com') as s:
+            with ctx.wrap_socket(raw, server_hostname=self.sni) as s:
                 cert = s.getpeercert() or {}
                 names = [v for (_k, v) in cert.get('subjectAltName', ())]
-                ok = any('github.com' in n for n in names)
+                ok = any(self.expect in n for n in names)
                 if not ok:
                     return None
                 # TLS 握手通了还不够: 某些 IP 的证书对, 但只跑 API/CDN,
@@ -226,8 +366,11 @@ class Health(object):
                 # 这里发一发 GET /; 如果 HTTP 测试自己超时(偶尔发生),
                 # 不因此判死, 毕竟 TLS 已经验证通过, 但返回 4xx/5xx 就判死。
                 try:
+                    if self.http_path is None:
+                        raise _SkipHttp()
                     s.settimeout(2.0)
-                    s.sendall(b'GET / HTTP/1.1\r\nHost: github.com\r\n'
+                    s.sendall(('GET %s HTTP/1.1\r\nHost: %s\r\n'
+                               % (self.http_path, self.sni)).encode('ascii') +
                               b'User-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n')
                     first = s.recv(64)
                     if first:
@@ -236,8 +379,13 @@ class Health(object):
                             status = parts[1]
                             # README 写的是"必须返回 2xx/3xx", 这里也照此收紧:
                             # 只拒 4xx/5xx 的话, 1xx 和畸形状态码会被放进来。
-                            if not (status.startswith(b'2') or status.startswith(b'3')):
+                            # 429 = 被限流：说明对面确实是 GitHub，只是让我们慢点。
+                            # 2026-10-08 修：以前把它当死 IP，体检会莫名其妙地全灭。
+                            if not (status.startswith(b'2') or status.startswith(b'3')
+                                    or status == b'429'):
                                 return None
+                except _SkipHttp:
+                    pass
                 except (socket.timeout, TimeoutError, OSError):
                     pass
             return int((time.time() - t0) * 1000)
@@ -273,6 +421,8 @@ class Health(object):
 
 
 HEALTH = Health()
+HEALTH_RAW = Health(sni='raw.githubusercontent.com',
+                      expect='githubusercontent.com', http_path=None)
 CANDIDATES = list(CANDIDATE_IPS)
 
 
@@ -280,27 +430,46 @@ _last_meta_ok = [0.0]      # 上次成功拉到官方 IP 表的时间
 
 
 def fetch_official_ips():
-    """从 api.github.com/meta 拿官方 web IP。注意: api.github.com 和
-    github.com 不是同一批地址, 前者一直通, 所以这里通常拿得到。"""
+    """同步官方 IP 表。**三个源依次试**：
+
+    1. api.github.com/meta —— 官方最准，但在联通/移动的部分线路上根本不通；
+    2. Gitee 上本项目仓库里的 meta.json —— 国内三网都能拉 Gitee，这是关键兜底；
+    3. GitHub raw 的同一份 meta.json。
+
+    以前只有一个源（api.github.com），拉不到就只剩内置那十几个旧地址 ——
+    这就是"某些运营商的用户用不了"的直接原因。
+    """
     global CANDIDATES
-    try:
-        req = urllib.request.Request('https://api.github.com/meta',
-                                     headers={'User-Agent': 'github-direct-helper'})
-        with urllib.request.urlopen(req, timeout=6) as r:
-            data = json.loads(r.read().decode('utf-8'))
-        ips = []
-        for cidr in data.get('web', []):
-            # 只取 IPv4 网段的**第一个可用主机地址**。旧代码是 cidr.split('/')[0],
-            # 对 140.82.112.0/20 拿到的是网段地址 140.82.112.0 —— 它永远探测失败,
-            # 白占一个并发名额。
+    urls = (
+        'https://api.github.com/meta',
+        'https://gitee.com/kele551/FoxPath/raw/main/meta.json',
+        'https://raw.githubusercontent.com/kele551/FoxPath/main/meta.json',
+    )
+    last_err = None
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'foxpath-helper'})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read().decode('utf-8'))
+        except Exception as e:
+            last_err = e
+            continue
+        ips, v6s = [], []
+        # 我们自己发的 meta.json 里可以带一份"策展过的" ips（优先用）
+        for ip in (data.get('ips') or []):
+            if _valid_ip(ip):
+                (v6s if ':' in ip else ips).append(ip)
+        for cidr in (data.get('web') or []):
             try:
                 net = ipaddress.ip_network(cidr, strict=False)
             except ValueError:
                 continue
-            if net.version != 4:
-                continue
             first = next(net.hosts(), None) or net.network_address
-            ips.append(str(first))
+            if net.version == 4:
+                ips.append(str(first))
+            # IPv6 网段的首地址不是真实主机（实测 HTTP 层 Domain Not Found），
+            # 所以这里**故意不收集**；真实 IPv6 只从 DNS / meta.json 的 web6 来。
+        # 140.82.112.0/20 只取网段首地址是没用的（那是网段地址），手工补齐真实主机
         for third in (112, 113, 114, 115, 116):
             for last in (3, 4):
                 ips.append('140.82.%d.%d' % (third, last))
@@ -310,12 +479,21 @@ def fetch_official_ips():
                 seen.add(ip)
                 out.append(ip)
         CANDIDATES = out
+        # 真实 IPv6 地址：官方只给网段，取网段首地址多半不通；我们发的 meta.json
+        # 里带了实测解析出来的地址，优先用它们。
+        extra6 = [ip for ip in (data.get('web6') or []) if _valid_ip(ip)]
+        for ip in (extra6 or CANDIDATE_IPS_V6 or []) + v6s:
+            if ip not in CANDIDATES:
+                CANDIDATES.append(ip)
         _last_meta_ok[0] = time.time()
-        log('已同步官方 IP 表: 候选 %d 个' % len(out))
+        _META_SOURCE[0] = ('官方' if 'api.github.com' in url else
+                           'Gitee' if 'gitee.com' in url else 'GitHub')
+        log('已同步官方 IP 表(%s): 候选 %d 个(含 IPv6 %d 个)'
+            % (_META_SOURCE[0], len(CANDIDATES),
+               len([x for x in CANDIDATES if ':' in x])))
         return out
-    except Exception as e:
-        log('同步官方 IP 表失败(%s), 用现有 %d 个候选' % (e, len(CANDIDATES)))
-        return list(CANDIDATES)
+    log('同步官方 IP 表失败(%s), 用内置 %d 个候选' % (last_err, len(CANDIDATES)))
+    return list(CANDIDATES)
 
 
 def dns_fallback_ips():
@@ -326,8 +504,12 @@ def dns_fallback_ips():
         try:
             for info in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP):
                 ip = info[4][0]
-                if ':' not in ip and ip not in out:
+                # 2026-10-08: 以前这里把 IPv6 直接丢掉（': ' in ip 就 continue）。
+                # 但"用户自己的 DNS 给的地址"恰恰是最值得试的 —— 移动/联通的
+                # IPv6 常常反而是通的。IPv4 排在前面，IPv6 跟在后面。
+                if ip not in out:
                     out.append(ip)
+
         except Exception:
             pass
     return out
@@ -361,10 +543,15 @@ def recover():
 
 PAC_TEMPLATE = """function FindProxyForURL(url, host) {
     host = host.toLowerCase();
-    // Only github.com goes through the local proxy.
-    // GitHub CSS/JS/images live on githubassets.com and githubusercontent.com,
-    // which work fine over a direct connection; proxying them breaks page scripts.
-    if (host === "github.com" || host === "www.github.com") {
+    // github.com -> local proxy.
+    // raw/objects.githubusercontent.com -> local proxy as well, but they use
+    // their OWN ip pool inside the proxy (185.199.108.0/22). Sending them to the
+    // github.com pool lands on the wrong server and breaks the download.
+    // avatars/camo/githubassets stay DIRECT on purpose: they render the pages,
+    // and proxying them with the wrong pool is what broke pages in the past.
+    if (host === "github.com" || host === "www.github.com" ||
+        host === "raw.githubusercontent.com" ||
+        host === "objects.githubusercontent.com") {
         return "PROXY 127.0.0.1:%d; DIRECT";
     }
     return "DIRECT";
@@ -407,7 +594,17 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             pass
 
     def _connect(self, host, port):
-        if is_github_host(host):
+        if is_raw_host(host):
+            # raw 文件 / 发布附件：走 185.199.108.0/22 那段专属池。
+            # 以前没有这段，所以 githubusercontent 只能直连（用户提的 issue #1）。
+            for ip in HEALTH_RAW.candidates()[:4]:
+                try:
+                    return socket.create_connection((ip, port), timeout=5), ip
+                except OSError:
+                    HEALTH_RAW.drop(ip)
+                    continue
+            log('raw 候选 IP 全灭, 本次退回系统解析')
+        elif is_github_host(host):
             for ip in HEALTH.candidates()[:4]:
                 try:
                     return socket.create_connection((ip, port), timeout=5), ip
@@ -913,6 +1110,29 @@ PANEL_HTML = """<!doctype html>
   <table><thead><tr><th>IP</th><th>延迟</th></tr></thead><tbody id="ips"></tbody></table>
 </div>
 
+<div class="card">
+  <div style="margin-bottom:8px"><b>线路体检</b>
+    <span style="color:#6b7280">—— 点「复制诊断信息」把这一行发给作者，就能定位卡在哪一环</span></div>
+  <div id="diag" style="font-family:Consolas,monospace;font-size:12px;background:#f6f8fa;
+       padding:8px;border-radius:6px;word-break:break-all;white-space:pre-wrap">读取中…</div>
+  <div class="row" style="margin-top:8px">
+    <button class="primary" id="btnDiagCopy">复制诊断信息</button>
+    <button id="btnDiagRe">刷新体检</button>
+    <span id="diagMsg" style="margin-left:8px;color:#16a34a"></span>
+  </div>
+</div>
+
+<div class="card">
+  <div style="margin-bottom:8px"><b>手动指定 IP</b>
+    <span style="color:#6b7280">—— 自动探测一个都不通时用：填一个你这条线能连上的 GitHub 官方 IP</span></div>
+  <div class="row">
+    <input id="ipInput" placeholder="例如 20.205.243.166" style="min-width:220px;padding:4px 6px">
+    <button class="primary" id="btnIpSave">保存并重测</button>
+    <button id="btnIpClear">清除</button>
+    <span id="ipMsg" style="margin-left:8px;color:#6b7280"></span>
+  </div>
+</div>
+
 <div class="card"><div style="margin-bottom:8px"><b>日志</b></div><pre id="log"></pre></div>
 
 <script>
@@ -946,6 +1166,37 @@ document.getElementById('btnQuit').onclick = ()=>{
     act('/api/quit').then(()=>{ document.getElementById('state').textContent='正在退出...'; });
   }
 };
+function loadDiag(){
+  fetch('/api/diag').then(r=>r.text()).then(t=>{
+    document.getElementById('diag').textContent = t;
+  }).catch(()=>{});
+}
+function _say(id,txt){const e=document.getElementById(id);if(e){e.textContent=txt;setTimeout(()=>{e.textContent=''},2500);}}
+function copyDiag(){
+  const t=document.getElementById('diag').textContent||'';
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(()=>_say('diagMsg','已复制，直接粘贴发给作者就行'))
+      .catch(()=>fallbackCopy(t));
+  } else { fallbackCopy(t); }
+}
+function fallbackCopy(t){
+  const ta=document.createElement('textarea'); ta.value=t; document.body.appendChild(ta);
+  ta.select(); try{document.execCommand('copy'); _say('diagMsg','已复制');}catch(e){_say('diagMsg','复制失败，请手动选中复制');}
+  document.body.removeChild(ta);
+}
+document.getElementById('btnDiagCopy').onclick = copyDiag;
+document.getElementById('btnDiagRe').onclick = ()=>{loadDiag();refresh();};
+document.getElementById('btnIpSave').onclick = ()=>{
+  const v=document.getElementById('ipInput').value.trim();
+  if(!v){_say('ipMsg','先填一个 IP');return;}
+  act('/api/set-ip?ip='+encodeURIComponent(v)).then(()=>{
+    _say('ipMsg','已保存，正在重测…'); loadDiag(); refresh();
+  });
+};
+document.getElementById('btnIpClear').onclick = ()=>{
+  act('/api/set-ip?ip=').then(()=>{_say('ipMsg','已清除');loadDiag();refresh();});
+};
+loadDiag(); setInterval(loadDiag,10000);
 refresh(); setInterval(refresh,3000);
 </script>
 <script>
@@ -1045,6 +1296,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             }
             self._send(200, json.dumps(data, ensure_ascii=False).encode('utf-8'),
                        'application/json; charset=utf-8')
+        elif path == '/api/diag':
+            self._send(200, diag_text().encode('utf-8'), 'text/plain; charset=utf-8')
         elif path == '/api/update/status':
             self._send(200, json.dumps(_update_get(), ensure_ascii=False).encode('utf-8'),
                        'application/json; charset=utf-8')
@@ -1080,8 +1333,10 @@ class PanelHandler(BaseHTTPRequestHandler):
         elif path == '/api/disable':
             disable_proxy()
         elif path == '/api/retest':
-            threading.Thread(target=lambda: HEALTH.refresh(CANDIDATES), daemon=True).start()
-            log('手动重测已触发')
+            threading.Thread(target=lambda: (HEALTH.refresh(candidate_list()),
+                                              HEALTH_RAW.refresh(CANDIDATE_IPS_RAW)),
+                             daemon=True).start()
+            log('手动重测已触发(含 raw 池)')
         elif path == '/api/quit':
             log('收到退出指令, 正在还原系统代理')
             disable_proxy()
@@ -1095,6 +1350,16 @@ class PanelHandler(BaseHTTPRequestHandler):
             else:
                 threading.Thread(target=apply_update_async, daemon=True).start()
                 log('收到升级指令, 开始下载新版本')
+        elif path == '/api/set-ip':
+            raw = ''
+            for kv in query.split('&'):
+                if kv.startswith('ip='):
+                    raw = urllib.parse.unquote(kv[3:])
+            ok, msg = save_manual_ip(raw)
+            log('手动 IP: ' + msg)
+            if ok:
+                threading.Thread(target=lambda: HEALTH.refresh(candidate_list()),
+                                 daemon=True).start()
         elif path == '/api/autostart':
             set_autostart('on=1' in query)
         length = int(self.headers.get('Content-Length') or 0)
@@ -1122,10 +1387,11 @@ def health_loop():
         # 官方 IP 表每 6 小时同步一次; 可用数量少于 3 个也顺手同步一次,
         # 免得 GitHub 换了地址我们还抱着旧表。
         need_meta = (time.time() - _last_meta_ok[0]) > 6 * 3600
-        good = HEALTH.refresh(CANDIDATES)
+        good = HEALTH.refresh(candidate_list())
+        good_raw = HEALTH_RAW.refresh(CANDIDATE_IPS_RAW)
         if need_meta or len(good) < 3:
             fetch_official_ips()
-            good = HEALTH.refresh(CANDIDATES)
+            good = HEALTH.refresh(candidate_list())
 
         # 体检日志就是狐径的心跳: 带上"已运行多久", 长跑日志才能一眼看出
         # 它是持续在跑、还是中途死过又重开。
@@ -1134,6 +1400,10 @@ def health_loop():
             log('体检: 可用 %d/%d 已运行%d分钟 -> %s' % (
                 len(good), len(CANDIDATES), up_min,
                 ', '.join('%s(%dms)' % (i, m) for i, m in good[:3])))
+        elif good_raw:
+            log('raw 体检: 可用 %d/%d -> %s'
+                % (len(good_raw), len(CANDIDATE_IPS_RAW),
+                   ', '.join('%s(%dms)' % (i, m) for i, m in good_raw[:2])))
         else:
             good = recover()
             if good:

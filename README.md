@@ -2,7 +2,7 @@
 
 > 作者：**海风（kele551）** · 仓库：https://gitee.com/kele551/FoxPath （GitHub 同名镜像）
 
-![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.5-blue)
+![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.6-blue) ![Downloads](https://img.shields.io/github/downloads/kele551/FoxPath/total?label=downloads&color=green)
 
 GitHub 直连助手。本机代理 + PAC，绕过 DNS 和 hosts，直连当前实测可用的 GitHub 官方 IP。
 
@@ -40,7 +40,7 @@ GitHub 直连助手。本机代理 + PAC，绕过 DNS 和 hosts，直连当前�
 
 ```
 浏览器 ──PAC──> 狐径本地代理 127.0.0.1:8787 ──> 实测可用的 GitHub 官方 IP
-              （只代理 github.com）            （绕过 DNS）
+              （代理 github.com + raw/附件）    （绕过 DNS）
 ```
 
 | 传统做法 | 狐径 |
@@ -130,7 +130,12 @@ python build_exe.py                   # 打包成 FoxPath.exe
 
 ## 已知边界
 
-- 只代理 `github.com` / `www.github.com`。GitHub 的 CSS/JS/头像在 `githubassets.com`、`githubusercontent.com` 上，这些域名直连本来就通，**走代理反而连不上**，会导致页面只剩裸 HTML、按钮点不动。
+- 代理 `github.com` / `www.github.com`，以及 **`raw.githubusercontent.com` /
+  `objects.githubusercontent.com`**（raw 文件与发布附件下载，v1.0.6 起）。
+  后两个走**专属 IP 池**（官方 `185.199.108.0/22`）：以前不代理它们，是因为塞进 `github.com`
+  的池子会连到错误服务器、页面脚本全废 —— 那是池子不对，不是「不能代理」。
+- **仍然直连**：`avatars.githubusercontent.com` / `camo.githubusercontent.com` /
+  `githubassets.com`。这些是页面渲染用的，保持直连最稳，也避免重演当年的坑。
 - 不代理 `api.github.com`（本来就通），Git 命令行操作不受影响。
 - 绿色单文件，无需安装；但**不能**用 `nohup ... &` 在 shell 里后台启动，那样命令结束进程会被终止。要常驻就双击运行或开开机自启。
 - 如果程序被**强制结束**（任务管理器结束进程、关机时强杀），`atexit` 不会执行，系统代理可能仍指向本程序。
