@@ -285,6 +285,23 @@ def cmd_release(ver, skip_build=False, notes_file=None, with_github=False):
     print('   exe =', exe, exe.stat().st_size, 'B')
 
     vj = make_version_json('')
+
+    # ── 发版铁律：先自检、后发布（2026-10-08 用户要求「以后都这样」）──────
+    # 起因：v1.0.6 发布后才发现"升级后程序可能起不来"(杀软拦第一次启动)。
+    # 位置很关键：必须在 make_version_json 之后 —— 自检要校验"即将发出去的
+    # version.json 与 exe 是否一致"，放前面会永远报不一致。
+    if '--skip-preflight' in sys.argv:
+        print('   ⚠ 已显式跳过发版前自检（--skip-preflight）—— 请在 logs\\ 里写明原因')
+    else:
+        pf = REPO_DIR.parent / 'tools' / 'preflight_release.py'
+        if not pf.exists():
+            sys.exit('找不到发版前自检脚本 %s —— 不许发布（铁律）' % pf)
+        print('   ── 发版前自检（必须全绿）──')
+        r = subprocess.run([PY, str(pf), str(exe)], cwd=str(REPO_DIR.parent))
+        if r.returncode != 0:
+            sys.exit('❌ 发版前自检未通过，已中止发布。修好再发（或 --skip-preflight 紧急跳过）')
+        print('   ✅ 自检全绿，继续发布')
+
     assets = [exe, vj]
 
     git_commit_push(ver)
