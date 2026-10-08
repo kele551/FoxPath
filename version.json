@@ -1,9 +1,9 @@
 {
-  "version": "1.0.5",
+  "version": "1.0.6",
   "notes": "",
   "exe": {
-    "sha256": "A433B95DBC6C2772217DD2405678EE11220F10D90FC92455C2387813F9FBB567",
-    "url": "https://gitee.com/kele551/FoxPath/releases/download/v1.0.5/FoxPath.exe",
-    "size": 8785642
+    "sha256": "FE9A22DB9A11C842651DFE1603D483073F80615E69201ED42982D286CC5187D1",
+    "url": "https://gitee.com/kele551/FoxPath/releases/download/v1.0.6/FoxPath.exe",
+    "size": 8793630
   }
 }

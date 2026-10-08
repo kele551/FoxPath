@@ -14,9 +14,13 @@
 1. 怎么用 (就一步)
    双击「FoxPath.exe」运行。
    - 会自动打开浏览器控制面板 http://127.0.0.1:8788/ui
-   - 会自动把系统代理设成自带的 PAC, 只接管 github.com / www.github.com 两个域名
-     (githubassets.com / githubusercontent.com / api.github.com 保持直连 —— 它们本来就通,
-      走代理反而会让页面样式脚本加载失败、按钮点不动)
+   - 会自动把系统代理设成自带的 PAC, 接管这几个域名:
+       github.com / www.github.com          (主站)
+       raw.githubusercontent.com            (raw 文件, 例如各种一键脚本、配置文件)
+       objects.githubusercontent.com        (GitHub 发布附件的下载)
+     其中 raw / 附件走**专属 IP 池** (官方 185.199.108.0/22), 不会连错服务器。
+     页面渲染用的头像与资源域 (avatars / camo / githubassets) 仍然直连 ——
+     它们本来就通, 走代理反而会让页面样式脚本加载失败、按钮点不动。
    - 其他网站完全走原路线, 不受影响
    - 屏幕上看不到窗口是正常的: exe 没有控制台, 日志写在
      %LOCALAPPDATA%\FoxPath\foxpath.log
@@ -57,11 +61,15 @@
 
 3. 工作原理
    - 本机监听 127.0.0.1:8787 作为 HTTP/HTTPS 代理
-   - 只代理 github.com / www.github.com 两个域名, 其余域名 PAC 返回 DIRECT
+   - 代理 github.com / www.github.com / raw.githubusercontent.com /
+     objects.githubusercontent.com, 其余域名 PAC 返回 DIRECT
    - 每 5 分钟并发重测候选池, 入选条件是 TCP 443 握手 + TLS 证书校验 +
-     HTTP 首包必须 2xx/3xx
+     HTTP 首包必须 2xx/3xx (429 限流也算活着 —— 说明对面确实是 GitHub)
      (有些 IP 证书是对的, 但只服务 API/CDN, 访问首页返回 400, 必须滤掉)
-   - 候选池定期从 api.github.com/meta 重拉官方公布的 IP 段, 官方换 IP 也能跟上
+   - 候选池从三个源依次同步官方 IP 段: api.github.com/meta -> Gitee 上的
+     meta.json (国内三网都能拉; 联通/移动拉不到官方接口时的兜底) -> GitHub raw
+   - 面板上的「线路体检」把可用数量、表源、最快 IP 列成一行, 点「复制诊断信息」
+     就能直接发给作者定位问题; 自动探测全都不通时, 还能「手动指定 IP」救急
    - 候选全灭时依次自救: 重拉官方表 → 查系统 DNS → 放宽超时重测;
      三步都不通才回退系统解析 (等于没装本程序, 不会更糟)
    - 正常退出和开机自启的静默模式都会还原系统代理; 还原备份固定在
