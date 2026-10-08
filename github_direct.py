@@ -842,6 +842,12 @@ UPDATE = {
     'local': APP_VERSION, 'remote': '', 'notes': '', 'exe_url': '', 'exe_sha': '',
 }
 
+# 静默检查新版本（2026-10-08 加）—— 老用户不会主动点「检查更新」，所以：
+# 启动后立刻看一眼，之后每 12 小时再看一眼；**只提示，绝不自动升级**。
+# 复用的是 read_update_info 的 6 小时缓存，所以基本不打网络。
+AUTO_CHECK_INTERVAL = 12 * 3600
+_last_auto_check = [0.0]
+
 
 def ver_tuple(v):
     try:
@@ -1127,6 +1133,8 @@ PANEL_HTML = """<!doctype html>
  .upd-bar > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#0f766e,#22c1ae);
    transition:width .25s ease}
  .upd-note{color:#6b7280;font-size:13px;margin-top:8px}
+.upd-banner{margin-top:10px;padding:8px 10px;border-radius:6px;background:#fff7ed;
+  border:1px solid #fed7aa;color:#9a3412;font-size:13px}
  .upd-ok{color:#0f766e;font-weight:600}
  .upd-err{color:#b91c1c;font-weight:600}</style></head><body>
 <h1>狐径 FoxPath __VERSION__</h1>
@@ -1142,6 +1150,7 @@ PANEL_HTML = """<!doctype html>
     <button class="primary" id="btnUpdGo" style="display:none">立即升级</button>
   </div>
   <div class="upd-bar" id="updBarWrap" style="display:none"><i id="updBar"></i></div>
+  <div class="upd-banner" id="updBanner" style="display:none"></div>
   <div class="upd-note" id="updMsg">点「检查更新」看看有没有新版本。</div>
 </div>
 <div class="card">
@@ -1200,6 +1209,14 @@ function refresh(){
     s.className = d.enabled ? 'big' : 'big off';
     document.getElementById('time').textContent = d.last || '-';
     document.getElementById('auto').checked = d.autostart;
+    // 有新版本就亮一条提示（不自动升级，用户自己点）
+    const nb = document.getElementById('updBanner');
+    if (d.newver) {
+      nb.style.display = 'block';
+      nb.innerHTML = '发现新版本 <b>v' + d.newver + '</b> —— 点下面的「检查更新」再点「立即升级」即可（不会自动升级）。';
+    } else {
+      nb.style.display = 'none';
+    }
     document.getElementById('ips').innerHTML = (d.good||[])
       .map(x=>'<tr><td>'+x[0]+'</td><td>'+x[1]+' ms</td></tr>').join('') ||
       '<tr><td colspan="2">一个都不通</td></tr>';
@@ -1346,6 +1363,9 @@ class PanelHandler(BaseHTTPRequestHandler):
                 'enabled': proxy_on(),
                 'autostart': autostart_on(),
                 'last': time.strftime('%H:%M:%S', time.localtime(ts)) if ts else None,
+                # 有新版本时给面板一个提示字段（只提示，是否升级由用户点）
+                'newver': (str(UPDATE.get('remote') or '')
+                           if cmp_ver(str(UPDATE.get('remote') or ''), APP_VERSION) > 0 else ''),
                 'logs': recent_logs(),
             }
             self._send(200, json.dumps(data, ensure_ascii=False).encode('utf-8'),
@@ -1446,6 +1466,19 @@ def health_loop():
         if need_meta or len(good) < 3:
             fetch_official_ips()
             good = HEALTH.refresh(candidate_list())
+
+        # 静默检查新版本（只提示，不自动升级）—— 启动后一次，之后每 12 小时一次。
+        if time.time() - _last_auto_check[0] > AUTO_CHECK_INTERVAL:
+            _last_auto_check[0] = time.time()
+            try:
+                st = do_update_check()
+                remote = str(st.get('remote') or '')
+                if cmp_ver(remote, APP_VERSION) > 0:
+                    log('发现新版本 v%s（面板上点一下就能升级，不会自动升）' % remote)
+                else:
+                    log('已是最新版 v%s' % APP_VERSION)
+            except Exception as e:
+                log('静默检查新版本失败: %s' % e)
 
         # 体检日志就是狐径的心跳: 带上"已运行多久", 长跑日志才能一眼看出
         # 它是持续在跑、还是中途死过又重开。
