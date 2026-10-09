@@ -259,3 +259,4 @@ MIT
 | 怎么参与 | 提 Issue / PR 之前先看 [CONTRIBUTING.md](CONTRIBUTING.md)：Issue 模板、PR 流程、代码风格、本地构建与自查、提交信息规范都在里面 |
 | 安全 | 漏洞请**不要**开公开 Issue，按 [SECURITY.md](SECURITY.md) 私下报告 |
 | 发布纪律 | 主程序零第三方依赖；每次发布都要先跑发版前自检 `tools/preflight_release.py`（版本一致性、冷启动演练、升级演练、失败分支、退出还原）全绿，才允许上传附件 |
+| 合规 | 本项目的法律与知识产权边界见 [COMPLIANCE.md](COMPLIANCE.md)：只在本机运行、不提供代理服务、只连接服务方公开地址、不采集用户数据；不使用他人商标作为品牌名 |
