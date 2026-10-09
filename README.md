@@ -1,8 +1,8 @@
-# 狐径 FoxPath
+﻿# 狐径 FoxPath
 
 > 作者：**海风（kele551）** · 仓库：https://github.com/kele551/FoxPath （Gitee 同名镜像：https://gitee.com/kele551/FoxPath ）
 
-![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.6-blue) ![Downloads](https://img.shields.io/github/downloads/kele551/FoxPath/total?label=downloads&color=green)
+![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.7-blue) ![Downloads](https://img.shields.io/github/downloads/kele551/FoxPath/total?label=downloads&color=green)
 
 GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，直连当前实测可用的 GitHub 官方 IP。
 
@@ -176,11 +176,20 @@ python tools/preflight_release.py --dry-run    # 只跑静态项：不写注册�
 
 ## 升级时请注意
 
-升级完成后程序会**自动重新打开**。如果它没有出现（个别杀毒软件会拦住升级后的第一次启动，
-实测火绒出现过），**双击一下 `FoxPath.exe` 就能正常使用** —— 升级本身是完成的。
-
-原因：新版本的文件刚落地时，杀软要做一次“首次运行”检查，可能把第一次启动拦掉。
-程序退出前已经还原好系统代理，所以**不会影响上网，也不会让浏览器出错**。
+- **不会把「降级」当「升级」**：升级前按版本号语义比较（`1.0.10 > 1.0.9` 这种也算得对），
+  只有线上确实比本地新才会提示「发现新版本」；线上不比本地新时，面板直接说明是
+  「已是最新版」还是「本地版本比线上新（线上尚未发布）」，**「立即升级」按钮置灰，
+  服务端也会拒绝执行**，日志里写一行「拒绝降级」。
+- **升级失败会自动回滚**：新版连续起不来时，小助手会把旧版本放回去并重新启动它，
+  日志里能看到三步（覆盖失败 / 回滚 / 旧版已起来），**不会再出现「升级之后程序没了」**。
+- 升级完成后程序会**自动重新打开**；万一它没有出现，**双击一下 `FoxPath.exe` 就能正常使用**
+  —— 升级本身是完成的。程序退出前已经还原好系统代理，**不会影响上网，也不会让浏览器出错**。
+- **历史说明更正（2026-10-09）**：v1.0.7 之前，这类「升级后起不来」曾被归因为杀毒软件拦截
+  （火绒实测）。真因已查清：升级小助手是从主程序里起的，会继承单文件 exe 的 `_PYI_*` 环境变量，
+  新版本的引导程序据此误判「已经解过包」，于是去找那个已被删掉的临时目录，
+  结果 `Failed to load Python DLL`。**该问题自 v1.0.7 起修复**（起新版本前先擦掉这些变量）。
+- **从 v1.0.6 升到 v1.0.7 这一跳**用的仍是老版小助手（不重试、不回滚），所以**仍可能失败一次**；
+  失败了双击 `FoxPath.exe` 即可。**从 v1.0.7 往后，升级全程带护栏。**
 
 ## 已知边界
 
