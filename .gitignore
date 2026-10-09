@@ -22,3 +22,10 @@ backups/
 
 # 代理状态快照(运行时生成)
 .proxy-backup.json
+
+# 【2026-10-09 事故防线】误落进仓库的凭据文件（文件名被反斜杠吃掉产生的野文件）
+Harnesssecrets*
+*git-credentials
+secrets/
+*.pem
+*.key
