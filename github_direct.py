@@ -52,6 +52,7 @@ import urllib.request
 import uuid
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+from ctypes import wintypes          # 升级结果气泡要用(Shell_NotifyIcon 的结构体)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = '狐径'
@@ -1198,11 +1199,28 @@ _last_auto_check = [0.0]
 SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
 SETTINGS_LOCK = threading.Lock()
 AUTO_UPDATE_DEFAULT = True                 # 默认开（用户明确要求）
-SETTINGS = {'auto_update': AUTO_UPDATE_DEFAULT}
+NOTIFY_DEFAULT = True                      # 升级结果气泡, 默认开（同上）
+SETTINGS = {'auto_update': AUTO_UPDATE_DEFAULT, 'notify_bubble': NOTIFY_DEFAULT}
 AUTO_UPDATE_MAX_TRIES = 2                  # 同一个版本 24 小时内最多自动试几次
 AUTO_UPDATE_TRIES_FILE = os.path.join(DATA_DIR, 'update-tries.json')
 UPDATE_DONE_FILE = os.path.join(DATA_DIR, 'update-done.json')
 _AUTO_UPGRADED = [None]                    # 本次启动是"刚被升级上来的"就记在这里
+
+# ── 升级结果气泡（2026-10-09 用户要求：升级完成/失败在右下角弹一下）──────────
+# 只在**真的有结果**时弹：升级成功弹一次「狐径已自动升级到 vX.Y.Z」；
+# 升级失败弹一次人话 + 一句怎么办。**检查到已是最新、或没在升级时绝不弹**。
+# 开关：设置里的 notify_bubble, 默认开；关掉就完全不弹（面板那行状态照留）。
+# 通知走 Windows 自己的气泡：优先 ctypes + Shell_NotifyIcon(NIF_INFO) —— 隐藏窗口 +
+# 消息循环都放在**独立后台线程**里，主流程一步都不等；万一原生那条不成就退回
+# 短命 powershell.exe 的 NotifyIcon.ShowBalloonTip（隐藏窗口 + 超时自杀）。
+# 铁律：**通知失败绝不能让升级失败** —— 所有异常一律吞掉并写日志。
+BUBBLE_WAIT = 7.0                          # 气泡线程最多守多久(秒)，到点自己收摊
+BUBBLE_TIP_MS = 6000                       # 气泡停留时间(Windows 有下限, 实际按系统设置)
+BUBBLE_DEDUP = 20.0                        # 同一件事 20 秒内只弹一次
+UPDATE_RESULT_FILE = os.path.join(DATA_DIR, 'update-result.json')
+_LAST_RESULT = [None]                      # 上次升级结果(内存 + 磁盘都给面板看)
+_BUBBLE_LOCK = threading.Lock()
+_BUBBLE_SEEN = {}                          # 结果 -> 上次弹的时刻(去重)
 
 
 def ver_tuple(v):
@@ -1232,13 +1250,18 @@ def _update_get():
 
 
 def load_settings():
-    """读设置(auto_update 默认 True)。读不到就用默认值, 不让设置文件挡住启动。"""
-    d = {'auto_update': AUTO_UPDATE_DEFAULT}      # 基准是默认值, 不是当前内存里的值
+    """读设置(auto_update / notify_bubble 都默认 True)。读不到就用默认值, 不让设置文件挡住启动。"""
+    d = {'auto_update': AUTO_UPDATE_DEFAULT,
+         'notify_bubble': NOTIFY_DEFAULT}       # 基准是默认值, 不是当前内存里的值
     try:
         with open(SETTINGS_FILE, encoding='utf-8') as f:
             raw = json.load(f)
-        if isinstance(raw, dict) and 'auto_update' in raw:
-            d['auto_update'] = bool(raw['auto_update'])
+        if isinstance(raw, dict):
+            # 逐项读: 老版本的 settings.json 里没有 notify_bubble 时,
+            # 它保持默认(开) —— 升级上来的用户不用手动去勾
+            for k in ('auto_update', 'notify_bubble'):
+                if k in raw:
+                    d[k] = bool(raw[k])
     except Exception:
         pass
     with SETTINGS_LOCK:
@@ -1272,6 +1295,27 @@ def set_auto_update(on):
         msg = '已开启自动升级: 以后启动时发现新版本会自动下好并换上新版(不弹确认框)'
     else:
         msg = '已关闭自动升级: 发现新版本只在面板上提示, 点「立即升级」才升级'
+    if not ok:
+        msg += '(设置没能写进磁盘, 重启后会回到默认值)'
+    log(msg)
+    return True, msg
+
+
+def bubble_on():
+    """升级结果气泡开着吗(默认开)。关掉就完全不弹, 面板那行状态照样留着。"""
+    with SETTINGS_LOCK:
+        return bool(SETTINGS.get('notify_bubble', NOTIFY_DEFAULT))
+
+
+def set_notify_bubble(on):
+    """开关升级结果气泡, 返回 (ok, 人话)。默认就是开着的。"""
+    with SETTINGS_LOCK:
+        SETTINGS['notify_bubble'] = bool(on)
+    ok = save_settings()
+    if on:
+        msg = '已开启升级结果气泡: 升级成功或失败会在右下角弹一下(平时不弹)'
+    else:
+        msg = '已关闭升级结果气泡: 以后只在面板「上次升级结果」那一行看升级结果'
     if not ok:
         msg += '(设置没能写进磁盘, 重启后会回到默认值)'
     log(msg)
@@ -1381,6 +1425,384 @@ def upgraded_text():
                d.get('from') or '?'))
 
 
+# ── 上一次升级结果（面板「上次升级结果」那一行靠它, 不只靠气泡）──────────────
+# 用户 2026-10-09 要求: 「面板里也留一行状态」—— 气泡看一眼就没了, 面板要能回看,
+# 所以结果同时落盘(update-result.json), 重启后那一行还在。
+RESULT_REASONS = {
+    'nosha': '升级源没有提供校验值',
+    'sha': '安装包校验没通过',
+    'size': '安装包大小不对',
+    'net': '下载没成功',
+    'helper': '没能启动升级小助手',
+    'no_info': '升级信息里没有下载地址',
+    'noeffect': '重启后还是旧版本',
+}
+
+
+def _human_reason(code, msg=''):
+    """把内部错误码换成一句人话; 认不出来就把原始说明截短(别把异常原文甩给用户)。"""
+    why = RESULT_REASONS.get(str(code or '').strip())
+    if why:
+        return why
+    s = ' '.join(str(msg or '').split())
+    return s[:40] if s else '原因见日志'
+
+
+def _write_update_result(ok, auto=False, from_ver='', to_ver='', why='', note=''):
+    """把上一次升级结果落盘(面板要显示「成功/失败 + 时间」)。
+
+    写不进去只写日志, 不影响升级本身 —— 跟气泡一样, 附属功能不许拖累主线。
+    """
+    d = {'ok': bool(ok), 'auto': bool(auto), 'from': str(from_ver or ''),
+         'to': str(to_ver or ''), 'why': str(why or ''), 'note': str(note or ''),
+         'ts': time.time()}
+    _LAST_RESULT[0] = d
+    try:
+        with open(UPDATE_RESULT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(d, f, ensure_ascii=False)
+    except Exception as e:
+        log('升级: 写升级结果文件失败(不影响升级本身): %s' % e)
+    return d
+
+
+def load_update_result():
+    """启动时读一次上次的升级结果(给面板那一行用)。读不到就算了, 不挡启动。"""
+    try:
+        with open(UPDATE_RESULT_FILE, encoding='utf-8') as f:
+            d = json.load(f)
+        if isinstance(d, dict) and 'ok' in d:
+            _LAST_RESULT[0] = d
+    except Exception:
+        pass
+    return _LAST_RESULT[0]
+
+
+def last_result_text():
+    """面板「更新」卡片里那一行: 上次升级结果(成功/失败 + 时间 + 一句怎么办)。"""
+    d = _LAST_RESULT[0]
+    if not d:
+        return ''
+    try:
+        when = time.strftime('%m-%d %H:%M',
+                             time.localtime(float(d.get('ts') or 0)))
+    except Exception:
+        when = '--'
+    who = '自动' if d.get('auto') else '手动'
+    if d.get('ok'):
+        to = str(d.get('to') or APP_VERSION)
+        fr = str(d.get('from') or '')
+        return ('上次升级结果：成功 · %s　已%s升级到 v%s%s'
+                % (when, who, to, ('（原 v%s）' % fr) if fr else ''))
+    return ('上次升级结果：失败 · %s　%s升级没有完成：%s；已保留旧版本 v%s，'
+            '可点上面「立即升级」重试'
+            % (when, who, _human_reason(d.get('why'), d.get('note')), APP_VERSION))
+
+
+def _bubble_texts(ok, auto, to_ver='', why=''):
+    """气泡的标题与正文。正文就是用户要看到的那一句人话(几秒后自己消失)。"""
+    who = '自动' if auto else '手动'
+    if ok:
+        if auto:
+            text = '狐径已自动升级到 v%s' % (to_ver or APP_VERSION)
+        else:
+            text = '狐径已升级到 v%s' % (to_ver or APP_VERSION)
+        return ('狐径 升级完成', text)
+    if str(why) == 'noeffect':
+        head = '%s升级没有生效（重启后还是 v%s）' % (who, APP_VERSION)
+    else:
+        head = '%s升级失败（%s）' % (who, _human_reason(why))
+    return ('狐径 升级没有完成',
+            '%s，已保留旧版本；可打开面板点「立即升级」重试' % head)
+
+
+# ── 气泡引擎 ①: Windows 自己的通知气泡(首选)────────────────────────────────
+# Shell_NotifyIcon(NIM_ADD + NIM_MODIFY/NIF_INFO) 就是系统原生的右下角气泡:
+# 不需要托盘常驻、不需要第三方库、也不会弹一个窗口出来抢焦点。
+# 代价是得先有一个窗口(哪怕是隐藏的)和一小段消息循环 —— 这两样都放在**调用它的
+# 那个后台线程**里, 主流程一步都不等它; 到点 NIM_DELETE 收摊, 通知区不留图标。
+_NIM_ADD, _NIM_MODIFY, _NIM_DELETE = 0, 1, 2
+_NIF_ICON, _NIF_TIP, _NIF_INFO = 0x02, 0x04, 0x10
+_NIIF_INFO = 0x01
+_WM_CLOSE, _WM_DESTROY = 0x0010, 0x0002
+_PM_REMOVE = 0x0001
+_IDI_INFORMATION = 32516                   # MAKEINTRESOURCE(IDI_INFORMATION)
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [('Data1', ctypes.c_ulong), ('Data2', ctypes.c_ushort),
+                ('Data3', ctypes.c_ushort), ('Data4', ctypes.c_ubyte * 8)]
+
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    """NOTIFYICONDATAW(Vista 以后那版, cbSize 用整个结构体大小)。
+
+    x64 上 sizeof=976, 各字段偏移与 Windows SDK 一致(自测里逐项断言过) ——
+    这种结构体错一个字节就会"什么都没发生", 所以必须钉死。
+    """
+    _fields_ = [
+        ('cbSize', wintypes.DWORD), ('hWnd', wintypes.HWND),
+        ('uID', wintypes.UINT), ('uFlags', wintypes.UINT),
+        ('uCallbackMessage', wintypes.UINT), ('hIcon', wintypes.HANDLE),
+        ('szTip', ctypes.c_wchar * 128),
+        ('dwState', wintypes.DWORD), ('dwStateMask', wintypes.DWORD),
+        ('szInfo', ctypes.c_wchar * 256), ('uTimeout', wintypes.UINT),
+        ('szInfoTitle', ctypes.c_wchar * 64), ('dwInfoFlags', wintypes.DWORD),
+        ('guidItem', _GUID), ('hBalloonIcon', wintypes.HANDLE)]
+
+
+class _WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [
+        ('cbSize', wintypes.UINT), ('style', wintypes.UINT),
+        ('lpfnWndProc', ctypes.c_void_p), ('cbClsExtra', ctypes.c_int),
+        ('cbWndExtra', ctypes.c_int), ('hInstance', wintypes.HINSTANCE),
+        ('hIcon', wintypes.HANDLE), ('hCursor', wintypes.HANDLE),
+        ('hbrBackground', wintypes.HANDLE), ('lpszMenuName', wintypes.LPCWSTR),
+        ('lpszClassName', wintypes.LPCWSTR), ('hIconSm', wintypes.HANDLE)]
+
+
+def _bubble_native(title, text, timeout_ms=BUBBLE_TIP_MS):
+    """用系统自己的通知气泡弹一下。弹出来了返回 True, 没成就返回 False。
+
+    只在这个线程里干活: 建隐藏窗口 -> 把图标加进通知区 -> NIF_INFO 弹出气泡 ->
+    跑消息循环守着 -> 到点删图标。窗口不带可见样式(dwStyle=0), 所以屏幕上不出现
+    任何窗口, 也不抢焦点; 不要求用户点击, 几秒后自己消失。
+    """
+    if os.name != 'nt':
+        return False
+    user32 = ctypes.WinDLL('user32', use_last_error=True)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    shell32 = ctypes.WinDLL('shell32', use_last_error=True)
+    # 指针宽度的返回值必须显式声明 restype, 否则 64 位下会被截成 int
+    user32.DefWindowProcW.restype = ctypes.c_ssize_t
+    user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                      wintypes.WPARAM, wintypes.LPARAM]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HANDLE, wintypes.HINSTANCE, ctypes.c_void_p]
+    user32.RegisterClassExW.restype = wintypes.ATOM
+    user32.RegisterClassExW.argtypes = [ctypes.POINTER(_WNDCLASSEXW)]
+    user32.UnregisterClassW.restype = wintypes.BOOL
+    user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+    user32.LoadIconW.restype = wintypes.HANDLE
+    user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+    user32.PeekMessageW.restype = wintypes.BOOL
+    user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                    wintypes.UINT, wintypes.UINT, wintypes.UINT]
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.restype = ctypes.c_ssize_t
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+    shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD,
+                                          ctypes.POINTER(_NOTIFYICONDATAW)]
+
+    hinst = kernel32.GetModuleHandleW(None)
+    cls = 'FoxPathBubble_%d_%d' % (os.getpid(), threading.get_ident())
+
+    @ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
+                        wintypes.WPARAM, wintypes.LPARAM)
+    def _proc(hwnd, msg, wp, lp):
+        if msg == _WM_CLOSE:
+            user32.DestroyWindow(hwnd)
+        elif msg == _WM_DESTROY:
+            user32.PostQuitMessage(0)
+        return user32.DefWindowProcW(hwnd, msg, wp, lp)
+
+    wc = _WNDCLASSEXW()
+    wc.cbSize = ctypes.sizeof(_WNDCLASSEXW)
+    wc.lpfnWndProc = ctypes.cast(_proc, ctypes.c_void_p)
+    wc.hInstance = hinst
+    wc.lpszClassName = cls
+    if not user32.RegisterClassExW(ctypes.byref(wc)):
+        return False
+    hwnd = None
+    added = False
+    nid = _NOTIFYICONDATAW()
+    nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+    nid.uID = 1
+    try:
+        hwnd = user32.CreateWindowExW(0, cls, APP_NAME, 0, 0, 0, 0, 0,
+                                      None, None, hinst, None)
+        if not hwnd:
+            return False
+        nid.hWnd = hwnd
+        nid.uFlags = _NIF_ICON | _NIF_TIP
+        nid.hIcon = user32.LoadIconW(None, ctypes.c_wchar_p(_IDI_INFORMATION))
+        nid.szTip = APP_NAME
+        if not shell32.Shell_NotifyIconW(_NIM_ADD, ctypes.byref(nid)):
+            return False
+        added = True
+        # 官方写法: 气泡不能用 NIM_ADD 一次带上, 必须 NIM_ADD 之后再 NIM_MODIFY
+        nid.uFlags = _NIF_INFO
+        nid.uTimeout = int(timeout_ms)
+        nid.szInfoTitle = str(title)[:63]
+        nid.szInfo = str(text)[:255]
+        nid.dwInfoFlags = _NIIF_INFO
+        if not shell32.Shell_NotifyIconW(_NIM_MODIFY, ctypes.byref(nid)):
+            return False
+        # 消息循环: 只为把"气泡被点了/超时了"这类回话收进来。用 PeekMessage
+        # 而不是 GetMessage —— 到点能自己收摊, 不会卡死在这条线程里。
+        end = time.time() + BUBBLE_WAIT
+        msg = wintypes.MSG()
+        while time.time() < end:
+            while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, _PM_REMOVE):
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+            time.sleep(0.05)
+        return True
+    finally:
+        if added:
+            try:
+                shell32.Shell_NotifyIconW(_NIM_DELETE, ctypes.byref(nid))
+            except Exception:
+                pass
+        if hwnd:
+            try:
+                user32.DestroyWindow(hwnd)
+            except Exception:
+                pass
+        try:
+            user32.UnregisterClassW(cls, hinst)
+        except Exception:
+            pass
+
+
+# ── 气泡引擎 ②: 短命 powershell.exe 兜底(原生那条不成时才走)───────────────
+# 三个要点, 缺一个就出问题:
+#   ① CREATE_NO_WINDOW —— 不然会闪一个黑框(绝对不行);
+#   ② 脚本用 -EncodedCommand(UTF-16LE + base64)传 —— 中文不受控制台代码页影响;
+#   ③ 脚本自己跑 DoEvents 消息循环、到点 Dispose 退出 —— 不留后台进程、不要求点击。
+# 标题/正文走环境变量(Windows 的环境块本身是 UTF-16, 中文安全)。
+_PS_BUBBLE = r'''
+$ErrorActionPreference = 'Stop'
+try {
+  Add-Type -AssemblyName System.Windows.Forms
+  Add-Type -AssemblyName System.Drawing
+  $ni = New-Object System.Windows.Forms.NotifyIcon
+  $ni.Icon = [System.Drawing.SystemIcons]::Information
+  $ni.BalloonTipTitle = [string]$env:FOXPATH_BUBBLE_TITLE
+  $ni.BalloonTipText  = [string]$env:FOXPATH_BUBBLE_TEXT
+  $ni.Visible = $true
+  [void]$ni.ShowBalloonTip(6000)
+  $end = (Get-Date).AddSeconds(7)
+  while ((Get-Date) -lt $end) {
+    [System.Windows.Forms.Application]::DoEvents()
+    Start-Sleep -Milliseconds 100
+  }
+} finally {
+  if ($ni) { try { $ni.Visible = $false; $ni.Dispose() } catch {} }
+}
+'''
+
+
+def _bubble_powershell(title, text):
+    """退路: 起一个短命 powershell.exe, 用 NotifyIcon.ShowBalloonTip 弹一下。
+
+    跑完自己退出(脚本里 7 秒到点), 这里在**后台线程**里等它, 主流程一点也不等。
+    """
+    import base64
+    import subprocess
+    ps = os.path.join(os.environ.get('SystemRoot') or r'C:\Windows',
+                      'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    if not os.path.isfile(ps):
+        ps = 'powershell.exe'              # 系统装得特殊就交给 PATH, 不硬撑
+    env = dict(os.environ)
+    env['FOXPATH_BUBBLE_TITLE'] = str(title)
+    env['FOXPATH_BUBBLE_TEXT'] = str(text)
+    enc = base64.b64encode(_PS_BUBBLE.encode('utf-16-le')).decode('ascii')
+    flags = 0x08000000 if os.name == 'nt' else 0     # CREATE_NO_WINDOW
+    devnull = open(os.devnull, 'wb')
+    try:
+        p = subprocess.Popen([ps, '-NoProfile', '-NonInteractive',
+                              '-WindowStyle', 'Hidden', '-EncodedCommand', enc],
+                             creationflags=flags, stdin=devnull, stdout=devnull,
+                             stderr=devnull, close_fds=True, env=env)
+    finally:
+        devnull.close()
+    try:
+        p.wait(timeout=20)
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    return True
+
+
+def _bubble_worker(title, text):
+    """气泡线程: 先试系统原生, 不成再退回短命 powershell。全程只写日志, 绝不外抛。"""
+    try:
+        if _bubble_native(title, text):
+            return
+        log('升级结果气泡: 系统原生通知没能弹出, 退回短命 PowerShell 通知')
+    except Exception as e:
+        log('升级结果气泡: 系统原生通知出错(改用 PowerShell 兜底): %s' % e)
+    try:
+        if not _bubble_powershell(title, text):
+            log('升级结果气泡: 两种方式都没弹出通知(不影响升级本身)')
+    except Exception as e:
+        log('升级结果气泡: PowerShell 通知也出错了(不影响升级本身): %s' % e)
+
+
+def _spawn_bubble(title, text):
+    """把气泡丢进后台线程: 主流程一步都不等它(通知慢/卡都不影响升级)。"""
+    t = threading.Thread(target=_bubble_worker, args=(title, text), daemon=True)
+    t.start()
+    return t
+
+
+def report_update_result(ok, auto=False, from_ver='', to_ver='', why='', note=''):
+    """升级有结果了: ①结果落盘(面板那一行); ②按开关弹一次气泡。
+
+    ok=True 是"换上新版、并且新实例已经起来了"; ok=False 是任意一种没成的情况。
+    **绝不抛异常** —— 它是升级流程的尾巴, 不许反过来把升级搞失败。
+    """
+    try:
+        _write_update_result(ok, auto=auto, from_ver=from_ver, to_ver=to_ver,
+                             why=why, note=note)
+        log('升级结果: %s%s%s' % ('成功' if ok else '失败',
+                                  (' -> v%s' % to_ver) if (ok and to_ver) else '',
+                                  '' if ok else ' (%s)' % _human_reason(why, note)))
+        if not bubble_on():
+            log('升级结果气泡: 已按设置关闭, 本次不弹(面板那行状态照留)')
+            return False
+        key = (bool(ok), str(to_ver or ''), str(why or ''))
+        now = time.time()
+        with _BUBBLE_LOCK:
+            if now - _BUBBLE_SEEN.get(key, 0.0) < BUBBLE_DEDUP:
+                return False                # 同一件事短时间内只弹一次
+            _BUBBLE_SEEN[key] = now
+        title, text = _bubble_texts(ok, auto, to_ver, why)
+        _spawn_bubble(title, text)
+        return True
+    except Exception as e:
+        try:
+            log('升级结果气泡: 出错了(不影响升级本身): %s' % e)
+        except Exception:
+            pass
+        return False
+
+
+def report_prev_update(prev):
+    """启动时把"上一次升级到底成没成"报一次(面板那行 + 一次气泡)。
+
+    prev 是 consume_update_done() 的返回值; 没升级过就是 None, 此时什么都不做 ——
+    「平时绝不弹」这条就落在这一句上。
+    """
+    if not prev:
+        return None
+    ok = bool(_AUTO_UPGRADED[0])
+    return report_update_result(
+        ok, auto=bool(prev.get('auto')),
+        from_ver=str(prev.get('from') or ''),
+        to_ver=(APP_VERSION if ok else str(prev.get('to') or '')),
+        why=('' if ok else 'noeffect'))
+
+
 def _start_update(auto=False):
     """起一个升级线程; 已经在升级就不重复起(返回 False)。
 
@@ -1400,7 +1822,8 @@ def _start_update(auto=False):
     return True
 
 
-load_settings()          # 启动即生效: 默认 auto_update=True
+load_settings()          # 启动即生效: 默认 auto_update=True, notify_bubble=True
+load_update_result()     # 上次升级结果(面板那一行要用; 读不到就算了, 不挡启动)
 
 
 def read_update_info(use_cache=True):
@@ -1681,6 +2104,7 @@ def apply_update_async(auto=False):
     node = update_exe_node(info)
     if not node:
         _update_set(phase='failed', error='no_info', msg='升级信息里没有下载地址')
+        report_update_result(False, auto=auto, from_ver=APP_VERSION, why='no_info')
         return
     exe = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
     new = exe + '.new'
@@ -1695,6 +2119,9 @@ def apply_update_async(auto=False):
     if not sha:
         _update_set(phase='failed', error=err, msg='下载失败: %s' % err)
         log('升级: 下载失败 %s' % err)
+        # 失败也要有回音: 弹一次人话气泡, 并在面板留一行(异常原文只进日志/结果文件)
+        report_update_result(False, auto=auto, from_ver=APP_VERSION,
+                             to_ver=ver_to, why='net', note=err)
         return
     _update_set(phase='verifying', msg='正在校验安装包')
     ok, verr, vmsg = _verify_download(new, node, sha)
@@ -1705,12 +2132,16 @@ def apply_update_async(auto=False):
             os.remove(new)
         except Exception:
             pass
+        report_update_result(False, auto=auto, from_ver=APP_VERSION,
+                             to_ver=ver_to, why=verr)
         return
     # 交给小助手之前先把"这次升级 + 升级前的状态"存档: 新实例起来后会读它,
     # 在面板上留一行「已自动升级到 vX.Y.Z」, 并把系统代理开关接着用升级前的选择。
     _write_update_done(APP_VERSION, ver_to or APP_VERSION, auto, silent)
     if not _spawn_helper(exe, new, ver_to, silent=silent):
         _update_set(phase='failed', error='helper', msg='放小助手失败')
+        report_update_result(False, auto=auto, from_ver=APP_VERSION,
+                             to_ver=ver_to, why='helper')
         return
     _update_set(phase='applying', pct=100, msg='校验通过, 正在覆盖并重启…')
     log('升级: 已下好 %d 字节 (sha256=%s) 并通过校验, 交给小助手覆盖(升级前状态已存档)'
@@ -1765,11 +2196,13 @@ PANEL_HTML = """<!doctype html>
     <button class="primary" id="btnUpdCheck">检查更新</button>
     <button class="primary" id="btnUpdGo" style="display:none">立即升级</button>
     <label><input type="checkbox" id="autoUpd"> 自动升级</label>
+    <label><input type="checkbox" id="notifyBubble"> 升级结果气泡</label>
   </div>
   <div class="upd-bar" id="updBarWrap" style="display:none"><i id="updBar"></i></div>
   <div class="upd-banner" id="updBanner" style="display:none"></div>
   <div class="upd-note" id="updMsg">默认自动升级: 启动后发现有新版本会自动下好、校验、换上新版（不弹确认框）。</div>
   <div class="upd-note upd-ok" id="updAuto"></div>
+  <div class="upd-note" id="updLast"></div>
 </div>
 <div class="card">
   <div class="row" style="margin-bottom:10px">
@@ -1831,6 +2264,11 @@ function refresh(){
     // 自动升级开关 + 本次启动的升级结果(2026-10-09 用户要求: 默认自动升级、不弹提示)
     document.getElementById('autoUpd').checked = !!d.autoupd;
     document.getElementById('updAuto').textContent = d.upgraded || '';
+    // 升级结果气泡开关(默认开) + 「上次升级结果」一行(成功/失败 + 时间, 不只靠气泡)
+    document.getElementById('notifyBubble').checked = d.notify !== false;
+    const lr = document.getElementById('updLast');
+    lr.textContent = d.lastres || '';
+    lr.className = 'upd-note ' + (d.lastres ? (d.lastok ? 'upd-ok' : 'upd-err') : '');
     // 有新版本时亮一条: 自动升级开着就说"会自动升", 关着才让用户自己点
     const nb = document.getElementById('updBanner');
     if (d.newver) {
@@ -1859,6 +2297,12 @@ function doAct(u){
 document.getElementById('autoUpd').onchange = (e)=>{
   // 默认开; 关掉就只提示(设置存在数据目录的 settings.json 里)
   act('/api/autoupdate?on='+(e.target.checked?1:0)).then(r=>{
+    _say('updMsg', (r&&r.msg)||'已保存', 6000, false); refresh();
+  }).catch(()=>{_say('updMsg','设置没有保存成功',8000,true);refresh();});
+};
+document.getElementById('notifyBubble').onchange = (e)=>{
+  // 升级结果气泡(默认开): 关掉就完全不弹, 面板「上次升级结果」那一行照留
+  act('/api/notifybubble?on='+(e.target.checked?1:0)).then(r=>{
     _say('updMsg', (r&&r.msg)||'已保存', 6000, false); refresh();
   }).catch(()=>{_say('updMsg','设置没有保存成功',8000,true);refresh();});
 };
@@ -2025,6 +2469,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                 # 自动升级开关(默认开) + 本次启动是不是"刚被升级上来的"
                 'autoupd': auto_update_on(),
                 'upgraded': upgraded_text(),
+                # 升级结果气泡开关(默认开) + 上一次升级结果那一行(成功/失败 + 时间)
+                'notify': bubble_on(),
+                'lastres': last_result_text(),
+                'lastok': bool(_LAST_RESULT[0] and _LAST_RESULT[0].get('ok')),
                 'logs': recent_logs(),
             }
             self._send(200, json.dumps(data, ensure_ascii=False).encode('utf-8'),
@@ -2100,6 +2548,10 @@ class PanelHandler(BaseHTTPRequestHandler):
         elif path == '/api/autoupdate':
             # 设置里保留的开关(默认开): 关掉就回到"发现新版只提示"的老行为
             ok, msg = set_auto_update('on=1' in query)
+            resp = {'ok': ok, 'msg': msg}
+        elif path == '/api/notifybubble':
+            # 升级结果气泡的开关(默认开): 关掉就完全不弹, 只留面板那行状态
+            ok, msg = set_notify_bubble('on=1' in query)
             resp = {'ok': ok, 'msg': msg}
         elif path == '/api/set-ip':
             raw = ''
@@ -2252,8 +2704,10 @@ def main():
         return
 
     # 上一次升级留下的状态(用户 2026-10-09 要求: 不要丢状态):
-    #   ① 面板上留一行"已自动升级到 vX.Y.Z"; ② 系统代理开关接着用升级前的选择。
+    #   ① 面板上留一行"已自动升级到 vX.Y.Z"; ② 系统代理开关接着用升级前的选择;
+    #   ③ 结果(成了/没成)在右下角弹一次气泡 —— 没升级过时这里什么都不做, 不打扰。
     prev = consume_update_done()
+    report_prev_update(prev)
     keep_off = bool(_AUTO_UPGRADED[0]) and (prev or {}).get('proxy_on') is False
     if keep_off and proxy_on():
         log('升级前用户没有开启加速, 这里按原状态关掉, 不替他打开')
