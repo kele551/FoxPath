@@ -1,0 +1,89 @@
+name: 🐞 报告问题（Bug report）
+description: 打不开 GitHub、体检全灭、系统代理没还原、面板异常等
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。填之前先扫一眼这几条，能省一轮来回：
+
+        - **先看「已知边界」**：README 的[已知边界](https://github.com/kele551/FoxPath#已知边界)一节写清了哪些情况是设计如此
+          （哪些域名不走代理、被强杀后系统代理可能还指着本程序、端口占用会弹错误框等）。
+        - **`foxpath.log` 最有价值**：`%LOCALAPPDATA%\FoxPath\foxpath.log` 的末尾几十行。
+        - **不要贴出口 IP 之外的私人信息**；本程序不收集数据，日志里也不会有你的账号。
+        - **安全类问题不要发在这里**：如果怀疑是漏洞，请按 [SECURITY.md](../blob/main/SECURITY.md) 私下报告。
+
+  - type: input
+    id: version
+    attributes:
+      label: 程序版本号
+      description: 控制面板标题上就有，或右键 exe → 属性 → 详细信息
+      placeholder: "v1.0.6"
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      description: 设置 → 系统 → 关于，例如「Windows 10 专业版 22H2（19045）」
+      placeholder: "Windows 10 专业版 22H2（19045）"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: isp
+    attributes:
+      label: 你的宽带是哪家
+      description: 线路差异是这个项目最关键的变量（联通/移动/电信/校园网表现差很多）
+      options:
+        - 电信
+        - 联通
+        - 移动
+        - 校园网 / 公司网
+        - 手机热点
+        - 其它 / 不确定（在下面说明）
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 出了什么问题
+      description: 你做了什么、期望看到什么、实际看到什么。有截图更好（直接拖进来）
+      placeholder: |
+        1. 我双击 FoxPath.exe，面板打开了，点了「启用加速」
+        2. 期望：github.com 能打开
+        3. 实际：还是转圈，面板「当前可用 IP」显示 0 个
+    validations:
+      required: true
+
+  - type: input
+    id: ipcount
+    attributes:
+      label: 面板「当前可用 IP」那一栏显示几个
+      description: 例如「3 / 49」。反馈问题时带上这个数字，定位会快很多
+      placeholder: "3 / 49"
+    validations:
+      required: false
+
+  - type: textarea
+    id: log
+    attributes:
+      label: 日志末尾几十行
+      description: 打开 `%LOCALAPPDATA%\FoxPath\foxpath.log`，复制最后几十行（面板的「日志」区块也能看到尾部）
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: tried
+    attributes:
+      label: 你已经试过哪些（多选）
+      options:
+        - label: 点了面板上的「立即重测」
+        - label: 重启过程序
+        - label: 跑过 `FoxPath.exe --restore`
+        - label: 换过网络（比如手机热点）对比
+        - label: 一个都没试

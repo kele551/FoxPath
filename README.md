@@ -1,6 +1,6 @@
 # 狐径 FoxPath
 
-> 作者：**海风（kele551）** · 仓库：https://gitee.com/kele551/FoxPath （GitHub 同名镜像）
+> 作者：**海风（kele551）** · 仓库：https://github.com/kele551/FoxPath （Gitee 同名镜像：https://gitee.com/kele551/FoxPath ）
 
 ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.6-blue) ![Downloads](https://img.shields.io/github/downloads/kele551/FoxPath/total?label=downloads&color=green)
 
@@ -22,6 +22,9 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 - [已知边界](#已知边界)
 - [版本记录](#版本记录)
 - [联系与反馈](#联系与反馈)
+- [代码签名政策](CODE_SIGNING_POLICY.md)
+- [贡献指南](CONTRIBUTING.md)　·　[安全政策](SECURITY.md)
+- [路线图（Roadmap）](#路线图roadmap)　·　[参与贡献与治理](#参与贡献与治理)
 - [许可](#许可)
 
 ## 解决什么问题
@@ -52,7 +55,7 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 
 ## 用法
 
-1. 从 [Releases](https://gitee.com/kele551/FoxPath/releases) 下载 `FoxPath.exe`
+1. 从 [Releases](https://github.com/kele551/FoxPath/releases) 下载 `FoxPath.exe`
 2. 双击运行 → 浏览器自动打开控制面板 `http://127.0.0.1:8788/ui`
 3. 勾选「开机自启」即可后台常驻
 
@@ -173,12 +176,37 @@ python build_exe.py                   # 打包成 FoxPath.exe
 
 ## 联系与反馈
 
-遇到打不开、体检全灭、或者觉得哪里不好用，欢迎直接邮件反馈，我会看：
+遇到打不开、体检全灭、或者觉得哪里不好用，欢迎直接提 Issue，我会看：
 
-[仓库 Issues](https://gitee.com/kele551/FoxPath/issues)
+[GitHub Issues](https://github.com/kele551/FoxPath/issues)　·　[Gitee Issues](https://gitee.com/kele551/FoxPath/issues)
 
 反馈时如果能顺手附上控制面板里「当前可用 IP」那一栏的数字，定位会快很多。
 
 ## 许可
 
 MIT
+
+## 路线图（Roadmap）
+
+按优先级从高到低，都是已经排进计划、能落到代码上的事：
+
+1. **更省心的静默检查更新**：现在启动后只静默查一次、有新版在面板上提示一句（`a8e8bfb`，未发版）。
+   下一步做成可配置的定时静默检查 + 明确的"有新版"角标，仍然**只提示、不自动升级**。
+2. **IPv6 实测地址池**：候选池目前只有 IPv4（内置 45 个 + 官方 `meta` 补充）。
+   要加的是"真的握手成功过才入池"的 IPv6 地址，而不是把段表直接塞进去。
+3. **线路自适应**：按当前线路的历史成败给候选排序，换网（宽带 ↔ 热点）后不从头再摸一遍。
+4. **代码签名申请**：产物已自带 SHA256 与可复现构建说明，下一步申请免费代码签名，
+   缓解"首次运行被安全软件拦一下"的体验问题。详见 [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)。
+
+> 路线图只列真实在办的事，做完一项改一项；临时想到的、还没验证的想法不写在这里。
+
+## 参与贡献与治理
+
+| 项目 | 说明 |
+| --- | --- |
+| 维护者 | [@kele551](https://github.com/kele551)（海风），一人维护，同时担任提交者、审查者与发布批准者 |
+| 响应预期 | Issue / PR 一般 **7 天内**给第一次答复；安全类问题按 [SECURITY.md](SECURITY.md) 私下走，**3 天内**响应 |
+| 许可 | MIT（见 [LICENSE](LICENSE)）；提交贡献即表示同意按同一许可发布 |
+| 怎么参与 | 提 Issue / PR 之前先看 [CONTRIBUTING.md](CONTRIBUTING.md)：Issue 模板、PR 流程、代码风格、本地构建与自查、提交信息规范都在里面 |
+| 安全 | 漏洞请**不要**开公开 Issue，按 [SECURITY.md](SECURITY.md) 私下报告 |
+| 发布纪律 | 主程序零第三方依赖；每次发布都要先跑发版前自检（版本一致性、冷启动演练、升级演练、失败分支、退出还原）全绿，才允许上传附件 |

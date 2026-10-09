@@ -114,7 +114,7 @@
 | v1.0.1 | 2026-09-22 | 修「还原不了系统代理」一类缺陷：重复启用不再污染备份、备份失败不再改注册表、静默模式也注册退出还原、加单实例与端口占用提示、日志落文件、新增 `--restore`；`Fix-GitHub.ps1` 补 UTF-8 BOM（此前无法运行） |
 | v1.0.0 | 2026-09-19 | 首个版本：本地代理 + PAC、每 5 分钟 IP 体检、候选池自动刷新、全灭自愈、退出还原 |
 
-反馈：[仓库 Issues](https://gitee.com/kele551/FoxPath/issues)
+反馈：[GitHub Issues](https://github.com/kele551/FoxPath/issues)　·　[Gitee Issues](https://gitee.com/kele551/FoxPath/issues)
 
 ---
 

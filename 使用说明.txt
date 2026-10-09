@@ -1,5 +1,5 @@
 狐径 FoxPath - 使用说明
-作者: 海风（kele551）   https://gitee.com/kele551/FoxPath
+作者: 海风（kele551）   https://github.com/kele551/FoxPath
 版本看 exe 属性, 或控制面板标题
 ================================
 

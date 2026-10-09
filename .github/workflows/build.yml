@@ -1,0 +1,98 @@
+name: build
+
+# 这个工作流只做一件事：在干净的 Windows runner 上，用仓库里的真实构建脚本
+# 把 FoxPath.exe 打出来，并把 SHA256 打印+存档 —— 证明"发布产物确实由本仓库源码构建"。
+# 它不发布、不上传 Release、不签名（签名步骤见 CODE_SIGNING_POLICY.md，用占位注释标出）。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows 打包 + SHA256
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          # 与本地打包环境一致：Python 3.13
+          python-version: '3.13'
+
+      - name: 安装 PyInstaller
+        # 说明（写成事实，别误会）：**只有打包这一步需要 pyinstaller**。
+        # 发布出去的 FoxPath.exe 运行时**零第三方依赖**，全部 import 都是 Python 标准库。
+        run: python -m pip install --disable-pip-version-check "pyinstaller==6.22.3"
+
+      - name: 打包（仓库里的真实构建脚本）
+        run: python build_exe.py
+
+      - name: 整理产物 + 生成 SHA256 清单
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-staging | Out-Null
+          if (-not (Test-Path 'FoxPath.exe')) { throw '打包后没有找到 FoxPath.exe' }
+          Copy-Item 'FoxPath.exe' 'dist-staging\FoxPath.exe'
+          $lines = foreach ($f in (Get-ChildItem -File dist-staging | Sort-Object Name)) {
+            $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f.FullName).Hash
+            '{0}  {1}  {2} bytes' -f $h, $f.Name, $f.Length
+          }
+          $lines | Set-Content -Encoding utf8 dist-staging\SHA256SUMS.txt
+          Write-Host '===== SHA256 ====='
+          $lines | ForEach-Object { Write-Host $_ }
+
+      - name: 版本号自证 + 与升级源比对
+        shell: pwsh
+        run: |
+          $src = Get-Content -Raw github_direct.py
+          if ($src -match "APP_VERSION\s*=\s*'([0-9.]+)'") {
+            $ver = $Matches[1]
+          } else {
+            throw '在 github_direct.py 里找不到 APP_VERSION 常量'
+          }
+          Write-Host ("源码 APP_VERSION = " + $ver)
+          $vj = Get-Content -Raw version.json | ConvertFrom-Json
+          Write-Host ("version.json 版本 = " + $vj.version)
+          $exe = Get-Item 'FoxPath.exe'
+          Write-Host ("exe 文件版本      = " + $exe.VersionInfo.FileVersion)
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath 'FoxPath.exe').Hash
+          Write-Host ("exe SHA256        = " + $sha)
+          @(
+            "源码 APP_VERSION = $ver",
+            "version.json 版本 = $($vj.version)",
+            "exe 文件版本      = $($exe.VersionInfo.FileVersion)",
+            "version.json 里的 exe sha256 = $($vj.exe.sha256)",
+            "version.json 里的 exe size   = $($vj.exe.size)",
+            "本次构建 exe sha256          = $sha",
+            "本次构建 exe size            = $($exe.Length)"
+          ) | Add-Content -Encoding utf8 dist-staging\SHA256SUMS.txt
+          if ($vj.version -ne $ver) {
+            Write-Host "::warning::version.json 的版本号($($vj.version))与源码 APP_VERSION($ver) 不一致 —— 发版前必须对齐"
+          }
+          if ($vj.exe.sha256 -and ($vj.exe.sha256.ToUpper() -ne $sha)) {
+            Write-Host "::warning::本次构建的指纹与 version.json 里登记的不一致（本地改动未发版时属正常）"
+          }
+
+      # ── 代码签名占位 ───────────────────────────────────────────────
+      # 本项目正在申请免费代码签名（见 CODE_SIGNING_POLICY.md）。
+      # 通过之后，签名步骤插在这里：对 dist-staging\FoxPath.exe 签名，**然后再**算上面那份 SHA256。
+      # 现在没有签名，所以产物是未签名的 —— 请以 SHA256SUMS.txt 自行核对来源。
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: FoxPath-build-${{ github.sha }}
+          path: dist-staging/
+          if-no-files-found: error
+          retention-days: 30
