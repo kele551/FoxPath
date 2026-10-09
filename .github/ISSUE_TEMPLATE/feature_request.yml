@@ -1,0 +1,46 @@
+name: 💡 提功能建议（Feature request）
+description: 想要某个功能，或者觉得现在的做法别扭
+title: "[建议] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先说一句实话，免得你白等：这个项目由作者一人维护，**版本号只给新功能用**，
+        改动会攒到下一个功能版一起发。提建议前可以先看 README 末尾的「路线图（Roadmap）」，
+        已经排进计划的就不用重复提了。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你现在遇到的麻烦是什么
+      description: 先说场景，再说功能。比如"公司网封了 443，希望有备用端口方案"比"加个开关"更有用
+      placeholder: 描述你实际的使用场景，以及现在哪里不顺手
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你希望它怎么做
+      description: 有具体想法就写具体点；没有也行，说清"想达到什么效果"就够了
+    validations:
+      required: true
+
+  - type: textarea
+    id: alt
+    attributes:
+      label: 你试过的替代做法
+      description: 现在你是怎么绕开这个麻烦的（改 hosts、用别的工具、手动切网络等）
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 自查
+      options:
+        - label: 我确认这不是"文档里已经写明支持"的功能（README / 使用说明 / 路线图 里都找过了）
+          required: true
+        - label: 我理解这个项目的原则是"没有云服务"：主程序零第三方依赖、不经过任何第三方服务器，联网相关建议要符合这一点
+          required: false
