@@ -19,7 +19,11 @@ def main():
     ap.add_argument('--out', default=os.path.join(HERE, 'version.json'))
     a = ap.parse_args()
     with io.open(os.path.join(HERE, 'github_direct.py'), encoding='utf-8') as f:
-        ver = re.search(r"^APP_VERSION\s*=\s*'([^']+)'", f.read(), re.M).group(1)
+        # 单引号/双引号都认（以前只写死单引号，源码里换成双引号就 AttributeError: 'NoneType'）
+        m = re.search(r"""^APP_VERSION\s*=\s*['"]([^'"]+)['"]""", f.read(), re.M)
+    if not m:
+        raise SystemExit('github_direct.py 里找不到 APP_VERSION, 没法确定版本号')
+    ver = m.group(1)
     out = {'version': ver, 'notes': a.notes,
            'exe': {'sha256': sha256(a.exe),
                    'url': 'https://gitee.com/kele551/FoxPath/releases/download/v%s/FoxPath.exe' % ver,

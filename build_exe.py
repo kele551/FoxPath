@@ -56,6 +56,20 @@ def read_version():
     return m.group(1)
 
 
+def ver_tuple(ver):
+    """把版本号解析成 exe 资源要的 4 段数字。
+
+    不能直接 re.findall(r'\\d+', ver):  '1.0.6-beta1' 会被抓成 [1, 0, 6, 1]
+    -> 写成 1.0.6.1, 把 -beta1 的序号当成了第四段版本号。
+    现在先砍掉 -beta1 / +build 这类后缀, 再取前四段数字。
+    """
+    core = re.split(r'[-+]', ver, 1)[0]
+    n = [int(x) for x in re.findall(r'\d+', core)][:4]
+    if not n:
+        raise SystemExit('版本号里没有数字, 没法写进 exe 资源: %r' % ver)
+    return tuple((n + [0, 0, 0, 0])[:4])
+
+
 def main():
     for p in (SRC, ICO):
         if not os.path.isfile(p):
@@ -68,8 +82,7 @@ def main():
     _bd = os.path.join(HERE, 'build')
     os.makedirs(_bd, exist_ok=True)
     verfile = os.path.join(_bd, 'version_info.txt')
-    _n = [int(x) for x in re.findall(r'\d+', ver)]
-    _n = (_n + [0, 0, 0, 0])[:4]
+    _n = ver_tuple(ver)                  # 已经补齐到 4 段数字
     with open(verfile, 'w', encoding='utf-8') as _f:
         _f.write(VERSION_TEMPLATE % {'ver': ver, 'vts': tuple(_n)})
     print('版本号: %s   产物: %s.exe (版本号写进 exe 资源, 文件名不带版本)' % (ver, name))

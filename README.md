@@ -7,10 +7,13 @@
 GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，直连当前实测可用的 GitHub 官方 IP。
 
 **主程序（`github_direct.py` / 发布的 exe）不用管理员权限，不改 hosts，不改系统 DNS。**
+主程序从代码到运行都不碰 `hosts` 文件：它只把代理设置写进当前用户的注册表（HKCU），
+代理范围与还原方式见下面「原理」「核心机制」两节。
 
-> 仓库里另有一个**互不相干的旧版方案** `Fix-GitHub.ps1`（配合 `Run-GitHubFix.bat`）：
-> 它走的是完全不同的路子 —— 直接改系统 `hosts` 文件 + 装一个计划任务定时换 IP，
-> **需要管理员权限，会改 hosts**。两套方案二选一，别同时用。详见下方文件表。
+> ⚠ 仓库里另有一个**独立的历史脚本** `Fix-GitHub.ps1`（配合 `Run-GitHubFix.bat`）：
+> **只有它会改 `hosts`** —— 直接往系统 `hosts` 里钉 IP + 装一个计划任务定时换 IP，
+> **需要管理员权限**。它是上一代做法，与主程序**不共享代码、也不会一起运行**：
+> 用主程序就不需要它，两者**二选一**，别同时用（同时用会互相打架）。详见下方文件表。
 
 ## 目录
 
@@ -19,6 +22,7 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 - [用法](#用法)
 - [核心机制](#核心机制)
 - [从源码构建](#从源码构建)
+- [发版前自检（发布闸门）](#发版前自检发布闸门)
 - [已知边界](#已知边界)
 - [版本记录](#版本记录)
 - [联系与反馈](#联系与反馈)
@@ -108,6 +112,9 @@ pip install pyinstaller
 python build_exe.py                   # 打包成 FoxPath.exe
 ```
 
+主程序**零第三方依赖**（只用 Python 标准库），打包额外需要 `pyinstaller`，
+发布流水线 `tools/publish.py` 需要 `requests` —— 依赖口径见仓库根目录的 `requirements.txt`。
+
 > 图标不用管：`app.ico` 已经入库。仓库里那几个 `create_icon*.py` /
 > `make_icon_from_user_image.py` 是当初做图标用的一次性脚本，里面的输入输出路径都写死在
 > 作者本机（还有一个依赖本机剪贴板缓存），**在别的机器上跑不通**，正常构建不需要它们。
@@ -115,9 +122,14 @@ python build_exe.py                   # 打包成 FoxPath.exe
 | 文件 | 说明 |
 | --- | --- |
 | `github_direct.py` | 主程序：代理、PAC、体检、控制面板（推荐用这个） |
-| `Fix-GitHub.ps1` | **旧版备用方案**：往 `hosts` 里钉 IP + 装计划任务定时换；**需要管理员权限**，与主程序是两套互不干扰的做法，二选一即可 |
+| `Fix-GitHub.ps1` | **历史脚本，仓库里只有它会改 `hosts`**：往 `hosts` 里钉 IP + 装计划任务定时换；**需要管理员权限**，与主程序二选一（主程序不碰 `hosts`） |
 | `Run-GitHubFix.bat` | 以管理员身份拉起 `Fix-GitHub.ps1`（会弹 UAC） |
 | `build_exe.py` | PyInstaller 打包脚本 |
+| `make_version_json.py` | 生成升级源 `version.json`（版本号 + exe 指纹 + 字节数） |
+| `tools/preflight_release.py` | **发版前自检闸门**（发布前必须全绿），见下方「发版前自检」 |
+| `tools/compare_ips.py` | 把内置候选 IP 与 GitHub 官方 `meta` 网段对照（排查用） |
+| `tools/publish.py` | 一键发布流水线（Gitee 主 + GitHub 镜像），内置自检闸门 |
+| `requirements.txt` | 依赖口径：主程序零第三方依赖，只有发布脚本需要 `requests` |
 | `make_icon_from_user_image.py` | 图标生成（抠图 + 圆角底 + 多尺寸 ICO） |
 | `app.ico` | 程序图标 |
 | `release-notes.md` | 发行说明 |
@@ -130,6 +142,33 @@ python build_exe.py                   # 打包成 FoxPath.exe
 - **`.ps1` 文件必须保存为「UTF-8 带 BOM」**。PowerShell 5.1 对没有 BOM 的文件按 ANSI 读，
   中文会变乱码，字符串/花括号被破坏后直接 ParserError —— `Fix-GitHub.ps1` 在 v1.0.1 之前
   就是这样：文件本身完整，但因为没有 BOM 而**从未成功运行过**。
+
+## 发版前自检（发布闸门）
+
+**发版前自检脚本随仓库提供，位置 `tools/preflight_release.py`**（同目录的 `tools/compare_ips.py`
+用于对照官方 `meta` 网段排查候选 IP）：
+
+```bash
+python tools/preflight_release.py              # 默认拿仓库根目录的 FoxPath.exe 当候选
+python tools/preflight_release.py --help       # 看全部开关
+python tools/preflight_release.py --dry-run    # 只跑静态项：不写注册表、不拉程序、不碰系统代理
+```
+
+检查内容：
+
+| 类别 | 检查什么 |
+| --- | --- |
+| 版本一致性 | exe 文件版本 = 源码 `APP_VERSION` = `version.json` 版本，且 `version.json` 的 `sha256` / `size` 与候选 exe 对上 |
+| 冷启动演练 | 把候选 exe 复制成「刚下载落地」的样子，立刻用隐藏 PowerShell 启动，必须在限定时间内起来 |
+| 完整升级演练 | 旧版 → 本地升级源 → 检查更新 → 立即升级 → 必须自己起来（起不来则必须「重试过 + 明确提示用户」），并核对换上去的文件**指纹**等于候选 |
+| 失败分支 | 升级源里的 `sha256` 故意写错 → 必须拒绝并保留旧版 |
+| 接口与还原 | `/pac` 纯 ASCII、`/api/diag` 正常、非法 IP 被拒、连点两次启用不污染系统代理备份、退出后注册表还原、不留垃圾 |
+| 一致性警告（WARN） | ① 工作区副本与仓库副本 `tools/preflight_release.py` 的 **sha256 是否一致**（两份漂移了就警告）；② **两平台发行版附件 SHA256 是否一致**（Gitee 请求间隔 ≥3 秒限速；网络或平台异常只警告，不判红） |
+
+> 自检会真的改注册表、拉起本机已装的狐径（结束时再把它重新启动），所以**别在有正式发布任务之外随手整轮跑**；
+> 只想确认脚本自己没坏，用 `--dry-run`（只做静态检查）。
+> 警告级（WARN）不阻断发布，但会在结尾单独列出来，发布前应当看一眼。
+> `tools/publish.py release` 已内置这道闸门：自检不全绿直接中止发布（`--skip-preflight` 只留给线上事故回滚，且要在 `logs\` 写明原因）。
 
 ## 升级时请注意
 
@@ -157,11 +196,15 @@ python build_exe.py                   # 打包成 FoxPath.exe
   而你手动设的那个代理在启用期间不再生效（其它网站会直连）。停用/退出时会自动还原。程序检测到这种情况会在
   日志里明确写一行提醒。
 - 遇到端口被占用、启动失败等情况，exe 会弹一个错误框并写明日志位置，不再"点了没反应"。
+- **两个平台发行版的附件个数可能不一样**：Gitee 侧比 GitHub 侧多一个中文名演示视频
+  （`演示视频-狐径.mp4`），GitHub 侧只有 ASCII 名的 `FoxPath-demo-v1.0.6.mp4` —— 这是**已知差异**
+  （中文文件名在部分平台下载下来会乱码，所以对外链接一律给 ASCII 名）。
+  两个核心附件 `FoxPath.exe` / `version.json` 两平台逐字节一致；每次发布都会把附件下载回来比对 SHA256。
 
 ## 版本记录
 
-> 当前对外发布版本是 **v1.0.5**（2026-09-22，Gitee 与 GitHub 同步）。`v1.0.2` ~ `v1.0.4` 是本机迭代版本，
-> 未单独发版，改动已一并进 v1.0.5。
+> 当前对外发布版本是 **v1.0.6**（2026-10-08，Gitee 与 GitHub 同步；v1.0.6 之后本地另有未发布的小改动，
+> 攒到下一个功能版一起发）。`v1.0.2` ~ `v1.0.4` 是本机迭代版本，未单独发版，改动已一并进 v1.0.5。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
@@ -171,6 +214,7 @@ python build_exe.py                   # 打包成 FoxPath.exe
 | v1.0.3 | 2026-09-22 | 重做图标（去白底卡片、清掉残留边框、裁到狐狸本体居中放大，重出七档尺寸）；产物改名 `FoxPath.exe` 不带版本号，版本号写进 exe 属性 |
 | v1.0.4 | 2026-09-22 | 加作者署名（源码文件头、控制面板底部、日志、exe 属性、README 统一为「海风（kele551）」）；README 里的私人邮箱换成 Issues 链接 |
 | v1.0.5 | 2026-09-22 | **网页版在线升级**：控制面板里检查更新、版本迁移动画 + 渐变色进度条，下载到 `.new` 校验 SHA256 后由独立小助手接管（先让旧程序退出并还原系统代理 → 覆盖 → 重启） |
+| v1.0.6 | 2026-10-08 | **联通/移动友好**：内置候选池扩到官方全量 45 个 IPv4；IP 表三源依次兜底（官方 `meta` → Gitee 上的 `meta.json` → GitHub raw）；`raw.githubusercontent.com` / `objects.githubusercontent.com` 改走**专属 IP 池**（官方 `185.199.108.0/22`），raw 文件与发布附件也能加速（回应 Issue #1）；429 限流视为存活（实测可用 19/49 → 31/49）；面板新增「线路体检」与「手动指定 IP」；升级小助手加固（覆盖后轮询确认新实例真的起来、递增重试、失败弹窗提示手动双击）；对外文案措辞中性化 |
 
 详细发行说明见 [release-notes.md](release-notes.md)。
 
@@ -209,4 +253,4 @@ MIT
 | 许可 | MIT（见 [LICENSE](LICENSE)）；提交贡献即表示同意按同一许可发布 |
 | 怎么参与 | 提 Issue / PR 之前先看 [CONTRIBUTING.md](CONTRIBUTING.md)：Issue 模板、PR 流程、代码风格、本地构建与自查、提交信息规范都在里面 |
 | 安全 | 漏洞请**不要**开公开 Issue，按 [SECURITY.md](SECURITY.md) 私下报告 |
-| 发布纪律 | 主程序零第三方依赖；每次发布都要先跑发版前自检（版本一致性、冷启动演练、升级演练、失败分支、退出还原）全绿，才允许上传附件 |
+| 发布纪律 | 主程序零第三方依赖；每次发布都要先跑发版前自检 `tools/preflight_release.py`（版本一致性、冷启动演练、升级演练、失败分支、退出还原）全绿，才允许上传附件 |
