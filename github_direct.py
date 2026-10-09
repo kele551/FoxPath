@@ -62,6 +62,8 @@ HOMEPAGE = 'gitee.com/kele551/FoxPath'
 PROXY_PORT = 8787
 PANEL_PORT = 8788
 CHECK_INTERVAL = 300          # 5 分钟重测一轮
+# 转发通道的"空闲上限": 只要两端还有数据流动就一直续期, 不是总时长上限(审查 H-4)。
+RELAY_IDLE_TIMEOUT = 600
 
 # PAC 只代理这两个主机；代理内部也用同一份名单，保证"PAC 会送来的"和
 # "代理愿意走 IP 池的"完全一致。githubassets/githubusercontent/api.github.com
@@ -206,6 +208,12 @@ def diag_text():
 REG_INTERNET = r'Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 REG_RUN = r'Software\Microsoft\Windows\CurrentVersion\Run'
 
+# 改系统代理的互斥锁(审查 H-3): 面板是 ThreadingHTTPServer, 两个 POST 会真并发。
+# 没有这把锁时「读原值 -> 写备份 -> 写注册表」不是原子的: 快速连点两次「启用加速」,
+# 第二份请求会在第一份写好 PAC 之后才读到"原值", 于是把我们自己的 PAC 地址写进
+# 备份 —— 退出还原就永远回不到原始状态(v1.0.0 踩过, 现在以竞态形式复活)。
+_REG_LOCK = threading.Lock()
+
 _log_q = queue.Queue()
 _START_TS = [0.0]          # 进程启动时刻, 体检日志里用它显示"已运行多久"
 
@@ -241,6 +249,13 @@ DATA_DIR = _data_dir()
 LOG_FILE = os.path.join(DATA_DIR, 'foxpath.log')
 BACKUP_FILE = os.path.join(DATA_DIR, 'proxy-backup.json')
 LOG_MAX = 512 * 1024
+LOG_PANEL_LINES = 200      # 面板 /api/status 只回尾部这么多行
+LOG_QUEUE_MAX = 2000       # 面板没打开时队列也要有个上限, 不然会一直涨
+# 连接级日志(每转发一次写一行)的降级参数(审查 H-5): 正常浏览 GitHub 几十秒就能
+# 产生几百行, 而面板只显示尾部 200 行、文件只留尾部 500 行 —— 不降级的话,
+# 体检/自愈/升级/还原这些关键行会被直接挤出可视范围。
+CONN_LOG_SAMPLE = 20       # 每 N 次连接才写一行明细(进面板/进文件), 其余只进控制台
+CONN_LOG_WINDOW = 60       # 每 N 秒补一行"这段时间转发了几次"的聚合行
 
 
 def _log_to_file(line):
@@ -257,17 +272,62 @@ def _log_to_file(line):
         pass
 
 
-def log(msg):
+def log(msg, debug=False):
+    """关键行日志: 面板队列与文件都写。
+
+    debug=True 是连接级明细里"被抽样掉"的那一档: 只打控制台, 不进面板队列、
+    不进文件 —— 否则每次连接一行, 几十秒就能把体检/自愈/升级/还原这些关键行
+    挤出面板的 200 行与文件尾部 500 行(审查 H-5)。
+    """
     line = '[%s] %s' % (time.strftime('%Y-%m-%d %H:%M:%S'), msg)
-    _log_q.put(line)
-    _log_to_file(line)
+    if not debug:
+        if _log_q.qsize() >= LOG_QUEUE_MAX:
+            try:
+                _log_q.get_nowait()          # 面板没开时丢最旧的, 别无限涨
+            except queue.Empty:
+                pass
+        _log_q.put(line)
+        _log_to_file(line)
     try:
         print(line, flush=True)
     except Exception:
         pass
 
 
-def recent_logs(n=200):
+_conn_lock = threading.Lock()
+_conn_total = [0]            # 累计转发次数, 只用于日志抽样
+_conn_window = [0.0, 0]      # [本窗口起点, 本窗口内的次数]
+
+
+def log_conn(msg):
+    """连接级日志: 抽样 + 聚合(审查 H-5)。
+
+    第 1 次和之后每 CONN_LOG_SAMPLE 次写一行明细(进面板、进文件), 每个
+    CONN_LOG_WINDOW 秒再补一行聚合, 让面板里始终看得出"代理在转发";
+    其余只进控制台。失败/异常路径不走这里, 仍用 log() 全量保留。
+    返回 True 表示这一行进了面板与文件(方便自测断言)。
+    """
+    agg = ''
+    with _conn_lock:
+        _conn_total[0] += 1
+        n = _conn_total[0]
+        now = time.time()
+        if not _conn_window[0]:
+            _conn_window[0] = now
+        _conn_window[1] += 1
+        sample = (n == 1) or (n % CONN_LOG_SAMPLE == 0)
+        if now - _conn_window[0] >= CONN_LOG_WINDOW:
+            agg = ('连接日志聚合: 最近 %d 秒转发 %d 次(明细按 1/%d 抽样, 完整明细见控制台)'
+                   % (int(now - _conn_window[0]), _conn_window[1], CONN_LOG_SAMPLE))
+            _conn_window[0] = now
+            _conn_window[1] = 0
+    log(msg, debug=not sample)
+    if agg:
+        log(agg)
+    return sample
+
+
+def recent_logs(n=LOG_PANEL_LINES):
     out = []
     try:
         while True:
@@ -633,21 +693,41 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             up.close()
             return
         if used:
-            log('%s -> %s' % (host, used))
+            log_conn('%s -> %s' % (host, used))
         self._relay(up)
 
     def _relay(self, up):
         conn = self.connection
         pair = [conn, up]
+        # 转发阶段由 select 统一管超时, 先把两端 socket 的超时都放宽到同一个空闲
+        # 上限: 客户端那端带着 StreamRequestHandler 的 30 秒(self.timeout), 上游
+        # 那端还是建连时 create_connection 留下的 5 秒 —— 大附件(raw /
+        # objects.githubusercontent.com)慢速传输时会被这两个短超时中途掐断,
+        # 用户看到的是"下载中断、文件损坏"(审查 H-4)。
+        for s in pair:
+            try:
+                s.settimeout(RELAY_IDLE_TIMEOUT)
+            except Exception:
+                pass
         try:
             while True:
-                r, _, e = select.select(pair, [], pair, 120)
+                r, _, e = select.select(pair, [], pair, RELAY_IDLE_TIMEOUT)
                 if e:
+                    break
+                if not r:
+                    # 双方都静默满一个空闲上限才收摊, 而且写进日志 ——
+                    # 不再像以前那样不声不响地把流掐掉。
+                    log('转发空闲超过 %d 秒, 关闭这条连接(对端可能已放弃)' % RELAY_IDLE_TIMEOUT)
                     break
                 stop = False
                 for s in r:
                     try:
                         data = s.recv(65536)
+                    except TimeoutError:
+                        # 3.10 起 socket.timeout 就是 TimeoutError
+                        log('转发等待数据超过 %d 秒, 关闭这条连接' % RELAY_IDLE_TIMEOUT)
+                        stop = True
+                        break
                     except OSError:
                         stop = True
                         break
@@ -656,6 +736,10 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                         break
                     try:
                         (up if s is conn else conn).sendall(data)
+                    except TimeoutError:
+                        log('转发写入超过 %d 秒仍未完成, 关闭这条连接' % RELAY_IDLE_TIMEOUT)
+                        stop = True
+                        break
                     except OSError:
                         stop = True
                         break
@@ -737,58 +821,74 @@ def _load_backup():
 
 
 def enable_proxy():
-    # 已经在启用状态就不要再"备份"一次 —— 否则备份里存的会是我们自己的
-    # PAC 地址, 之后「停用并还原」只会把我们的地址写回去, 等于永远还原不了。
-    # (旧版每次点「启用加速」都会覆盖备份, 这是最容易复现的一处缺陷。)
-    if proxy_on():
-        log('加速已处于启用状态, 不重复备份 / 不改写')
-        return True
-    saved = {
-        'AutoConfigURL': reg_get(REG_INTERNET, 'AutoConfigURL'),
-        'ProxyEnable': reg_get(REG_INTERNET, 'ProxyEnable'),
-        'ProxyServer': reg_get(REG_INTERNET, 'ProxyServer'),
-    }
-    try:
-        with open(BACKUP_FILE, 'w', encoding='utf-8') as f:
-            json.dump(saved, f, ensure_ascii=False)
-    except Exception as e:
-        # 备份写不进去就绝不改注册表 —— 否则退出时无法还原, 用户会被留在
-        # "PAC 指向死端口"的状态里(这正是 v1.0.0 踩过的坑)。
-        log('!! 无法保存还原备份(%s), 为安全起见不改系统代理' % e)
-        return False
-    if saved.get('ProxyEnable') and saved.get('ProxyServer'):
-        # 一旦设置了 PAC, WinINET 会优先用它, 静态代理(ProxyEnable=1)就被旁路了。
-        # 家用场景一般没有静态代理; 万一有, 至少要让用户知道发生了什么。
-        log('注意: 你原本设了静态代理 %s —— 启用期间 PAC 优先级更高, '
-            '其它网站会直连而不是走原代理; 停用时会自动还原'
-            % saved.get('ProxyServer'))
-    reg_set(REG_INTERNET, 'AutoConfigURL', 'http://127.0.0.1:%d/pac' % PANEL_PORT)
-    notify_proxy_change()
-    log('加速已开启 (原设置已备份到 %s)' % BACKUP_FILE)
-    return True
+    """启用加速, 返回 (ok, msg) —— 面板要按 ok 明确告诉用户成没成(审查 H-2)。
+
+    整段「读原值 -> 写备份 -> 写注册表」在同一把 _REG_LOCK 里完成(审查 H-3):
+    并发/连点时后一个请求会在前一个写完之后才判断, 不会拿我们自己的 PAC 当原值
+    写进备份, 备份因此只写一次、且永远是"进入本程序管理之前"的原始值。
+    """
+    with _REG_LOCK:
+        # 已经在启用状态就不要再"备份"一次 —— 否则备份里存的会是我们自己的
+        # PAC 地址, 之后「停用并还原」只会把我们的地址写回去, 等于永远还原不了。
+        # (旧版每次点「启用加速」都会覆盖备份, 这是最容易复现的一处缺陷。)
+        if proxy_on():
+            log('加速已处于启用状态, 不重复备份 / 不改写')
+            return True, '加速已处于启用状态'
+        saved = {
+            'AutoConfigURL': reg_get(REG_INTERNET, 'AutoConfigURL'),
+            'ProxyEnable': reg_get(REG_INTERNET, 'ProxyEnable'),
+            'ProxyServer': reg_get(REG_INTERNET, 'ProxyServer'),
+        }
+        try:
+            with open(BACKUP_FILE, 'w', encoding='utf-8') as f:
+                json.dump(saved, f, ensure_ascii=False)
+        except Exception as e:
+            # 备份写不进去就绝不改注册表 —— 否则退出时无法还原, 用户会被留在
+            # "PAC 指向死端口"的状态里(这正是 v1.0.0 踩过的坑)。
+            msg = ('无法保存还原备份(%s), 为安全起见没有修改系统代理 —— 加速未生效。'
+                   '请检查这个目录能不能写: %s' % (e, DATA_DIR))
+            log('!! ' + msg.replace('\n', ' '))
+            return False, msg
+        if saved.get('ProxyEnable') and saved.get('ProxyServer'):
+            # 一旦设置了 PAC, WinINET 会优先用它, 静态代理(ProxyEnable=1)就被旁路了。
+            # 家用场景一般没有静态代理; 万一有, 至少要让用户知道发生了什么。
+            log('注意: 你原本设了静态代理 %s —— 启用期间 PAC 优先级更高, '
+                '其它网站会直连而不是走原代理; 停用时会自动还原'
+                % saved.get('ProxyServer'))
+        reg_set(REG_INTERNET, 'AutoConfigURL', 'http://127.0.0.1:%d/pac' % PANEL_PORT)
+        notify_proxy_change()
+        log('加速已开启 (原设置已备份到 %s)' % BACKUP_FILE)
+        return True, '加速已开启, 原系统代理设置已备份'
 
 
 def disable_proxy():
-    saved = _load_backup()
-    if saved is None:
-        # 没有备份时要分两种情况, 不能一律删:
-        #   a) 当前值确实指向本程序 -> 是本程序留下的残留, 清掉(用户删程序后
-        #      系统里永远是死端口的 PAC, 2026-09-22 实测就是这种状态);
-        #   b) 当前值指向别处(公司 PAC / 其它工具下发的) -> **保持原样**。
-        #      那份地址我们既没备份也无从得知, 删了就永久回不来。
-        if not proxy_on():
-            log('没有还原备份, 且当前系统代理不是本程序所设 —— 保持原样, 不做任何修改')
-            return False
-        log('没有找到还原备份, 只清掉本程序的 PAC 设置(原值已无从得知)')
-        saved = {}
-    reg_set(REG_INTERNET, 'AutoConfigURL', saved.get('AutoConfigURL') or None)
-    if saved.get('ProxyServer'):
-        reg_set(REG_INTERNET, 'ProxyServer', saved['ProxyServer'])
-    if saved.get('ProxyEnable') is not None:
-        reg_set(REG_INTERNET, 'ProxyEnable', saved['ProxyEnable'], 4)
-    notify_proxy_change()
-    log('加速已关闭, 系统代理已还原')
-    return True
+    """停用并还原, 返回 (ok, msg) —— 失败原因要在面板上写清楚(审查 H-2)。
+
+    与 enable_proxy 共用同一把 _REG_LOCK(审查 H-3): 启用与还原不会交叉执行,
+    否则"刚写好的还原备份"可能被并发的还原流程读成半截。
+    """
+    with _REG_LOCK:
+        saved = _load_backup()
+        if saved is None:
+            # 没有备份时要分两种情况, 不能一律删:
+            #   a) 当前值确实指向本程序 -> 是本程序留下的残留, 清掉(用户删程序后
+            #      系统里永远是死端口的 PAC, 2026-09-22 实测就是这种状态);
+            #   b) 当前值指向别处(公司 PAC / 其它工具下发的) -> **保持原样**。
+            #      那份地址我们既没备份也无从得知, 删了就永久回不来。
+            if not proxy_on():
+                log('没有还原备份, 且当前系统代理不是本程序所设 —— 保持原样, 不做任何修改')
+                return False, ('当前系统代理不是狐径所设, 也没有找到还原备份 —— '
+                               '已保持原样, 没有做任何修改')
+            log('没有找到还原备份, 只清掉本程序的 PAC 设置(原值已无从得知)')
+            saved = {}
+        reg_set(REG_INTERNET, 'AutoConfigURL', saved.get('AutoConfigURL') or None)
+        if saved.get('ProxyServer'):
+            reg_set(REG_INTERNET, 'ProxyServer', saved['ProxyServer'])
+        if saved.get('ProxyEnable') is not None:
+            reg_set(REG_INTERNET, 'ProxyEnable', saved['ProxyEnable'], 4)
+        notify_proxy_change()
+        log('加速已关闭, 系统代理已还原')
+        return True, '已停用, 系统代理已还原'
 
 
 def proxy_on():
@@ -1068,6 +1168,31 @@ def _spawn_helper(exe, new, ver):
         return False
 
 
+def _verify_download(path, node, sha):
+    """升级包完整性校验(审查 H-1)。返回 (ok, err, msg)。
+
+    sha256 是这条升级链上唯一的完整性凭证(HTTPS 之外没有签名), 所以升级源里
+    没有 sha256 时必须拒绝 —— 不能像以前那样"want 为空就放行", 那会让漏写或
+    被改写过的 exe 未经任何校验就覆盖到用户机器上。size 只要声明了也一并核对。
+    """
+    want = str(node.get('sha256') or '').upper().strip()
+    if not want:
+        return False, 'nosha', ('升级源没有提供 sha256 校验值, 为安全起见已拒绝升级'
+                                '(当前版本保持不变)')
+    if sha != want:
+        return False, 'sha', '校验不过(期望 %s, 实际 %s), 已放弃' % (want[:16], sha[:16])
+    want_size = int(node.get('size') or 0)
+    if want_size:
+        try:
+            got = os.path.getsize(path)
+        except OSError:
+            got = -1
+        if got != want_size:
+            return False, 'size', ('下载大小不符(期望 %d 字节, 实际 %d 字节), '
+                                   '已拒绝升级(当前版本保持不变)' % (want_size, got))
+    return True, '', ''
+
+
 def apply_update_async():
     """后台线程: 下载 -> 校验 -> 叫小助手覆盖并重启。"""
     info = read_update_info()
@@ -1084,10 +1209,10 @@ def apply_update_async():
         log('升级: 下载失败 %s' % err)
         return
     _update_set(phase='verifying', msg='正在校验安装包')
-    want = str(node.get('sha256') or '').upper().strip()
-    if want and sha != want:
-        _update_set(phase='failed', error='sha', msg='校验不过(期望 %s, 实际 %s), 已放弃' % (want[:16], sha[:16]))
-        log('升级: 校验不过, 已放弃; 期望 %s 实际 %s' % (want[:16], sha[:16]))
+    ok, verr, vmsg = _verify_download(new, node, sha)
+    if not ok:
+        _update_set(phase='failed', error=verr, msg=vmsg)
+        log('升级: %s' % vmsg)
         try:
             os.remove(new)
         except Exception:
@@ -1165,6 +1290,7 @@ PANEL_HTML = """<!doctype html>
     <button id="btnTest">立即重测</button>
     <label><input type="checkbox" id="auto"> 开机自启</label>
     <button class="danger" id="btnQuit">退出并还原</button>
+    <span id="actMsg" style="font-size:13px;color:#16a34a"></span>
   </div>
 </div>
 
@@ -1224,8 +1350,16 @@ function refresh(){
     const p=document.getElementById('log'); p.scrollTop=p.scrollHeight;
   }).catch(()=>{});
 }
-document.getElementById('btnEnable').onclick = ()=>act('/api/enable').then(refresh);
-document.getElementById('btnDisable').onclick = ()=>act('/api/disable').then(refresh);
+function doAct(u){
+  act(u).then(r=>{
+    // 后端的 ok/msg 必须显示出来: 启用失败时用户绝不能以为已经生效(审查 H-2)
+    if(r&&r.ok===false){_say('actMsg',(r.msg||'操作没有成功'),12000,true);}
+    else{_say('actMsg',(r&&r.msg)||'已完成',3000,false);}
+    refresh();
+  }).catch(()=>{_say('actMsg','面板没有响应, 操作结果未知',12000,true);refresh();});
+}
+document.getElementById('btnEnable').onclick = ()=>doAct('/api/enable');
+document.getElementById('btnDisable').onclick = ()=>doAct('/api/disable');
 document.getElementById('btnTest').onclick = ()=>{
   document.getElementById('btnTest').disabled=true;
   act('/api/retest').then(()=>{document.getElementById('btnTest').disabled=false;refresh()});
@@ -1242,7 +1376,8 @@ function loadDiag(){
     document.getElementById('diag').textContent = t;
   }).catch(()=>{});
 }
-function _say(id,txt){const e=document.getElementById(id);if(e){e.textContent=txt;setTimeout(()=>{e.textContent=''},2500);}}
+function _say(id,txt,ms,err){const e=document.getElementById(id);if(e){e.textContent=txt;
+  e.style.color=err?'#b91c1c':'';setTimeout(()=>{e.textContent='';e.style.color='';},ms||2500);}}
 function copyDiag(){
   const t=document.getElementById('diag').textContent||'';
   if(navigator.clipboard&&navigator.clipboard.writeText){
@@ -1402,10 +1537,15 @@ class PanelHandler(BaseHTTPRequestHandler):
             return
         path = self.path.split('?')[0]
         query = self.path.split('?')[1] if '?' in self.path else ''
+        # 后端必须把 ok / 失败原因回给面板(审查 H-2): 原来返回值被丢在地上,
+        # 用户点了「启用加速」没生效也看不出来。
+        resp = {'ok': True, 'msg': ''}
         if path == '/api/enable':
-            enable_proxy()
+            ok, msg = enable_proxy()
+            resp = {'ok': ok, 'msg': msg}
         elif path == '/api/disable':
-            disable_proxy()
+            ok, msg = disable_proxy()
+            resp = {'ok': ok, 'msg': msg}
         elif path == '/api/retest':
             threading.Thread(target=lambda: (HEALTH.refresh(candidate_list()),
                                               HEALTH_RAW.refresh(CANDIDATE_IPS_RAW)),
@@ -1439,7 +1579,13 @@ class PanelHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length') or 0)
         if length:
             self.rfile.read(length)
-        self._send(200, b'{"ok":true}', 'application/json')
+        self._send(200, json.dumps(resp, ensure_ascii=False).encode('utf-8'),
+                   'application/json; charset=utf-8')
+        if path == '/api/enable' and not resp['ok']:
+            # 面板可能没被打开/没被看到 —— 沿用现有的弹窗机制再兜一次(审查 H-2)
+            threading.Thread(target=alert,
+                             args=('狐径: 启用加速失败', resp['msg'] or '加速没有生效'),
+                             daemon=True).start()
 
 
 def start_panel():
