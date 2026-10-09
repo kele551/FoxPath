@@ -19,6 +19,12 @@ jobs:
     name: Windows 打包 + SHA256
     runs-on: windows-latest
     timeout-minutes: 30
+    # 【2026-10-09 修】GitHub 的 Windows runner 控制台默认 cp1252，
+    # 构建脚本里的中文 print 会抛 UnicodeEncodeError 直接把 CI 弄红。
+    # 强制 Python 用 UTF-8 输出即可（本地因此从没复现过）。
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
 
     steps:
       - name: 检出源码
