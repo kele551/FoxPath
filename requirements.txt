@@ -1,0 +1,18 @@
+# 狐径 FoxPath —— 依赖口径（作者: 海风（kele551）  https://github.com/kele551/FoxPath）
+#
+# 主程序零第三方依赖：
+#   github_direct.py 只用 Python 标准库（socket / ssl / http.server / winreg / json ...），
+#   所以运行发布的 FoxPath.exe、或直接 `python github_direct.py` 都不需要装任何包。
+#
+# 只有"开发/发布用"的脚本才需要额外依赖，见下面两条 —— 它们不参与主程序运行，
+# 也不进 exe。想构建/发布时才装：
+#
+#   pyinstaller   —— 打包用（build_exe.py 调 `python -m PyInstaller`）
+#   requests      —— 发布流水线用（tools/publish.py，走 Gitee API / 下载回验）
+#
+# 用法（按需装，别一股脑全装）：
+#   pip install pyinstaller                     # 只打包
+#   pip install -r requirements.txt             # 打包 + 发布
+
+pyinstaller>=6.0        # 打包（build_exe.py）
+requests>=2.28          # 发布流水线（tools/publish.py）
