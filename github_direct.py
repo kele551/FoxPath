@@ -40,6 +40,7 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import select
 import socket
 import socketserver
@@ -56,7 +57,7 @@ from ctypes import wintypes          # 升级结果气泡要用(Shell_NotifyIcon
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = '狐径'
-APP_VERSION = '1.0.6'
+APP_VERSION = '1.0.7'
 # 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
 AUTHOR = '海风（kele551）'
 AUTHOR_ASCII = 'HaiFeng (kele551)'
@@ -277,12 +278,43 @@ _log_q = queue.Queue()
 _START_TS = [0.0]          # 进程启动时刻, 体检日志里用它显示"已运行多久"
 
 
+# ── 启动阶段绝不弹模态对话框(★★ 2026-10-09 线上事故的加固)──────────────────
+# 升级小助手判"新版本起没起来"看的是**控制面板有没有应答**; 而 MessageBox 是模态的 ——
+# 启动路上任何一个弹窗都会把进程挂在那儿等人点"确定", 面板就一直起不来,
+# 小助手于是判定失败、结束卡住的进程、反复重启, 用户升级完就"没有程序可用"。
+# 所以定一条硬规矩: 启动宽限期内(STARTUP_MODAL_GRACE 秒)、以及"这次是升级交接上来的"
+# 整个进程, 一律**不弹模态框** —— 失败只写日志 + 在面板/气泡里显示。
+STARTUP_MODAL_GRACE = 120.0
+_HANDOFF_STARTUP = [False]      # 本次启动是不是"刚被升级换上新版本"的那一次
+
+
+def modal_allowed():
+    """现在允许弹模态框吗? 启动阶段与升级交接后一律不许(见上面的说明)。"""
+    if _HANDOFF_STARTUP[0]:
+        return False
+    t0 = _START_TS[0] or 0.0
+    return (time.time() - t0) > STARTUP_MODAL_GRACE
+
+
 def alert(title, text):
-    """exe 是 --noconsole 的: 致命错误只写日志的话, 用户双击后看到的是"没反应"。
-    有控制台时不弹窗(免得命令行下被打断), 只在冻结的 exe 或没有 stdout 时弹。"""
+    """重要提示。启动阶段(尤其升级交接后)**不弹模态框**, 只写日志 + 弹一个非模态气泡。
+
+    exe 是 --noconsole 的: 致命错误只写日志的话, 用户双击后看到的是"没反应" —— 所以
+    该提示还是要提示, 只是不再用会挂住启动的模态框; 命令行跑源码时屏幕上看得到, 不弹。
+    """
     try:
-        if getattr(sys, 'frozen', False) or sys.stdout is None:
+        if (not getattr(sys, 'frozen', False)) and sys.stdout is not None:
+            return                          # 有控制台: 命令行下不该被打断
+        if modal_allowed():
             ctypes.windll.user32.MessageBoxW(None, text, title, 0x10)   # MB_ICONERROR
+            return
+        log('提示(启动阶段不弹模态框, 只写日志+气泡): %s | %s'
+            % (title, ' '.join(str(text).split())))
+        try:
+            if bubble_on():                 # 非模态气泡: 看一眼就没了, 不会挂住启动
+                _spawn_bubble(str(title), str(text))
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -292,10 +324,11 @@ _alert_seen = {}
 
 
 def alert_once(key, title, text, window=15.0):
-    """同一件事短时间内只弹一次(审查 M-4)。
+    """同一件事短时间内只提示一次(审查 M-4)。
 
-    enable_proxy 回读失败时会弹一次, 面板的 /api/enable 分支还有一道兜底弹窗 ——
-    两处都走这里, 靠它去重: 同一个错误不会连着弹两个框。
+    enable_proxy 回读失败时会提示一次, 面板的 /api/enable 分支还有一道兜底 ——
+    两处都走这里, 靠它去重: 同一个错误不会连着提示两次。启动阶段由 alert() 决定
+    "写日志+气泡"还是"弹模态框"(升级交接后的启动一律不弹模态框)。
     """
     now = time.time()
     with _alert_lock:
@@ -1180,6 +1213,9 @@ UPDATE = {
     'got': 0, 'total': 0, 'pct': 0, 'msg': '', 'error': '',
     'local': APP_VERSION, 'remote': '', 'notes': '', 'exe_url': '', 'exe_sha': '',
     'auto': False,        # 这次升级是不是「按设置自动升的」(面板上要区别显示)
+    # 远程 vs 本地的关系与结论(2026-10-09 线上事故后加): 面板照 relation / newer
+    # 渲染, 服务端也照它决定放不放行 —— 不再让任何一处拿 remote != local 当"有新版本"。
+    'relation': '', 'newer': False, 'block_msg': '',
 }
 
 # 静默检查新版本（2026-10-08 加；2026-10-09 改成**默认自动升级**）——
@@ -1204,6 +1240,11 @@ SETTINGS = {'auto_update': AUTO_UPDATE_DEFAULT, 'notify_bubble': NOTIFY_DEFAULT}
 AUTO_UPDATE_MAX_TRIES = 2                  # 同一个版本 24 小时内最多自动试几次
 AUTO_UPDATE_TRIES_FILE = os.path.join(DATA_DIR, 'update-tries.json')
 UPDATE_DONE_FILE = os.path.join(DATA_DIR, 'update-done.json')
+# 升级相关存档(update-done.json / update-result.json)的**格式号**(2026-10-09 加):
+# 写的时候带上它 + 写它的程序版本; 读的时候只认自己认识的字段, 不认识的忽略、
+# 少了字段用默认值, **绝不因为存档格式报错** —— 升级/回滚时新旧版本互相读对方的
+# 存档是常态, 存档不该成为"新版本起不来"的原因。
+UPDATE_STATE_SCHEMA = 2
 _AUTO_UPGRADED = [None]                    # 本次启动是"刚被升级上来的"就记在这里
 
 # ── 升级结果气泡（2026-10-09 用户要求：升级完成/失败在右下角弹一下）──────────
@@ -1224,19 +1265,86 @@ _BUBBLE_SEEN = {}                          # 结果 -> 上次弹的时刻(去重
 
 
 def ver_tuple(v):
-    try:
-        return tuple(int(x) for x in str(v).strip().split('.'))
-    except Exception:
-        return (0,)
+    """把版本号拆成"分段整数"元组: '1.0.10' -> (1, 0, 10)。
+
+    2026-10-09 线上事故后加固(当时本地 1.0.7 对着线上 1.0.6 提示"发现新版本"):
+      ① 必须**分段当数字比**, 绝不按字符串比 —— 按字符串 '1.0.10' < '1.0.9' 是错的,
+         分段比数字才是 1.0.10 > 1.0.9;
+      ② 段里的非数字尾巴(1.0.7-beta / 1.0.7+build)按语义忽略, 不再让 int() 抛异常 ——
+         老写法一喂 '1.0.7-beta' 就整串退化成 (0,), 于是"预发布版"比谁都不如;
+      ③ 末尾的 0 段削掉, 于是 '1.0' 与 '1.0.0' 相等;
+      ④ 空值 / 乱码统一给 (0,), 比大小永不抛异常。
+    """
+    out = []
+    for part in str(v if v is not None else '').strip().lstrip('vV').split('.'):
+        m = re.match(r'\s*(\d+)', part)
+        out.append(int(m.group(1)) if m else 0)
+    while out and out[-1] == 0:
+        out.pop()
+    return tuple(out) or (0,)
 
 
 def cmp_ver(a, b):
-    """比大小: a>b 返回 1, 相等 0, a<b 返回 -1。"""
+    """按版本号语义比大小: a>b 返回 1, 相等 0, a<b 返回 -1(1.0.10 > 1.0.9)。"""
     ta, tb = ver_tuple(a), ver_tuple(b)
     n = max(len(ta), len(tb))
     ta = ta + (0,) * (n - len(ta))
     tb = tb + (0,) * (n - len(tb))
     return (ta > tb) - (ta < tb)
+
+
+# ── 远程 vs 本地: 三种关系一套措辞(面板 / 日志 / 接口共用, 免得各写各的)─────
+VER_NEWER, VER_SAME, VER_OLDER, VER_UNKNOWN = 'newer', 'same', 'older', 'unknown'
+VER_OLDER_TEXT = '本地版本比线上新（预发布/开发版本），线上暂未发布'
+
+
+def ver_relation(remote, local=None):
+    """远程版本 vs 本地版本 -> newer / same / older / unknown。"""
+    r = str(remote if remote is not None else '').strip()
+    if not r:
+        return VER_UNKNOWN
+    c = cmp_ver(r, APP_VERSION if local is None else local)
+    return VER_NEWER if c > 0 else (VER_SAME if c == 0 else VER_OLDER)
+
+
+def ver_verdict(remote, local=None):
+    """一次「检查更新」的结论: (关系, 能不能升级, 面板上那一句人话)。
+
+    ★★ 2026-10-09 线上事故的教训就落在这个函数里(本机装 1.0.7、线上发布的是 1.0.6,
+    面板却提示「发现新版本 v1.0.6」, 用户一点「立即升级」真把 1.0.7 换成了 1.0.6):
+      · 远程 **严格大于** 本地 -> 才叫「发现新版本」, 才允许升级;
+      · 远程 **等于** 本地     -> 「已是最新版」;
+      · 远程 **小于** 本地     -> 不提示升级, 直说"本地版本比线上新(预发布/开发版本)",
+                                 并且**禁止升级**(服务端也要挡, 见 update_gate)。
+    """
+    local = APP_VERSION if local is None else str(local)
+    rel = ver_relation(remote, local)
+    if rel == VER_NEWER:
+        return rel, True, '发现新版本 v%s（当前 v%s）' % (remote, local)
+    if rel == VER_SAME:
+        return rel, False, '已是最新版 v%s' % local
+    if rel == VER_OLDER:
+        return rel, False, '%s：本地 v%s，线上 v%s' % (VER_OLDER_TEXT, local, remote)
+    return rel, False, '暂时读不到线上版本（升级源里没有版本号）'
+
+
+def update_gate(remote, local=None):
+    """升级闸门(纯函数, 单元测试直接调): (放行?, 拒绝原因人话, 要写进日志的那一行)。
+
+    ★ 只把面板按钮置灰是不够的 —— 本机任何程序都能直接 POST /api/update/start。
+    所以任何触发升级的入口(面板「立即升级」、启动时的静默自动升级、以后新加的入口)
+    都必须先过这里; 拒绝时**写一行日志**, 降级那一档口径固定为
+    「拒绝降级：远程 x < 本地 y」。
+    """
+    local = APP_VERSION if local is None else str(local)
+    rel, allow, msg = ver_verdict(remote, local)
+    if allow:
+        return True, '', ''
+    if rel == VER_OLDER:
+        return False, msg, '拒绝降级：远程 %s < 本地 %s' % (remote, local)
+    if rel == VER_SAME:
+        return False, msg, '拒绝升级：远程 %s == 本地 %s（同版本不用升）' % (remote, local)
+    return False, msg, '拒绝升级：升级源里没有版本号(远程 %r)' % (remote,)
 
 
 def _update_set(**kw):
@@ -1377,8 +1485,13 @@ def _write_update_done(from_ver, to_ver, auto, silent):
 
     新实例起来后读它, 就能: ①在面板上留一行「已自动升级到 vX.Y.Z」;
     ②把升级前的系统代理开关接着用, 不因为换了 exe 就把用户的选择重置(不丢状态)。
+
+    ★ 2026-10-09 起: 存档里**带上格式号(schema)与写它的程序版本(app)**。
+    升级链路上"新版本写、旧版本读"(比如降级、回滚)是常态, 所以读写两端都要
+    向下兼容: 写的多加字段、读的只认认识的字段, 谁都不许因为存档格式摔一跤。
     """
-    d = {'from': str(from_ver), 'to': str(to_ver), 'auto': bool(auto),
+    d = {'schema': UPDATE_STATE_SCHEMA, 'app': str(APP_VERSION),
+         'from': str(from_ver), 'to': str(to_ver), 'auto': bool(auto),
          'silent': bool(silent), 'proxy_on': bool(proxy_on()),
          'autostart': bool(autostart_on()), 'ts': time.time()}
     try:
@@ -1390,7 +1503,11 @@ def _write_update_done(from_ver, to_ver, auto, silent):
 
 
 def consume_update_done():
-    """启动时读一次: 上一次升级到底成没成。返回 dict 或 None。"""
+    """启动时读一次: 上一次升级到底成没成。返回 dict 或 None。
+
+    读法按"向下兼容"来(2026-10-09 起): 只认自己认识的字段, 多了少了都不报错;
+    存档里的 schema 比本程序认识的更新时, 也只写一行日志后照读认识的字段。
+    """
     try:
         with open(UPDATE_DONE_FILE, encoding='utf-8') as f:
             d = json.load(f)
@@ -1402,6 +1519,10 @@ def consume_update_done():
         pass
     if not isinstance(d, dict):
         return None
+    sch = d.get('schema')
+    if isinstance(sch, int) and sch > UPDATE_STATE_SCHEMA:
+        log('上次升级的存档格式是 v%d(比本程序认识的 v%d 新), 只读认识的字段, 不影响使用'
+            % (sch, UPDATE_STATE_SCHEMA))
     to = str(d.get('to') or '')
     if to and to == APP_VERSION:
         _AUTO_UPGRADED[0] = {'to': to, 'from': str(d.get('from') or ''),
@@ -1436,6 +1557,9 @@ RESULT_REASONS = {
     'helper': '没能启动升级小助手',
     'no_info': '升级信息里没有下载地址',
     'noeffect': '重启后还是旧版本',
+    # 2026-10-09 加: ①升级源版本不高于本地, 服务端直接拒绝; ②新版本起不来, 小助手回滚
+    'downgrade': '线上版本不高于本地版本（已拒绝执行）',
+    'rollback': '新版本没起来，已自动回滚到升级前的旧版本',
 }
 
 
@@ -1453,7 +1577,8 @@ def _write_update_result(ok, auto=False, from_ver='', to_ver='', why='', note=''
 
     写不进去只写日志, 不影响升级本身 —— 跟气泡一样, 附属功能不许拖累主线。
     """
-    d = {'ok': bool(ok), 'auto': bool(auto), 'from': str(from_ver or ''),
+    d = {'schema': UPDATE_STATE_SCHEMA, 'app': str(APP_VERSION),
+         'ok': bool(ok), 'auto': bool(auto), 'from': str(from_ver or ''),
          'to': str(to_ver or ''), 'why': str(why or ''), 'note': str(note or ''),
          'ts': time.time()}
     _LAST_RESULT[0] = d
@@ -1796,6 +1921,16 @@ def report_prev_update(prev):
     if not prev:
         return None
     ok = bool(_AUTO_UPGRADED[0])
+    # 小助手已经写过一条「已自动回滚」时, 不要用泛泛的「重启后还是旧版本」把它盖掉 ——
+    # 回滚是它实际做的事, 说清楚了用户才知道自己没被升坏(2026-10-09 加)。
+    prev_res = _LAST_RESULT[0] or {}
+    if (not ok) and str(prev_res.get('why') or '') == 'rollback':
+        log('上次升级是小助手回滚掉的, 面板/气泡保留「已自动回滚」这条说明')
+        return report_update_result(
+            False, auto=bool(prev.get('auto')),
+            from_ver=str(prev_res.get('from') or prev.get('from') or ''),
+            to_ver=str(prev_res.get('to') or prev.get('to') or ''),
+            why='rollback', note=str(prev_res.get('note') or ''))
     return report_update_result(
         ok, auto=bool(prev.get('auto')),
         from_ver=str(prev.get('from') or ''),
@@ -1804,22 +1939,42 @@ def report_prev_update(prev):
 
 
 def _start_update(auto=False):
-    """起一个升级线程; 已经在升级就不重复起(返回 False)。
+    """起一个升级线程; 返回 (有没有起来, 一句人话)。
 
     auto=True 是默认自动升级那条路, auto=False 是用户在面板上点「立即升级」。
+
+    ★★ 闸门就设在这里(2026-10-09 线上事故后): 不管从哪个入口进来, 只要升级源里的
+    版本**不高于**本地版本, 一律拒绝执行并写日志。前端把「立即升级」置灰只是提示,
+    真正的门必须在服务端 —— 本机任何程序都能直接 POST /api/update/start。
     """
+    info = read_update_info()
+    remote = str((info or {}).get('version') or '') or str(UPDATE.get('remote') or '')
+    rel = ver_relation(remote, APP_VERSION)
+    allow, why, logline = update_gate(remote, APP_VERSION)
+    if not allow:
+        _update_set(phase='idle', error='', remote=remote, relation=rel, newer=False,
+                    block_msg=why, msg=why)
+        if logline:
+            log(logline)
+        if auto:
+            log('自动升级: %s' % why)
+        return False, why
     with UPDATE_LOCK:
         if UPDATE.get('phase') in ('downloading', 'verifying', 'applying'):
-            return False
+            return False, '已经在升级了，不用重复点'
         UPDATE['phase'] = 'downloading'
         UPDATE['got'] = 0
         UPDATE['pct'] = 0
         UPDATE['error'] = ''
         UPDATE['auto'] = bool(auto)
         UPDATE['msg'] = '正在下载新版本'
+        UPDATE['remote'] = remote
+        UPDATE['relation'] = rel
+        UPDATE['newer'] = True
+        UPDATE['block_msg'] = ''
     threading.Thread(target=apply_update_async, kwargs={'auto': bool(auto)},
                      daemon=True).start()
-    return True
+    return True, '正在下载新版本'
 
 
 load_settings()          # 启动即生效: 默认 auto_update=True, notify_bubble=True
@@ -1892,11 +2047,18 @@ def do_update_check():
         return _update_get()
     node = update_exe_node(info) or {}
     remote = str(info.get('version') or '')
-    newer = cmp_ver(remote, APP_VERSION) > 0
+    # ★ 结论只按版本号语义下(2026-10-09 线上事故): 只有**远程严格大于本地**才是
+    # 「发现新版本」。面板拿 relation / newer 两个字段渲染, 不再自己比字符串。
+    rel, newer, msg = ver_verdict(remote, APP_VERSION)
     _update_set(local=APP_VERSION, remote=remote, notes=str(info.get('notes') or ''),
                 phase='idle', exe_url=node.get('url', ''), exe_sha=str(node.get('sha256') or '').upper(),
                 total=int(node.get('size') or 0),
-                msg=('有新版本 v' + remote + ' 可以升级') if newer else '已是最新版')
+                relation=rel, newer=bool(newer),
+                block_msg=('' if newer else msg),
+                msg=('有新版本 v' + remote + ' 可以升级') if newer else msg)
+    if rel == VER_OLDER:
+        log('检查更新: 本地 v%s 比线上 v%s 新（预发布/开发版本），不提示升级、也不允许升级'
+            % (APP_VERSION, remote))
     return _update_get()
 
 
@@ -1925,6 +2087,30 @@ def _download_to(path, url, total_hint=0):
         return None, str(e)
 
 
+# ── 升级交接的环境卫生(★★ 2026-10-09 真机事故的真因, 详见 clean_pyi_env)────────
+PYI_ENV_PREFIXES = ('_PYI_',)
+PYI_ENV_NAMES = ('_MEIPASS', '_MEIPASS2')
+
+
+def clean_pyi_env(env=None):
+    """返回一份**去掉 PyInstaller 记账变量**的环境(不传就基于 os.environ 复制)。
+
+    ★★ 2026-10-09 真机事故的真因(用实验钉死的, 见 logs\\升级护栏-20261009.md 第 3 节):
+    PyInstaller 单文件 exe 的引导程序会给它的 Python 子进程塞
+    `_PYI_PARENT_PROCESS_LEVEL` / `_PYI_APPLICATION_HOME_DIR` / `_PYI_ARCHIVE_FILE` / `_MEIPASS*`。
+    这些变量会被**主程序启的每一个子进程**继承 —— 包括升级小助手; 小助手再去启动"新版本"时,
+    新版的引导程序一看到 `_PYI_PARENT_PROCESS_LEVEL` 就认为"我是子进程、已经解过包了",
+    于是**跳过解包**、去找那个早已随旧实例退出被删掉的解包目录, 结果是:
+    应用一行日志都不写、端口不监听、只弹一个标题为 `Error` 的引导程序模态框 ——
+    真机上就是这么连续两次起不来的(而用户手工双击没有这些变量, 所以能起来)。
+    """
+    src = dict(os.environ if env is None else env)
+    for k in list(src):
+        if k.startswith(PYI_ENV_PREFIXES) or k in PYI_ENV_NAMES:
+            src.pop(k, None)
+    return src
+
+
 def _spawn_helper(exe, new, ver, silent=False):
     """独立小助手(PowerShell, UTF-8 带 BOM): 等本进程退出 -> 备份旧版 -> 覆盖 -> 再启动。
     不用 .cmd —— cmd.exe 按控制台代码页读 .cmd, 中文路径会变问号(壁纸助手那边实测过)。
@@ -1946,20 +2132,89 @@ def _spawn_helper(exe, new, ver, silent=False):
         "$newver = '" + str(ver) + "'",
         "$silent = " + ('$true' if silent else '$false'),
         "$args0 = " + ("'--silent'" if silent else "''"),
+        "# ★★ 先把自己环境里的 PyInstaller 记账变量删干净, 再启动任何狐径 exe(2026-10-09 真机事故):",
+        "# 单文件 exe 的引导程序会给它的 Python 子进程塞 _PYI_PARENT_PROCESS_LEVEL /",
+        "# _PYI_APPLICATION_HOME_DIR / _PYI_ARCHIVE_FILE / _MEIPASS*; 这些变量会被小助手继承,",
+        "# 于是小助手启动的新版本一看到 _PYI_PARENT_PROCESS_LEVEL 就以为「我是子进程、已经解过包了」,",
+        "# **跳过解包**去找那个早就被删掉的旧解包目录 -> 起不来(只弹一个标题为 Error 的框,",
+        "# 应用一行代码都跑不到)。手工双击没有这些变量, 所以能起来 —— 这就是真机那次连续两次没起来的真因。",
+        "foreach ($n in '_PYI_PARENT_PROCESS_LEVEL','_PYI_APPLICATION_HOME_DIR','_PYI_ARCHIVE_FILE','_PYI_SPLASH_IPC','_MEIPASS','_MEIPASS2') {",
+        "  try { Remove-Item -LiteralPath ('Env:' + $n) -ErrorAction SilentlyContinue } catch {}",
+        "}",
         "function W($m) { try { Add-Content -LiteralPath $log -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $m) -Encoding UTF8 } catch {} }",
         "function Panel {",
-        "  # 面板是否有人应答（不区分新旧实例）",
-        "  try { $r = Invoke-WebRequest 'http://127.0.0.1:" + str(PANEL_PORT) + "/api/status' -TimeoutSec 3 -UseBasicParsing",
+        "  # 面板有没有人应答(不区分新旧实例; 判「新版本起来了」请用 Ver/WaitVer)",
+        "  try { $r = Invoke-WebRequest 'http://127.0.0.1:" + str(PANEL_PORT) + "/api/status' -TimeoutSec 2 -UseBasicParsing",
         "        return ($r.StatusCode -eq 200) } catch { return $false }",
         "}",
-        "function Up {",
-        "  # 2026-10-08 起：判断「新版本真的起来了」靠两步，别只看看板通不通 ——",
-        "  # 旧实例还没退干净时看板也是通的，会被误判成已起来，于是不再重试，",
-        "  # 用户就真的没程序可用了（发版前自检抓到过这个假阳性）。",
-        "  # 所以：启动前先等看板彻底不通，启动后只要通了就一定是新实例。",
-        "  return (Panel)",
+        "function Ver {",
+        "  # 现在应答的那个实例**自己的版本号**: /api/update/status 的 local 字段",
+        "  # (1.0.5 起就有这个字段), 拿不到再退回 /api/status 的 version 字段。",
+        "  try { $r = Invoke-WebRequest 'http://127.0.0.1:" + str(PANEL_PORT) + "/api/update/status' -TimeoutSec 2 -UseBasicParsing",
+        "        $j = $r.Content | ConvertFrom-Json; if ($j.local) { return [string]$j.local } } catch {}",
+        "  try { $r2 = Invoke-WebRequest 'http://127.0.0.1:" + str(PANEL_PORT) + "/api/status' -TimeoutSec 2 -UseBasicParsing",
+        "        $j2 = $r2.Content | ConvertFrom-Json; if ($j2.version) { return [string]$j2.version } } catch {}",
+        "  return ''",
         "}",
-        "W '开始覆盖主程序 (新版本 v" + str(ver) + ")'",
+        "function WaitVer {",
+        "  # ★★ 2026-10-09 线上事故的核心加固: 判「新版本起没起来」必须**按版本号认**, 不能",
+        "  # 只看面板通不通 —— 当时用户手动把旧版 1.0.7 起回来, 面板一应答, 小助手就宣布",
+        "  # 「新版本已起来」, 于是该重试的不重试、该回滚的不回滚, 用户手里还是旧版本。",
+        "  # 返回等到的版本号; 等到 $Want 才算成功, 超时返回空串。",
+        "  param([string]$Want, [int]$Sec)",
+        "  $deadline = (Get-Date).AddSeconds($Sec)",
+        "  while ((Get-Date) -lt $deadline) {",
+        "    $v = Ver",
+        "    if ($v -and ($v -eq $Want)) { return $v }",
+        "    Start-Sleep -Milliseconds 500",
+        "  }",
+        "  $v = Ver",
+        "  if ($v -and ($v -eq $Want)) { return $v }",
+        "  return ''",
+        "}",
+        "function AnyVer {",
+        "  # 回滚后用它确认「旧版本真的起来了」: 只要有人应答, 就把它自己的版本号报回来。",
+        "  param([int]$Sec)",
+        "  $deadline = (Get-Date).AddSeconds($Sec)",
+        "  while ((Get-Date) -lt $deadline) {",
+        "    $v = Ver",
+        "    if ($v) { return $v }",
+        "    Start-Sleep -Milliseconds 500",
+        "  }",
+        "  $v = Ver",
+        "  if ($v) { return $v }",
+        "  return ''",
+        "}",
+        "function Balloon($title, $text) {",
+        "  # 非模态气泡: 看一眼就消失, **绝不弹模态框** —— 升级链路上任何模态框都会把",
+        "  # 交接后的启动挂住(2026-10-09 线上事故), 提示宁可轻一点也不能挂住程序。",
+        "  try {",
+        "    Add-Type -AssemblyName System.Windows.Forms | Out-Null",
+        "    Add-Type -AssemblyName System.Drawing | Out-Null",
+        "    $ni = New-Object System.Windows.Forms.NotifyIcon",
+        "    $ni.Icon = [System.Drawing.SystemIcons]::Information",
+        "    $ni.BalloonTipTitle = [string]$title",
+        "    $ni.BalloonTipText = [string]$text",
+        "    $ni.Visible = $true",
+        "    $ni.ShowBalloonTip(8000)",
+        "    Start-Sleep -Seconds 8",
+        "    $ni.Dispose()",
+        "  } catch { W ('气泡没弹出来(不影响别的): ' + $_.Exception.Message) }",
+        "}",
+        "function WriteResult($why, $note) {",
+        "  # 把这次失败落盘成 update-result.json(格式与主程序一致, 带 schema 与版本号):",
+        "  # 回滚后起来的旧版本一读, 面板上就会出现「上次升级结果：失败 · … 已保留旧版本」。",
+        "  try {",
+        "    $sec = [int][double]::Parse((Get-Date -UFormat %s))",
+        "    $j = '{\"schema\":2,\"app\":\"' + $oldver + '\",\"ok\":false,\"auto\":false,\"from\":\"' + $oldver + '\",\"to\":\"' + $newver + '\",\"why\":\"' + $why + '\",\"note\":\"' + $note + '\",\"ts\":' + $sec + '}'",
+        "    $rp = Join-Path (Split-Path -Parent $log) 'update-result.json'",
+        "    [System.IO.File]::WriteAllText($rp, $j, (New-Object System.Text.UTF8Encoding($false)))",
+        "  } catch { W ('写升级结果文件失败(不影响别的): ' + $_.Exception.Message) }",
+        "}",
+        "# 先把**当前正在跑的版本号**记下来(回滚要用它报账), 这时旧实例还活着。",
+        "$oldver = ''",
+        "try { $oldver = (AnyVer 5) } catch {}",
+        "W ('开始覆盖主程序 (新版本 v" + str(ver) + ", 升级前跑的是 v' + $oldver + ')')",
         "Start-Sleep -Seconds 2",
         "try { Invoke-WebRequest 'http://127.0.0.1:" + str(PANEL_PORT) + "/api/quit' -Method POST -TimeoutSec 8 -UseBasicParsing | Out-Null } catch { W ('调 /api/quit 出错: ' + $_.Exception.Message) }",
         "# 审查 M-5: 判断旧进程还在不在, 不能再用 Get-Process -Name —— 中文 exe 名的",
@@ -1982,34 +2237,77 @@ def _spawn_helper(exe, new, ver, silent=False):
         "# 覆盖之前先把旧版本留一份(exe 同级的 .old): 换坏了还能人工回退",
         "try { Copy-Item -LiteralPath $exe -Destination ($exe + '.old') -Force; W ('已备份旧版本 -> ' + $exe + '.old') } catch { W ('备份旧版本失败(继续覆盖): ' + $_.Exception.Message) }",
         "try { Move-Item -LiteralPath $new -Destination $exe -Force; W '已覆盖主程序' } catch { W ('覆盖失败: ' + $_.Exception.Message) }",
-        "# 2026-10-08: 覆盖后先等 3 秒 —— 新文件刚落地时杀软正在扫, 立刻启动会出现",
-        "# 'Failed to load Python DLL'(实测被火绒拦过), 表现为程序打不开。",
+        "# 覆盖后先等 3 秒(让杀软把新文件扫完, 也等行业务句柄彻底放开)。",
+        "# 注: 2026-10-08 那次'刚覆盖就启动会报 Failed to load Python DLL'曾被记成'被火绒拦了', ",
+        "# 2026-10-09 查清了 —— 真因是小助手继承了 PyInstaller 的 _PYI_* 变量(见脚本开头),",
+        "# 与杀软无关; 这句等待留着无害, 但别再拿它当解释。",
         "Start-Sleep -Seconds 3",
-        "# 关键一步：确认旧实例真的退干净了（看板不通），否则后面的 Up 会误判。",
+        "# 关键一步: 确认旧实例真的退干净了(看板不通), 否则新实例的版本号可能读成旧的,",
+        "# WaitVer 会一直等不到自己的版本号。",
         "$d = 0",
         "while ($d -lt 30) { if (-not (Panel)) { break }; Start-Sleep -Seconds 1; $d++ }",
         "W ('旧实例已停 (等了 ' + $d + ' 秒, 看板不通=' + (-not (Panel)) + ')')",
-        "# 启动并确认真的起来了: 轮询面板。实测杀软(火绒)对「它第一次见到的全新",
-        "# 二进制」会先拦一下 —— 第一次启动常常失败(报 Failed to load Python DLL),",
-        "# 等一会儿再试就好了。所以间隔递增重试 6 次, 总共覆盖约 6 分钟。",
+        "# 启动并确认真的起来了 —— 两件事一起做: ①首次启动给足时间(刚落地的二进制可能被杀软",
+        "# 扫一遍、也可能要解包 18 MB, 20 秒根本不够); ②按**版本号**确认, 不再只看面板通不通。",
+        "# 三次都不成 -> 回滚到备份的旧版本并把它拉起来(第 1/2/3 步都写日志)。",
         "$ok = $false",
-        "$waits = @(5, 10, 15, 20, 30)",
-        "for ($k = 1; $k -le $waits.Count; $k++) {",
-        "  W ('第 ' + $k + ' 次启动新版本')",
+        "$polls = @(90, 60, 60)",
+        "$waits = @(5, 10)",
+        "for ($k = 1; $k -le $polls.Count; $k++) {",
+        "  W ('第 ' + $k + ' 次启动新版本 v' + $newver + ' (最多等 ' + $polls[$k-1] + ' 秒)')",
         "  if ($silent) { try { Start-Process -FilePath $exe -ArgumentList $args0 } catch { W ('Start-Process 失败: ' + $_.Exception.Message) } }",
         "  else { try { Start-Process -FilePath $exe } catch { W ('Start-Process 失败: ' + $_.Exception.Message) } }",
-        "  $w = 0",
-        "  while ($w -lt 20) { if (Up) { $ok = $true; break }; Start-Sleep -Seconds 1; $w++ }",
-        "  if ($ok) { W ('新版本已起来 (等了 ' + $w + ' 秒)'); break }",
-        "  W ('第 ' + $k + ' 次没起来 (20 秒内面板无响应), 结束卡住的进程, 等 ' + $waits[$k-1] + ' 秒再试')",
+        "  $t0 = Get-Date",
+        "  $got = WaitVer $newver $polls[$k-1]",
+        "  if ($got) { $ok = $true; W ('新版本已起来 (v' + $got + ', 等了 ' + [int]((Get-Date) - $t0).TotalSeconds + ' 秒)'); break }",
+        "  $seen = ''",
+        "  try { $seen = (Ver) } catch {}",
+        "  $seenTxt = '面板一直没有响应'",
+        "  if ($seen) { $seenTxt = ('应答的是 v' + $seen + ', 不是新版本') }",
+        "  $tail = ''",
+        "  if ($k -lt $polls.Count) { $tail = ', 等 ' + $waits[$k-1] + ' 秒再试' }",
+        "  W ('第 ' + $k + ' 次没起来: ' + $polls[$k-1] + ' 秒内没有 v' + $newver + ' 应答, ' + $seenTxt + '; 结束卡住的进程' + $tail)",
         "  try { foreach ($p in @(Find-Same $exe)) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } } catch {}",
-        "  Start-Sleep -Seconds $waits[$k-1]",
+        "  if ($k -lt $polls.Count) { Start-Sleep -Seconds $waits[$k-1] }",
         "}",
-        "if ($ok) { W '已用新版本重新启动' } else {",
-        "  W '五次都没能自动启动, 已提示用户手动双击（弹窗）'",
-        "  try { (New-Object -ComObject Wscript.Shell).Popup(",
-        "        '狐径已升级到新版本，但自动重启没成功（多半是杀毒软件拦了第一次解包）。' + [char]13 + [char]10 + [char]13 + [char]10 + '请手动双击 FoxPath.exe 启动即可，不影响使用。',",
-        "        90, '狐径 FoxPath', 48) | Out-Null } catch {}",
+        "if ($ok) {",
+        "  W '已用新版本重新启动'",
+        "} else {",
+        "  # ── 三步兜底: ①新版起不来 -> ②回滚到备份的旧版本 -> ③把旧版本拉起来 ────────",
+        "  W ('三步兜底第 1 步: ' + $polls.Count + ' 次都没能让 v' + $newver + ' 起来')",
+        "  $bak = $exe + '.old'",
+        "  $rolled = $false",
+        "  if (Test-Path -LiteralPath $bak) {",
+        "    # 刚 Stop-Process 完, 文件可能还被占着(镜像段要过一会儿才真正释放, 杀软也可能",
+        "    # 正拿着它扫) —— 所以回滚这一下要**重试**, 不能一次不成就算了。",
+        "    for ($r = 1; $r -le 5; $r++) {",
+        "      try { Copy-Item -LiteralPath $bak -Destination $exe -Force -ErrorAction Stop; $rolled = $true; break }",
+        "      catch { W ('三步兜底第 2 步: 回滚第 ' + $r + ' 次没成(' + $_.Exception.Message + '), 等 1 秒再试'); Start-Sleep -Seconds 1 }",
+        "    }",
+        "    if ($rolled) { W ('三步兜底第 2 步: 回滚 —— 已用备份覆盖回升级前的旧版本 (v' + $oldver + ')') }",
+        "    else { W '三步兜底第 2 步: 回滚失败 —— 备份文件覆盖不回去(见上面几次的报错)' }",
+        "  } else { W ('三步兜底第 2 步: 回滚不了 —— 找不到备份 ' + $bak) }",
+        "  $back = ''",
+        "  if ($rolled) {",
+        "    Start-Sleep -Seconds 3",
+        "    for ($k = 1; $k -le 2; $k++) {",
+        "      W ('回滚后第 ' + $k + ' 次启动旧版本')",
+        "      if ($silent) { try { Start-Process -FilePath $exe -ArgumentList $args0 } catch { W ('Start-Process 失败: ' + $_.Exception.Message) } }",
+        "      else { try { Start-Process -FilePath $exe } catch { W ('Start-Process 失败: ' + $_.Exception.Message) } }",
+        "      $back = AnyVer 60",
+        "      if ($back -and ($back -ne $newver)) { break }",
+        "      try { foreach ($p in @(Find-Same $exe)) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } } catch {}",
+        "      Start-Sleep -Seconds 5",
+        "    }",
+        "  }",
+        "  if ($back -and ($back -ne $newver)) {",
+        "    W ('三步兜底第 3 步: 旧版本已起来 (v' + $back + ') —— 升级已回滚, 加速照常可用')",
+        "    WriteResult 'rollback' ('新版本 v' + $newver + ' 起不来, 已自动回滚到 v' + $back)",
+        "  } else {",
+        "    W '三步兜底第 3 步: 旧版本也没能自动起来 —— 只能请用户手动双击 FoxPath.exe'",
+        "    WriteResult 'rollback' ('新版本 v' + $newver + ' 起不来, 回滚后也没能自动启动; 备份在 ' + $bak)",
+        "    Balloon '狐径 升级没有完成' ('新版本没能自动启动, 已经回滚到升级前的版本。若程序没出现, 手动双击 FoxPath.exe 即可, 不影响使用。')",
+        "  }",
         "}",
         "# 顺手清理解包残留(只清 24 小时前的、且**确认没进程在用的**), 这堆东西能占几个 GB",
         "$cut = (Get-Date).AddHours(-24)",
@@ -2059,10 +2357,13 @@ def _spawn_helper(exe, new, ver, silent=False):
         # (沙箱实测: 同一个脚本手动跑完全正常, 换成 DETACHED 就一条日志都没有)。
         flags = 0x08000000 if os.name == 'nt' else 0
         devnull = open(os.devnull, 'wb')
+        # ★ 环境必须先擦一遍 _PYI_* 再给小助手(脚本里还会再擦一次, 双保险):
+        # 小助手是用我们(单文件 exe 的 Python 子进程)的环境起来的, 而这份环境里有
+        # PyInstaller 的记账变量; 它们会让"新版本"的引导程序误以为已经解过包。
         subprocess.Popen(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
                           '-WindowStyle', 'Hidden', '-File', helper],
                          creationflags=flags, stdin=devnull, stdout=devnull,
-                         stderr=devnull, close_fds=True)
+                         stderr=devnull, close_fds=True, env=clean_pyi_env())
         return True
     except Exception as e:
         log('升级: 放小助手失败 %s' % e)
@@ -2109,6 +2410,21 @@ def apply_update_async(auto=False):
     exe = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
     new = exe + '.new'
     ver_to = str(node.get('version') or (info or {}).get('version') or '')
+    # 纵深防御(2026-10-09 线上事故后加): 走到这一步也不许"降级安装"。正常路径已经被
+    # _start_update 的闸门拦住了, 这里再挡一次 —— 以后谁加了新入口、或改了判断,
+    # 都不会把用户手里更新的版本换成一个更旧的。
+    if cmp_ver(ver_to, APP_VERSION) <= 0:
+        c = cmp_ver(ver_to, APP_VERSION)
+        msg = ('升级源里的版本 v%s 不高于当前版本 v%s, 已拒绝执行(不会动你的程序)'
+               % (ver_to or '?', APP_VERSION))
+        _update_set(phase='idle', error='', newer=False, block_msg=msg, msg=msg,
+                    relation=ver_relation(ver_to, APP_VERSION))
+        log(('%s：远程 %s %s 本地 %s'
+             % ('拒绝降级' if c < 0 else '拒绝升级', ver_to or '?',
+                '<' if c < 0 else '==', APP_VERSION)))
+        report_update_result(False, auto=auto, from_ver=APP_VERSION,
+                             to_ver=ver_to, why='downgrade', note=msg)
+        return
     silent = '--silent' in [a.lower() for a in sys.argv[1:]]
     if auto:
         _auto_update_mark(ver_to)
@@ -2391,12 +2707,24 @@ refresh(); setInterval(refresh,3000);
     } else if(v.phase==='failed'){
       U.wrap.style.display='block';
       U.msg.innerHTML='<span class="upd-err">升级没有完成：'+(v.msg||'')+'</span>';
-    } else if(v.remote && v.remote!==v.local){
+    } else if(v.newer){
+      // ★ 只有服务端按**版本号语义**判出"远程严格大于本地"才提示升级、才放开按钮。
+      // 2026-10-09 线上事故: 这里以前写的是 v.remote!==v.local, 于是本地 1.0.7
+      // 对着线上 1.0.6 也提示「发现新版本 v1.0.6」, 用户一点就把 1.0.7 换成了 1.0.6。
       U.msg.innerHTML='<span class="upd-ok">发现新版本 v'+v.remote+'</span>'+(v.notes?('  '+v.notes):'');
-      U.go.style.display=''; U.wrap.style.display='none'; U.bar.style.width='0';
+      U.go.style.display=''; U.go.disabled=false; U.go.style.opacity='';
+      U.wrap.style.display='none'; U.bar.style.width='0';
+    } else if(v.relation==='older'){
+      // 本地比线上新(预发布/开发版本): 不提示升级, 按钮置灰且点不动;
+      // 就算有人跳过前端直接调接口, 服务端也会拒绝(见 update_gate)。
+      U.msg.innerHTML='<span class="upd-err">本地版本比线上新（预发布/开发版本），线上暂未发布</span>'
+        +'<span style="color:#6b7280">　本地 v'+(v.local||'')+' · 线上 v'+(v.remote||'')+'</span>';
+      U.go.style.display=''; U.go.disabled=true; U.go.style.opacity='0.45';
+      U.go.title='本地版本比线上新，不能升级（要退回旧版本请用手动方式）';
+      U.wrap.style.display='none'; U.bar.style.width='0';
     } else {
-      U.msg.textContent=v.msg||'已是最新版';
-      U.go.style.display='none'; U.wrap.style.display='none';
+      U.msg.textContent=v.msg||'还没检查过线上版本，点「检查更新」看一眼';
+      U.go.style.display='none';
     }
     var b=(v.phase!=='idle'&&v.phase!=='failed');
     if(b&&!U.timer){U.timer=setInterval(tick,400);}
@@ -2408,10 +2736,20 @@ refresh(); setInterval(refresh,3000);
     act('/api/update/check').then(tick);
   };
   document.getElementById('btnUpdGo').onclick=function(){
+    if(U.go.disabled){return;}
     U.go.style.display='none'; U.wrap.style.display='block'; U.bar.style.width='0';
-    act('/api/update/start').then(tick);
+    act('/api/update/start').then(function(r){
+      // 服务端闸门也会拒绝(远程不高于本地): 必须把原因显示出来, 不能"点了没反应"
+      if(r&&r.ok===false){U.wrap.style.display='none';
+        _say('updMsg', r.msg||'这次不能升级', 12000, true);}
+      tick();
+    }).catch(function(){U.wrap.style.display='none';
+      _say('updMsg','面板没有响应, 升级结果未知',12000,true); tick();});
   };
   tick();
+  // 面板开着的时候每 15 秒跟一次服务端结论: 用户什么都不点, 也能自己看到
+  // 「发现新版本」或者「本地版本比线上新（预发布/开发版本）」(2026-10-09 加)。
+  setInterval(tick, 15000);
 })();
 </script><div style="margin:16px 0 6px;text-align:center;font-size:12px;color:#8a8a8f">狐径 FoxPath · 作者 __AUTHOR__ · __HOMEPAGE__</div>
 </body></html>
@@ -2463,9 +2801,17 @@ class PanelHandler(BaseHTTPRequestHandler):
                 'enabled': proxy_on(),
                 'autostart': autostart_on(),
                 'last': time.strftime('%H:%M:%S', time.localtime(ts)) if ts else None,
-                # 有新版本时给面板一个提示字段
+                # 有新版本时给面板一个提示字段(★ 只有远程严格大于本地才算, 2026-10-09)
                 'newver': (str(UPDATE.get('remote') or '')
-                           if cmp_ver(str(UPDATE.get('remote') or ''), APP_VERSION) > 0 else ''),
+                           if ver_relation(str(UPDATE.get('remote') or ''),
+                                           APP_VERSION) == VER_NEWER else ''),
+                # 版本关系也一并回给面板(older = 本地比线上新, 面板要显示成"线上暂未发布")
+                'verrel': UPDATE.get('relation') or ver_relation(
+                    str(UPDATE.get('remote') or ''), APP_VERSION),
+                # /api/status 带上自己的版本号: 升级小助手靠它确认"起来的到底是不是新版本"
+                # (2026-10-09 线上事故: 小助手只看看板通不通, 结果用户手动起回旧版也被算成
+                #  "新版本已起来", 于是该重试不重试、该回滚不回滚)
+                'version': APP_VERSION,
                 # 自动升级开关(默认开) + 本次启动是不是"刚被升级上来的"
                 'autoupd': auto_update_on(),
                 'upgraded': upgraded_text(),
@@ -2542,9 +2888,17 @@ class PanelHandler(BaseHTTPRequestHandler):
         elif path == '/api/update/check':
             st = do_update_check()
             log('手动检查升级: ' + str(st.get('msg')))
+            # 把结论一起回给面板(2026-10-09): 降级场景下手动检查也必须给出
+            # 「本地版本比线上新…」, 而不是一句"有新版本"。
+            resp = {'ok': st.get('phase') != 'failed', 'msg': str(st.get('msg') or ''),
+                    'relation': st.get('relation') or '', 'newer': bool(st.get('newer'))}
         elif path == '/api/update/start':
-            if _start_update(auto=False):
+            # ★ 服务端闸门: 远程不高于本地时这里会拒绝(不再只靠面板把按钮置灰),
+            # 面板把 ok/msg 显示出来, 用户看到的是"为什么不能升"而不是"点了没反应"。
+            started, umsg = _start_update(auto=False)
+            if started:
                 log('收到升级指令, 开始下载新版本')
+            resp = {'ok': bool(started), 'msg': umsg}
         elif path == '/api/autoupdate':
             # 设置里保留的开关(默认开): 关掉就回到"发现新版只提示"的老行为
             ok, msg = set_auto_update('on=1' in query)
@@ -2608,7 +2962,7 @@ def health_loop():
             try:
                 st = do_update_check()
                 remote = str(st.get('remote') or '')
-                if cmp_ver(remote, APP_VERSION) > 0:
+                if ver_relation(remote, APP_VERSION) == VER_NEWER:
                     if not auto_update_on():
                         log('发现新版本 v%s（自动升级已关闭, 面板上点「立即升级」即可）' % remote)
                     else:
@@ -2620,7 +2974,9 @@ def health_loop():
                                 log('面板 %d 秒前还有活动(用户可能正开着面板): 升级前的开关'
                                     '状态已存档, 面板标签页升级后会自己接上, 不丢状态'
                                     % int(time.time() - _LAST_ACT[0]))
-                            _start_update(auto=True)
+                            started, smsg = _start_update(auto=True)
+                            if not started:
+                                log('自动升级没有开始: %s' % smsg)
                         else:
                             log('发现新版本 v%s, 但没有自动升级: %s' % (remote, why))
                 else:
@@ -2707,6 +3063,11 @@ def main():
     #   ① 面板上留一行"已自动升级到 vX.Y.Z"; ② 系统代理开关接着用升级前的选择;
     #   ③ 结果(成了/没成)在右下角弹一次气泡 —— 没升级过时这里什么都不做, 不打扰。
     prev = consume_update_done()
+    # ★ 这次是"升级交接"上来的: 整个进程都不许弹模态框(2026-10-09 线上事故 —— 启动路上
+    # 一弹窗, 面板就起不来, 小助手判定失败后反复重启, 用户就没程序可用了)。
+    _HANDOFF_STARTUP[0] = bool(prev)
+    if prev:
+        log('本次是升级交接后的启动: 全程不弹模态框, 有问题只写日志并在面板/气泡里提示')
     report_prev_update(prev)
     keep_off = bool(_AUTO_UPGRADED[0]) and (prev or {}).get('proxy_on') is False
     if keep_off and proxy_on():
