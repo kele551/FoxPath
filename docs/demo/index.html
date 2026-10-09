@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>狐径 FoxPath · 演示视频</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px 48px; font: 16px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+         background: #f6f7f9; color: #1b1f24; }
+  @media (prefers-color-scheme: dark) { body { background:#14171a; color:#e6e8eb; } .card { background:#1c2024 !important; } }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  .sub { color: #6b7280; font-size: 14px; margin-bottom: 18px; }
+  .card { background:#fff; border-radius: 12px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  video { width: 100%; height: auto; border-radius: 8px; background:#000; display:block; }
+  .meta { margin-top: 14px; font-size: 14px; color:#6b7280; }
+  a { color: #2563eb; }
+  ul { padding-left: 20px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>狐径 FoxPath · 演示视频</h1>
+  <div class="sub">GitHub 在国外访问一直正常，在国内却常打不开 —— 狐径解决的就是这一段</div>
+
+  <div class="card">
+    <video controls preload="metadata" playsinline>
+      <source src="FoxPath-demo-v1.0.6.mp4" type="video/mp4">
+      你的浏览器不支持内嵌播放，请直接下载：<a href="FoxPath-demo-v1.0.6.mp4">FoxPath-demo-v1.0.6.mp4</a>
+    </video>
+    <div class="meta">
+      时长 1 分 58 秒　·　文件大小 3.6 MB　·　格式 MP4（H.264），手机与电脑浏览器均可直接播放
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <b>关于本项目</b>
+    <ul>
+      <li>绿色单文件，双击即用，免安装、免管理员权限</li>
+      <li>本机 HTTP 代理 + PAC 精准分流 + 可验证的官方 IP 池，只接管 GitHub 相关域名</li>
+      <li>不改系统 DNS、不改 hosts，退出时自动还原系统设置</li>
+      <li>只在本机运行：不提供代理服务、不转发他人流量、不采集任何用户数据</li>
+    </ul>
+    <div class="meta">代码仓库：<a href="https://github.com/kele551/FoxPath">https://github.com/kele551/FoxPath</a>　·　许可：MIT License　·　作者：海风（kele551）</div>
+  </div>
+</div>
+</body>
+</html>
