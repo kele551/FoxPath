@@ -6,7 +6,7 @@
 它是什么:
   国内访问 github.com 时通时断。狐径不查 DNS, 也不改 hosts ——
   它自己拿着一批 GitHub 官方 IP 逐个实测握手, 挑当前能用的直连。
-  本机代理 + PAC, 只接管 github.com 一个域名。
+  本机代理 + PAC, 只接管 GitHub 相关域名 (主站 / raw / 发布附件 / Pages 网页)。
   不需要管理员权限, 不写 hosts, 不改系统 DNS。
   (手机流量能开、电脑宽带上不去, 多半就是本机解析到的那个 IP 不通)
 
@@ -18,7 +18,8 @@
        github.com / www.github.com          (主站)
        raw.githubusercontent.com            (raw 文件, 例如各种一键脚本、配置文件)
        objects.githubusercontent.com        (GitHub 发布附件的下载)
-     其中 raw / 附件走**专属 IP 池** (官方 185.199.108.0/22), 不会连错服务器。
+       github.io / *.github.io              (GitHub Pages 网页, 例如项目自建的演示页)
+     其中 raw / 附件 / Pages 走**专属 IP 池** (官方 185.199.108.0/22), 不会连错服务器。
      页面渲染用的头像与资源域 (avatars / camo / githubassets) 仍然直连 ——
      它们本来就通, 走代理反而会让页面样式脚本加载失败、按钮点不动。
    - 其他网站完全走原路线, 不受影响

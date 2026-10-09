@@ -49,6 +49,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -69,6 +70,13 @@ RELAY_IDLE_TIMEOUT = 600
 # "代理愿意走 IP 池的"完全一致。githubassets/githubusercontent/api.github.com
 # 一律 DIRECT —— 它们直连本来就通，走代理反而会坏（见 README 已知边界）。
 PROXY_HOSTS = ('github.com', 'www.github.com')
+
+# 2026-10-09 用户要求：把 GitHub Pages 也纳入接管范围。
+# 页面挂在 *.github.io 上（用户名.github.io），用的还是 185.199.108.0/22 那一段，
+# 所以与 raw/附件**共用同一份 IP 池**；但**证书期望值必须单独设** ——
+# 实测这一段服务的是 *.github.io 证书，拿 githubusercontent.com 那套去校验，
+# 会把这一池的好 IP 全部误杀（见下面的 HEALTH_PAGES）。
+GITHUB_IO_SUFFIX = '.github.io'
 
 # 2026-10-08 按用户需求（GitHub issue #1）增加：raw 文件与发布附件下载。
 # **它们必须走自己的 IP 池**（见下面 CANDIDATE_IPS_RAW）：官方 meta 里
@@ -140,20 +148,46 @@ def _valid_ip(s):
         return False
 
 
+def _manual_ip_reject(ip):
+    """手动 IP 的合法性检查(审查 M-14): 只收公网单播地址。
+
+    留手填是为了救急, 但填 192.168.x.x / 127.0.0.1 / fe80:: 这类地址只会白试一场
+    (对面的证书必然不匹配), 所以直接挡掉并给一句人话, 而不是写进去让程序空转。
+    返回 '' 表示可以收。
+    """
+    try:
+        a = ipaddress.ip_address(str(ip or '').strip())
+    except Exception:
+        return '不是合法的 IP 地址: %s' % (ip or '(空)')
+    if a.is_loopback:
+        return '这是本机回环地址(%s), 不是 GitHub 的服务器地址' % a
+    if a.is_private:
+        return '这是内网地址(%s), 不是 GitHub 的服务器地址' % a
+    if a.is_link_local:
+        return '这是链路本地地址(%s), 不是 GitHub 的服务器地址' % a
+    if a.is_multicast or a.is_reserved or a.is_unspecified:
+        return '这个地址(%s)不能当作服务器地址用' % a
+    return ''
+
+
 def load_manual_ip():
     try:
         with open(_manual_ip_path(), encoding='utf-8') as f:
             ip = f.read().strip()
     except Exception:
         return ''
-    return ip if _valid_ip(ip) else ''
+    if not _valid_ip(ip) or _manual_ip_reject(ip):
+        return ''                  # 以前写进去的私网/回环地址也一并作废(审查 M-14)
+    return ip
 
 
 def save_manual_ip(ip):
     """保存/清除手动 IP，返回 (成功?, 一句话说明)。"""
     ip = (ip or '').strip()
-    if ip and not _valid_ip(ip):
-        return False, '不是合法的 IP 地址：%s' % ip
+    if ip:
+        why = _manual_ip_reject(ip)     # 审查 M-14: 私网/回环等一律拒收
+        if why:
+            return False, why
     try:
         if ip:
             with open(_manual_ip_path(), 'w', encoding='utf-8') as f:
@@ -182,26 +216,47 @@ def candidate_list():
     return ([_MANUAL_IP[0]] if _MANUAL_IP[0] else []) + out
 
 
-def diag_text():
+def _mask_ip(ip):
+    """把地址的末段换成 x（审查 M-6: 诊断文本可能被复制外发, 不外传完整 IP）。
+
+    只留前两段(IPv4)或第一段(IPv6), 足够看出"是哪一段地址在通", 又不构成可用地址。
+    """
+    ip = str(ip or '')
+    if ':' in ip:
+        return ip.split(':')[0] + ':****'
+    parts = ip.split('.')
+    if len(parts) == 4:
+        return '%s.%s.x.x' % (parts[0], parts[1])
+    return ip
+
+
+def diag_text(redact=True):
     """一行"线路体检"—— 客户复制这一行发来，就能定位卡在哪一环。"""
     good, ts = HEALTH.snapshot()
+    # 审查 M-6: redact=True(/api/diag 走这条)时**不带完整 IP** —— 这段文本会被
+    # 用户复制外发, 而 /api/diag 是 GET 接口。面板上"当前可用 IP"那张表仍按原样
+    # 显示(走 /api/status, 是给用户自己看的)。
     v4 = [g for g in good if ':' not in g[0]]
     v6 = [g for g in good if ':' in g[0]]
     cand = candidate_list()
     all4 = [ip for ip in cand if ':' not in ip]
     all6 = [ip for ip in cand if ':' in ip]
-    fastest = ('%s(%dms)' % (good[0][0], good[0][1])) if good else '无'
+    hide = _mask_ip if redact else (lambda x: x)
+    fastest = ('%s(%dms)' % (hide(good[0][0]), good[0][1])) if good else '无'
     up_min = int((time.time() - _START_TS[0]) / 60) if _START_TS[0] else 0
     last = time.strftime('%m-%d %H:%M:%S', time.localtime(ts)) if ts else '还没体检过'
     raw_good, _ = HEALTH_RAW.snapshot()
+    pages_good, _ = HEALTH_PAGES.snapshot()
     head = ('狐径体检 v%s | IPv4 可用 %d/%d | IPv6 可用 %d/%d | raw 可用 %d/%d | '
-            '表源 %s | 最快 %s | 系统代理 %s | 手动IP %s | 上次体检 %s | 已运行 %d 分钟'
+            'pages 可用 %d/%d | 表源 %s | 最快 %s | 系统代理 %s | 手动IP %s | '
+            '上次体检 %s | 已运行 %d 分钟'
             % (APP_VERSION, len(v4), len(all4), len(v6), len(all6),
                len(raw_good), len(CANDIDATE_IPS_RAW),
+               len(pages_good), len(CANDIDATE_IPS_RAW),
                _META_SOURCE[0] or '未同步(用内置表)', fastest,
                '已开启' if proxy_on() else '未开启', _MANUAL_IP[0] or '无', last, up_min))
     detail = ('停用' if not good else
-              '可用清单: ' + ', '.join('%s(%dms)' % (i, m) for i, m in good[:8]))
+              '可用清单: ' + ', '.join('%s(%dms)' % (hide(i), m) for i, m in good[:8]))
     return head + '\n' + detail
 
 
@@ -213,6 +268,9 @@ REG_RUN = r'Software\Microsoft\Windows\CurrentVersion\Run'
 # 第二份请求会在第一份写好 PAC 之后才读到"原值", 于是把我们自己的 PAC 地址写进
 # 备份 —— 退出还原就永远回不到原始状态(v1.0.0 踩过, 现在以竞态形式复活)。
 _REG_LOCK = threading.Lock()
+
+# 面板最后一次被请求的时刻(自动升级前用它判断"用户是不是正开着面板")
+_LAST_ACT = [0.0]
 
 _log_q = queue.Queue()
 _START_TS = [0.0]          # 进程启动时刻, 体检日志里用它显示"已运行多久"
@@ -226,6 +284,25 @@ def alert(title, text):
             ctypes.windll.user32.MessageBoxW(None, text, title, 0x10)   # MB_ICONERROR
     except Exception:
         pass
+
+
+_alert_lock = threading.Lock()
+_alert_seen = {}
+
+
+def alert_once(key, title, text, window=15.0):
+    """同一件事短时间内只弹一次(审查 M-4)。
+
+    enable_proxy 回读失败时会弹一次, 面板的 /api/enable 分支还有一道兜底弹窗 ——
+    两处都走这里, 靠它去重: 同一个错误不会连着弹两个框。
+    """
+    now = time.time()
+    with _alert_lock:
+        if now - _alert_seen.get(key, 0.0) < window:
+            return False
+        _alert_seen[key] = now
+    alert(title, text)
+    return True
 
 
 def _data_dir():
@@ -249,10 +326,11 @@ DATA_DIR = _data_dir()
 LOG_FILE = os.path.join(DATA_DIR, 'foxpath.log')
 BACKUP_FILE = os.path.join(DATA_DIR, 'proxy-backup.json')
 LOG_MAX = 512 * 1024
+LOG_TAIL_BYTES = 128 * 1024   # 超过上限时保留的尾部**字节数**(审查 M-9: 不再按行)
 LOG_PANEL_LINES = 200      # 面板 /api/status 只回尾部这么多行
 LOG_QUEUE_MAX = 2000       # 面板没打开时队列也要有个上限, 不然会一直涨
 # 连接级日志(每转发一次写一行)的降级参数(审查 H-5): 正常浏览 GitHub 几十秒就能
-# 产生几百行, 而面板只显示尾部 200 行、文件只留尾部 500 行 —— 不降级的话,
+# 产生几百行, 而面板只显示尾部 200 行、文件只留尾部一块(按字节) —— 不降级的话,
 # 体检/自愈/升级/还原这些关键行会被直接挤出可视范围。
 CONN_LOG_SAMPLE = 20       # 每 N 次连接才写一行明细(进面板/进文件), 其余只进控制台
 CONN_LOG_WINDOW = 60       # 每 N 秒补一行"这段时间转发了几次"的聚合行
@@ -262,10 +340,22 @@ def _log_to_file(line):
     """exe 是 --noconsole 的, 屏幕上看不到任何东西; 日志必须落文件。"""
     try:
         if os.path.isfile(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX:
-            with open(LOG_FILE, 'r', encoding='utf-8', errors='replace') as f:
-                tail = f.readlines()[-500:]
+            # 审查 M-9: 截断改成**按字节**读尾再 decode。以前是 readlines() 取尾部
+            # 500 "行", 口径与 512 KB 的上限对不上 —— 遇到超长行(异常堆栈、超长 URL)
+            # 会一次读进来一大片; 而且多字节字符按行切也不保险。
+            with open(LOG_FILE, 'rb') as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - LOG_TAIL_BYTES), os.SEEK_SET)
+                tail = f.read().decode('utf-8', 'ignore')
+            nl = tail.find('\n')
+            if nl >= 0:
+                tail = tail[nl + 1:]        # 从第一个换行之后开始, 不留半行
+            # 读回来的是字节, 里面已经带着 \r\n; 文本模式写回时会再翻译一次
+            # (变成 \r\r\n, 每轮转一次多一个 \r)。这里先统一成 \n 再交回文本模式。
+            tail = tail.replace('\r\n', '\n').replace('\r', '\n')
             with open(LOG_FILE, 'w', encoding='utf-8') as f:
-                f.writelines(tail)
+                f.write(tail)
         with open(LOG_FILE, 'a', encoding='utf-8') as f:
             f.write(line + '\n')
     except Exception:
@@ -354,6 +444,15 @@ def is_github_host(host):
     return host in PROXY_HOSTS
 
 
+def is_pages_host(host):
+    """GitHub Pages: github.io 及其所有子域(user.github.io)。
+
+    与 PAC 里的判断保持一致(同一份名单、同一个语义), 名单只有一个来源。
+    """
+    host = (host or '').lower().split(':')[0]
+    return host == 'github.io' or host.endswith(GITHUB_IO_SUFFIX)
+
+
 # ------------------------------------------------------------------- 注册表
 
 def reg_set(path, name, value, vtype=None):
@@ -393,6 +492,25 @@ class _SkipHttp(Exception):
     """内部用：跳过 HTTP 状态检查。"""
 
 
+def cert_matches(names, expect):
+    """证书里的名字有没有覆盖 expect（纯函数, 便于单测）。
+
+    三个池的期望值各不一样: github.com / githubusercontent.com / github.io,
+    **混用就会把好 IP 判死**。只认后缀匹配, 不再像旧版那样做子串包含 ——
+    'github.com' in 'github.com.evil.example' 会把别人的证书当成 GitHub 的。
+    """
+    want = str(expect or '').lower().strip()
+    if not want:
+        return False
+    for n in (names or ()):
+        n = str(n).lower().strip()
+        if n == want or n.endswith('.' + want):
+            return True
+        if n.startswith('*.') and n[2:] == want:
+            return True
+    return False
+
+
 class Health(object):
     def __init__(self, sni='github.com', expect='github.com', http_path='/'):
         self._lock = threading.Lock()
@@ -418,8 +536,9 @@ class Health(object):
             with ctx.wrap_socket(raw, server_hostname=self.sni) as s:
                 cert = s.getpeercert() or {}
                 names = [v for (_k, v) in cert.get('subjectAltName', ())]
-                ok = any(self.expect in n for n in names)
-                if not ok:
+                # 三个池的证书期望值各不相同: github.com / githubusercontent.com /
+                # github.io(证书里是 *.github.io)。混用会把好 IP 判死。
+                if not cert_matches(names, self.expect):
                     return None
                 # TLS 握手通了还不够: 某些 IP 的证书对, 但只跑 API/CDN,
                 # 直接访问 github.com 会返回 4xx, 这种不能要。
@@ -483,6 +602,11 @@ class Health(object):
 HEALTH = Health()
 HEALTH_RAW = Health(sni='raw.githubusercontent.com',
                       expect='githubusercontent.com', http_path=None)
+# GitHub Pages(2026-10-09 新增): 与 raw/附件同一段 IP(185.199.108.0/22),
+# 但**证书不一样** —— 这里必须是 github.io(证书里是 *.github.io),
+# 不能用 githubusercontent 那套, 也不能用 github.com 那套, 否则这一池 IP 全被判死。
+# http_path=None: 只验 TLS + 证书(拿 IP 直接 GET 根路径本来就不是 2xx/3xx, 会误杀好 IP)。
+HEALTH_PAGES = Health(sni='github.io', expect='github.io', http_path=None)
 CANDIDATES = list(CANDIDATE_IPS)
 
 
@@ -529,6 +653,14 @@ def fetch_official_ips():
                 ips.append(str(first))
             # IPv6 网段的首地址不是真实主机（实测 HTTP 层 Domain Not Found），
             # 所以这里**故意不收集**；真实 IPv6 只从 DNS / meta.json 的 web6 来。
+        # 审查 M-2: 这一份表到底解析出东西没有 —— 只有**真的解析出地址**才算同步成功。
+        # 以前不管解析出几个, 都会把内置的 140.82.x.x 补进来凑数, 于是"接口 200 但表是
+        # 空的 / 字段被改名"也会被记成「已同步官方 IP 表」, 而且**不再往下试 Gitee 兜底**;
+        # 用户那边的表现就是"同步成功却一个 IP 都不通"。现在空表直接换下一个源。
+        if not ips and not v6s:
+            last_err = '%s 里没有解析出任何 IP(字段缺失或被改写)' % url
+            log('同步源 %s 返回成功但没有 IP, 换下一个源' % url)
+            continue
         # 140.82.112.0/20 只取网段首地址是没用的（那是网段地址），手工补齐真实主机
         for third in (112, 113, 114, 115, 116):
             for last in (3, 4):
@@ -585,6 +717,10 @@ def recover():
     log('放宽超时到 6 秒, 重测 %d 个' % len(ips))
     good = HEALTH.refresh(ips, timeout=6.0)
     if good:
+        # 审查 M-3: 自愈成功必须**回写候选表**。只把结果留在 HEALTH._good 里的话,
+        # 下一轮 candidate_list() 又变回旧表, 自愈等于每轮白做一遍。
+        CANDIDATES = list(dict.fromkeys(list(CANDIDATES) + list(ips)))
+        log('自愈成功并已回写候选表: 候选 %d 个' % len(CANDIDATES))
         return good
 
     extra = [i for i in dns_fallback_ips() if i not in ips]
@@ -609,9 +745,13 @@ PAC_TEMPLATE = """function FindProxyForURL(url, host) {
     // github.com pool lands on the wrong server and breaks the download.
     // avatars/camo/githubassets stay DIRECT on purpose: they render the pages,
     // and proxying them with the wrong pool is what broke pages in the past.
+    // github.io and *.github.io (GitHub Pages) also go through the local proxy.
+    // They share the 185.199.108.0/22 pool with raw/objects, but the proxy checks
+    // them against the *.github.io certificate, NOT the githubusercontent one.
     if (host === "github.com" || host === "www.github.com" ||
         host === "raw.githubusercontent.com" ||
-        host === "objects.githubusercontent.com") {
+        host === "objects.githubusercontent.com" ||
+        host === "github.io" || dnsDomainIs(host, ".github.io")) {
         return "PROXY 127.0.0.1:%d; DIRECT";
     }
     return "DIRECT";
@@ -664,6 +804,16 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     HEALTH_RAW.drop(ip)
                     continue
             log('raw 候选 IP 全灭, 本次退回系统解析')
+        elif is_pages_host(host):
+            # GitHub Pages: 与 raw/附件同一段 IP(185.199.108.0/22), 但证书是 *.github.io,
+            # 所以走**按 github.io 证书体检过**的那一池(HEALTH_PAGES)。
+            for ip in HEALTH_PAGES.candidates()[:4]:
+                try:
+                    return socket.create_connection((ip, port), timeout=5), ip
+                except OSError:
+                    HEALTH_PAGES.drop(ip)
+                    continue
+            log('github.io 候选 IP 全灭, 本次退回系统解析')
         elif is_github_host(host):
             for ip in HEALTH.candidates()[:4]:
                 try:
@@ -781,18 +931,57 @@ def single_instance():
         return True
 
 
+def _probe_own_panel(timeout=2.0):
+    """探一探 127.0.0.1:8788 上跑的**是不是我们自己的**控制面板(审查 M-13)。
+
+    单实例用的是带 Local 前缀的命名互斥: 同一台机器上不同登录会话(远程桌面 + 本机)
+    各能起一个, 后起的那个会撞端口, 以前直接弹错误框退出 —— 用户看到"程序坏了",
+    其实只是另一个会话里已经在跑。撞端口先问一句"是不是自己人"。
+    """
+    try:
+        req = urllib.request.Request('http://127.0.0.1:%d/api/status' % PANEL_PORT,
+                                     headers={'User-Agent': 'FoxPath'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if int(getattr(r, 'status', 200) or 0) != 200:
+                return False
+            d = json.loads(r.read().decode('utf-8', 'replace'))
+    except Exception:
+        return False
+    return isinstance(d, dict) and ('logs' in d) and ('enabled' in d)
+
+
+def _port_taken(port, err, what):
+    """端口被占用时的统一处理(审查 M-13): 先认"是不是自己的实例", 是就提示复用。
+
+    这个函数**一定抛 SystemExit**: 要么按"已有实例"安静退出(0),
+    要么沿用原来的弹窗 + 退出(2)。
+    """
+    if _probe_own_panel():
+        log('!! 端口 %d 被占用(%s), 但 8788 上的控制面板有应答 —— 判定为同一个狐径的'
+            '另一个实例(多半在另一个登录会话里先起的), 本次不再重复启动' % (port, what))
+        if '--silent' not in [a.lower() for a in sys.argv[1:]]:
+            try:
+                webbrowser.open('http://127.0.0.1:%d' % PANEL_PORT)
+                log('已把正在运行的那个控制面板交给浏览器打开')
+            except Exception as e:
+                log('打开控制面板失败: %s' % e)
+        raise SystemExit(0)
+    log('!! 端口 %d 被占用, %s起不来: %s' % (port, what, err))
+    tip = ('多半是上一个狐径没退干净。请在任务管理器结束它, 或先跑一次:\n'
+           '    %s --restore' % os.path.basename(
+               sys.executable if getattr(sys, 'frozen', False) else __file__))
+    log('   ' + tip.replace('\n', ' '))
+    alert('狐径: 端口被占用', '本机 %d 端口已被占用, 狐径起不来。\n\n%s\n\n日志: %s'
+          % (port, tip, LOG_FILE))
+    raise SystemExit(2)
+
+
 def start_proxy():
     try:
         srv = ProxyServer(('127.0.0.1', PROXY_PORT), ProxyHandler)
     except OSError as e:
-        log('!! 端口 %d 被占用, 代理起不来: %s' % (PROXY_PORT, e))
-        tip = ('多半是上一个狐径没退干净。请在任务管理器结束它, 或先跑一次:\n'
-               '    %s --restore' % os.path.basename(
-                   sys.executable if getattr(sys, 'frozen', False) else __file__))
-        log('   ' + tip.replace('\n', ' '))
-        alert('狐径: 端口被占用', '本机 %d 端口已被占用, 狐径起不来。\n\n%s\n\n日志: %s'
-              % (PROXY_PORT, tip, LOG_FILE))
-        raise SystemExit(2)
+        # 审查 M-13: 先探"是不是自己的实例", 是就提示/复用, 而不是弹错退出
+        _port_taken(PROXY_PORT, e, '代理')
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     log('代理已启动 127.0.0.1:%d' % PROXY_PORT)
 
@@ -855,7 +1044,18 @@ def enable_proxy():
             log('注意: 你原本设了静态代理 %s —— 启用期间 PAC 优先级更高, '
                 '其它网站会直连而不是走原代理; 停用时会自动还原'
                 % saved.get('ProxyServer'))
-        reg_set(REG_INTERNET, 'AutoConfigURL', 'http://127.0.0.1:%d/pac' % PANEL_PORT)
+        pac_url = _pac_url()
+        reg_set(REG_INTERNET, 'AutoConfigURL', pac_url)
+        # 审查 M-4: 写完必须**回读一眼**。注册表被组策略/安全软件锁住时,
+        # 写操作可能悄悄不生效(或写进去又被改回), 而用户看到的是"已启用"、
+        # 实际一点用都没有 —— 这种沉默失败最坑人。
+        got = reg_get(REG_INTERNET, 'AutoConfigURL') or ''
+        if got != pac_url:
+            msg = ('系统代理写入后回读不一致(写入 %s, 读回 %s)—— 多半是安全软件或组策略'
+                   '锁住了注册表, 加速没有生效。' % (pac_url, got or '(空)'))
+            log('!! ' + msg)
+            alert_once('enable-readback', '狐径: 启用加速失败', msg)
+            return False, msg
         notify_proxy_change()
         log('加速已开启 (原设置已备份到 %s)' % BACKUP_FILE)
         return True, '加速已开启, 原系统代理设置已备份'
@@ -880,20 +1080,58 @@ def disable_proxy():
                 return False, ('当前系统代理不是狐径所设, 也没有找到还原备份 —— '
                                '已保持原样, 没有做任何修改')
             log('没有找到还原备份, 只清掉本程序的 PAC 设置(原值已无从得知)')
-            saved = {}
+            # 审查 M-1: 没有备份时 ProxyEnable / ProxyServer 的原值同样无从得知 ——
+            # 按"未知即不动"处理, 这里**显式跳过并写日志**, 而不是顺手清掉:
+            # 那会把用户原本的静态代理设置永久抹掉, 再也找不回来。
+            for name in ('ProxyEnable', 'ProxyServer'):
+                cur = reg_get(REG_INTERNET, name)
+                log('没有还原备份: %s=%s 保持原样不动(原值未知, 乱还原比不动更危险)'
+                    % (name, '(未设置)' if cur is None else cur))
+            saved = {'AutoConfigURL': None, '__no_backup__': True}
+        no_backup = bool(saved.get('__no_backup__'))
         reg_set(REG_INTERNET, 'AutoConfigURL', saved.get('AutoConfigURL') or None)
-        if saved.get('ProxyServer'):
-            reg_set(REG_INTERNET, 'ProxyServer', saved['ProxyServer'])
-        if saved.get('ProxyEnable') is not None:
-            reg_set(REG_INTERNET, 'ProxyEnable', saved['ProxyEnable'], 4)
+        if no_backup:
+            pass            # 上面已经逐项写过日志: 这两项一个字节都不动
+        else:
+            if saved.get('ProxyServer'):
+                reg_set(REG_INTERNET, 'ProxyServer', saved['ProxyServer'])
+            if saved.get('ProxyEnable') is not None:
+                reg_set(REG_INTERNET, 'ProxyEnable', saved['ProxyEnable'], 4)
         notify_proxy_change()
         log('加速已关闭, 系统代理已还原')
+        if no_backup:
+            return True, ('已停用: 清掉了本程序写的 PAC；ProxyEnable / ProxyServer '
+                          '原值未知, 按"未知即不动"保持原样')
         return True, '已停用, 系统代理已还原'
 
 
+def _pac_url():
+    """本程序写进注册表的 PAC 地址（只此一处定义）。"""
+    return 'http://127.0.0.1:%d/pac' % PANEL_PORT
+
+
 def proxy_on():
-    cur = reg_get(REG_INTERNET, 'AutoConfigURL') or ''
-    return ('127.0.0.1:%d' % PANEL_PORT) in cur
+    """系统 PAC 是不是**本程序**设的。
+
+    审查 M-8: 以前是子串判断 `'127.0.0.1:8788' in cur` —— 用户原来的 PAC 串里
+    只要恰好含这一小段(或别的路径), 就会被误判成"是我们设的"; 退出/还原时
+    可能把别人的设置当自己的清掉。现在解析 URL, 按 host:port **精确比较**。
+    """
+    cur = (reg_get(REG_INTERNET, 'AutoConfigURL') or '').strip()
+    if not cur:
+        return False
+    try:
+        u = urllib.parse.urlsplit(cur)
+    except Exception:
+        return False
+    if (u.scheme or '').lower() not in ('http', 'https'):
+        return False
+    host = (u.hostname or '').lower()
+    try:
+        port = u.port or (443 if (u.scheme or '').lower() == 'https' else 80)
+    except ValueError:
+        return False
+    return host in ('127.0.0.1', 'localhost') and port == PANEL_PORT
 
 
 def _exe_cmd(silent=True):
@@ -940,13 +1178,31 @@ UPDATE = {
     'phase': 'idle',      # idle / checking / downloading / verifying / applying / done / failed
     'got': 0, 'total': 0, 'pct': 0, 'msg': '', 'error': '',
     'local': APP_VERSION, 'remote': '', 'notes': '', 'exe_url': '', 'exe_sha': '',
+    'auto': False,        # 这次升级是不是「按设置自动升的」(面板上要区别显示)
 }
 
-# 静默检查新版本（2026-10-08 加）—— 老用户不会主动点「检查更新」，所以：
-# 启动后立刻看一眼，之后每 12 小时再看一眼；**只提示，绝不自动升级**。
+# 静默检查新版本（2026-10-08 加；2026-10-09 改成**默认自动升级**）——
+# 老用户不会主动点「检查更新」，所以：启动后立刻看一眼，之后每 12 小时再看一眼。
 # 复用的是 read_update_info 的 6 小时缓存，所以基本不打网络。
 AUTO_CHECK_INTERVAL = 12 * 3600
 _last_auto_check = [0.0]
+
+# ── 默认自动升级（2026-10-09 用户要求：不弹确认框）──────────────────────────
+# 行为：启动后静默检查 -> 有新版本就自动下载 -> 校验 SHA256 -> 交小助手替换 -> 重启,
+#       全程不打断用户; 面板上只留一行「已自动升级到 vX.Y.Z」; 日志写清每一步。
+# 开关：设置里的 auto_update, **默认开**; 关掉就回到「发现新版只提示」的老行为。
+# 安全底线（与 H-1 一致, 不许破）:
+#   ① sha256 缺失/不符一律拒绝并保留旧版本(_verify_download);
+#   ② 覆盖前先把旧 exe 备份成 FoxPath.exe.old(小助手脚本里做);
+#   ③ 替换失败仍走原来的递增重试, 最终失败才弹窗提示, 不会把用户搞成没程序可用。
+SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
+SETTINGS_LOCK = threading.Lock()
+AUTO_UPDATE_DEFAULT = True                 # 默认开（用户明确要求）
+SETTINGS = {'auto_update': AUTO_UPDATE_DEFAULT}
+AUTO_UPDATE_MAX_TRIES = 2                  # 同一个版本 24 小时内最多自动试几次
+AUTO_UPDATE_TRIES_FILE = os.path.join(DATA_DIR, 'update-tries.json')
+UPDATE_DONE_FILE = os.path.join(DATA_DIR, 'update-done.json')
+_AUTO_UPGRADED = [None]                    # 本次启动是"刚被升级上来的"就记在这里
 
 
 def ver_tuple(v):
@@ -973,6 +1229,178 @@ def _update_set(**kw):
 def _update_get():
     with UPDATE_LOCK:
         return dict(UPDATE)
+
+
+def load_settings():
+    """读设置(auto_update 默认 True)。读不到就用默认值, 不让设置文件挡住启动。"""
+    d = {'auto_update': AUTO_UPDATE_DEFAULT}      # 基准是默认值, 不是当前内存里的值
+    try:
+        with open(SETTINGS_FILE, encoding='utf-8') as f:
+            raw = json.load(f)
+        if isinstance(raw, dict) and 'auto_update' in raw:
+            d['auto_update'] = bool(raw['auto_update'])
+    except Exception:
+        pass
+    with SETTINGS_LOCK:
+        SETTINGS.update(d)
+    return dict(SETTINGS)
+
+
+def save_settings():
+    try:
+        with SETTINGS_LOCK:
+            data = dict(SETTINGS)
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        return True
+    except Exception as e:
+        log('保存设置失败: %s' % e)
+        return False
+
+
+def auto_update_on():
+    with SETTINGS_LOCK:
+        return bool(SETTINGS.get('auto_update', AUTO_UPDATE_DEFAULT))
+
+
+def set_auto_update(on):
+    """开关自动升级, 返回 (ok, 人话)。默认就是开着的。"""
+    with SETTINGS_LOCK:
+        SETTINGS['auto_update'] = bool(on)
+    ok = save_settings()
+    if on:
+        msg = '已开启自动升级: 以后启动时发现新版本会自动下好并换上新版(不弹确认框)'
+    else:
+        msg = '已关闭自动升级: 发现新版本只在面板上提示, 点「立即升级」才升级'
+    if not ok:
+        msg += '(设置没能写进磁盘, 重启后会回到默认值)'
+    log(msg)
+    return True, msg
+
+
+def _auto_update_guard(remote, url=''):
+    """自动升级的护栏, 返回 (能不能自动升, 不能的原因)。
+
+    1. 只有打包成 exe 才自动换文件 —— 源码方式运行时 __file__ 是 .py, 换不得;
+    2. 只认 https 升级源 —— 数据目录里的 update_url.txt 是给发版自检用的本地源,
+       绝不能让一个本地文件把线上 exe 换掉(本地源的升级演练走的仍是面板上的手动升级);
+    3. 同一个版本 24 小时内最多自动试 AUTO_UPDATE_MAX_TRIES 次 —— 万一"下好了却换不上",
+       不至于每次开机都重下一遍、来回折腾用户(超过就只提示, 让用户自己点)。
+    """
+    if not getattr(sys, 'frozen', False):
+        return False, '当前是源码方式运行, 不自动替换文件(可在面板上手动升级)'
+    if not str(url or '').lower().startswith('https://'):
+        return False, '升级源不是 https, 按安全策略不自动升级(可在面板上手动升级)'
+    now = time.time()
+    rec = {}
+    try:
+        with open(AUTO_UPDATE_TRIES_FILE, encoding='utf-8') as f:
+            rec = json.load(f) or {}
+    except Exception:
+        rec = {}
+    cur = rec.get(str(remote)) or {}
+    n = int(cur.get('n') or 0)
+    if now - float(cur.get('ts') or 0) > 24 * 3600:
+        n = 0                       # 超过 24 小时重新计数
+    if n >= AUTO_UPDATE_MAX_TRIES:
+        return False, ('v%s 在 24 小时内已经自动试过 %d 次都没成, 先停手不反复折腾'
+                       '(可在面板上手动升级)' % (remote, n))
+    return True, ''
+
+
+def _auto_update_mark(remote):
+    """记一次自动升级尝试(护栏 3 用)。失败不影响升级本身。"""
+    try:
+        rec = {}
+        try:
+            with open(AUTO_UPDATE_TRIES_FILE, encoding='utf-8') as f:
+                rec = json.load(f) or {}
+        except Exception:
+            rec = {}
+        cur = rec.get(str(remote)) or {}
+        n = int(cur.get('n') or 0)
+        if time.time() - float(cur.get('ts') or 0) > 24 * 3600:
+            n = 0
+        rec[str(remote)] = {'n': n + 1, 'ts': time.time()}
+        with open(AUTO_UPDATE_TRIES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(rec, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _write_update_done(from_ver, to_ver, auto, silent):
+    """把"这次升级从哪来、升到哪、升级前用户是什么状态"留给**新版本**读。
+
+    新实例起来后读它, 就能: ①在面板上留一行「已自动升级到 vX.Y.Z」;
+    ②把升级前的系统代理开关接着用, 不因为换了 exe 就把用户的选择重置(不丢状态)。
+    """
+    d = {'from': str(from_ver), 'to': str(to_ver), 'auto': bool(auto),
+         'silent': bool(silent), 'proxy_on': bool(proxy_on()),
+         'autostart': bool(autostart_on()), 'ts': time.time()}
+    try:
+        with open(UPDATE_DONE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(d, f, ensure_ascii=False)
+    except Exception as e:
+        log('升级: 写升级状态文件失败(不影响升级本身): %s' % e)
+    return d
+
+
+def consume_update_done():
+    """启动时读一次: 上一次升级到底成没成。返回 dict 或 None。"""
+    try:
+        with open(UPDATE_DONE_FILE, encoding='utf-8') as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    try:
+        os.remove(UPDATE_DONE_FILE)
+    except Exception:
+        pass
+    if not isinstance(d, dict):
+        return None
+    to = str(d.get('to') or '')
+    if to and to == APP_VERSION:
+        _AUTO_UPGRADED[0] = {'to': to, 'from': str(d.get('from') or ''),
+                             'auto': bool(d.get('auto'))}
+        log('已%s升级到 v%s (原 v%s); 旧版本已备份为 FoxPath.exe.old'
+            % ('自动' if d.get('auto') else '手动', to, d.get('from') or '?'))
+    else:
+        _AUTO_UPGRADED[0] = None
+        log('上次升级到 v%s 没有生效(当前仍是 v%s), 已保留旧版本; 可在面板上重试'
+            % (to or '?', APP_VERSION))
+    return d
+
+
+def upgraded_text():
+    """面板上那一行状态: 「已自动升级到 v1.0.7（原 v1.0.6）」; 没升级过就是空串。"""
+    d = _AUTO_UPGRADED[0]
+    if not d:
+        return ''
+    return ('已%s升级到 v%s（原 v%s）'
+            % ('自动' if d.get('auto') else '手动', d.get('to') or '?',
+               d.get('from') or '?'))
+
+
+def _start_update(auto=False):
+    """起一个升级线程; 已经在升级就不重复起(返回 False)。
+
+    auto=True 是默认自动升级那条路, auto=False 是用户在面板上点「立即升级」。
+    """
+    with UPDATE_LOCK:
+        if UPDATE.get('phase') in ('downloading', 'verifying', 'applying'):
+            return False
+        UPDATE['phase'] = 'downloading'
+        UPDATE['got'] = 0
+        UPDATE['pct'] = 0
+        UPDATE['error'] = ''
+        UPDATE['auto'] = bool(auto)
+        UPDATE['msg'] = '正在下载新版本'
+    threading.Thread(target=apply_update_async, kwargs={'auto': bool(auto)},
+                     daemon=True).start()
+    return True
+
+
+load_settings()          # 启动即生效: 默认 auto_update=True
 
 
 def read_update_info(use_cache=True):
@@ -1030,6 +1458,10 @@ def update_exe_node(info):
 
 
 def do_update_check():
+    # 正在下载/校验/覆盖时不要插一脚: 以前这里会把 phase 改回 idle,
+    # 面板的「立即升级」就可能在升级进行中再起一个线程。
+    if UPDATE.get('phase') in ('downloading', 'verifying', 'applying'):
+        return _update_get()
     _update_set(phase='checking', msg='正在检查升级源…', error='')
     info = read_update_info()
     if not info:
@@ -1070,11 +1502,17 @@ def _download_to(path, url, total_hint=0):
         return None, str(e)
 
 
-def _spawn_helper(exe, new, ver):
-    """独立小助手(PowerShell, UTF-8 带 BOM): 等本进程退出 -> 覆盖 -> 再启动。
-    不用 .cmd —— cmd.exe 按控制台代码页读 .cmd, 中文路径会变问号(壁纸助手那边实测过)。"""
+def _spawn_helper(exe, new, ver, silent=False):
+    """独立小助手(PowerShell, UTF-8 带 BOM): 等本进程退出 -> 备份旧版 -> 覆盖 -> 再启动。
+    不用 .cmd —— cmd.exe 按控制台代码页读 .cmd, 中文路径会变问号(壁纸助手那边实测过)。
+
+    silent: 原来是不是静默模式(开机自启)。升级后按原样启动, 不因为换了 exe 就
+    突然给用户弹一个浏览器窗口。
+    """
     import subprocess
-    helper = os.path.join(DATA_DIR, 'update-apply.ps1')
+    # 审查 M-15: 助手脚本改成**一次性随机名** —— 固定叫 update-apply.ps1 时,
+    # 数据目录里任何一个同用户程序都能提前把它替换掉。脚本跑完会删掉自己(见末尾)。
+    helper = os.path.join(DATA_DIR, 'update-apply-%s.ps1' % uuid.uuid4().hex[:8])
     logf = os.path.join(DATA_DIR, 'update.log')
     q = lambda s: "'" + str(s).replace("'", "''") + "'"
     lines = [
@@ -1083,6 +1521,8 @@ def _spawn_helper(exe, new, ver):
         '$new = ' + q(new),
         '$log = ' + q(logf),
         "$newver = '" + str(ver) + "'",
+        "$silent = " + ('$true' if silent else '$false'),
+        "$args0 = " + ("'--silent'" if silent else "''"),
         "function W($m) { try { Add-Content -LiteralPath $log -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $m) -Encoding UTF8 } catch {} }",
         "function Panel {",
         "  # 面板是否有人应答（不区分新旧实例）",
@@ -1099,10 +1539,25 @@ def _spawn_helper(exe, new, ver):
         "W '开始覆盖主程序 (新版本 v" + str(ver) + ")'",
         "Start-Sleep -Seconds 2",
         "try { Invoke-WebRequest 'http://127.0.0.1:" + str(PANEL_PORT) + "/api/quit' -Method POST -TimeoutSec 8 -UseBasicParsing | Out-Null } catch { W ('调 /api/quit 出错: ' + $_.Exception.Message) }",
-        "$nm = [System.IO.Path]::GetFileNameWithoutExtension($exe)",
+        "# 审查 M-5: 判断旧进程还在不在, 不能再用 Get-Process -Name —— 中文 exe 名的",
+        "# ProcessName 匹配不可靠(改名后就认不出来了)。改成按**可执行文件完整路径**匹配:",
+        "# Get-CimInstance Win32_Process 拿 ExecutablePath, 中文路径也照配不误。",
+        "function Find-Same {",
+        "  param([string]$ExePath)",
+        "  $full = ''",
+        "  try { $full = [System.IO.Path]::GetFullPath($ExePath) } catch { return @() }",
+        "  $hit = @()",
+        "  try { $hit = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.ExecutablePath -and ([System.IO.Path]::GetFullPath($_.ExecutablePath) -ieq $full) }) } catch { $hit = @() }",
+        "  if (@($hit).Count -eq 0) {",
+        "    try { $hit = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ([System.IO.Path]::GetFullPath($_.Path) -ieq $full) }) } catch { $hit = @() }",
+        "  }",
+        "  return @($hit)",
+        "}",
         "$n = 0",
-        "while ($n -lt 90) { if (-not (Get-Process -Name $nm -ErrorAction SilentlyContinue)) { break }; Start-Sleep -Seconds 1; $n++ }",
+        "while ($n -lt 90) { if (@(Find-Same $exe).Count -eq 0) { break }; Start-Sleep -Seconds 1; $n++ }",
         "W ('进程已退出, 等了 ' + $n + ' 秒')",
+        "# 覆盖之前先把旧版本留一份(exe 同级的 .old): 换坏了还能人工回退",
+        "try { Copy-Item -LiteralPath $exe -Destination ($exe + '.old') -Force; W ('已备份旧版本 -> ' + $exe + '.old') } catch { W ('备份旧版本失败(继续覆盖): ' + $_.Exception.Message) }",
         "try { Move-Item -LiteralPath $new -Destination $exe -Force; W '已覆盖主程序' } catch { W ('覆盖失败: ' + $_.Exception.Message) }",
         "# 2026-10-08: 覆盖后先等 3 秒 —— 新文件刚落地时杀软正在扫, 立刻启动会出现",
         "# 'Failed to load Python DLL'(实测被火绒拦过), 表现为程序打不开。",
@@ -1118,12 +1573,13 @@ def _spawn_helper(exe, new, ver):
         "$waits = @(5, 10, 15, 20, 30)",
         "for ($k = 1; $k -le $waits.Count; $k++) {",
         "  W ('第 ' + $k + ' 次启动新版本')",
-        "  try { Start-Process -FilePath $exe } catch { W ('Start-Process 失败: ' + $_.Exception.Message) }",
+        "  if ($silent) { try { Start-Process -FilePath $exe -ArgumentList $args0 } catch { W ('Start-Process 失败: ' + $_.Exception.Message) } }",
+        "  else { try { Start-Process -FilePath $exe } catch { W ('Start-Process 失败: ' + $_.Exception.Message) } }",
         "  $w = 0",
         "  while ($w -lt 20) { if (Up) { $ok = $true; break }; Start-Sleep -Seconds 1; $w++ }",
         "  if ($ok) { W ('新版本已起来 (等了 ' + $w + ' 秒)'); break }",
         "  W ('第 ' + $k + ' 次没起来 (20 秒内面板无响应), 结束卡住的进程, 等 ' + $waits[$k-1] + ' 秒再试')",
-        "  try { Stop-Process -Name $nm -Force -ErrorAction SilentlyContinue } catch {}",
+        "  try { foreach ($p in @(Find-Same $exe)) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } } catch {}",
         "  Start-Sleep -Seconds $waits[$k-1]",
         "}",
         "if ($ok) { W '已用新版本重新启动' } else {",
@@ -1132,23 +1588,45 @@ def _spawn_helper(exe, new, ver):
         "        '狐径已升级到新版本，但自动重启没成功（多半是杀毒软件拦了第一次解包）。' + [char]13 + [char]10 + [char]13 + [char]10 + '请手动双击 FoxPath.exe 启动即可，不影响使用。',",
         "        90, '狐径 FoxPath', 48) | Out-Null } catch {}",
         "}",
-        "# 顺手清理解包残留(只清 24 小时前的、且没进程在用的), 这堆东西能占几个 GB",
+        "# 顺手清理解包残留(只清 24 小时前的、且**确认没进程在用的**), 这堆东西能占几个 GB",
         "$cut = (Get-Date).AddHours(-24)",
         "$inuse = @{}",
+        "$blind = 0",
         "Get-Process -ErrorAction SilentlyContinue | ForEach-Object {",
-        "  try { foreach ($m in $_.Modules) { if ($m.FileName -like '*\\_MEI*') { foreach ($p in $m.FileName.Split('\\')) { if ($p -like '_MEI*') { $inuse[$p] = 1 } } } } } catch {}",
+        "  try { foreach ($m in $_.Modules) { if ($m.FileName -like '*\\_MEI*') { foreach ($p in $m.FileName.Split('\\')) { if ($p -like '_MEI*') { $inuse[$p] = 1 } } } } }",
+        "  catch {",
+        "    # 审查 M-7: 读不到模块列表的进程(多半是提权进程)无法确认它是不是正在用某个",
+        "    # _MEI* 目录。系统目录里的进程不会是解包目录的使用者, 不计入;",
+        "    # 其它目录的(Program Files / 桌面 / U 盘……)一律计入 —— 此时一个都不删。",
+        "    $bp = $_.Path",
+        "    if (-not $bp -or ($bp -notlike ($env:SystemRoot + '\\*'))) { $blind++ }",
+        "  }",
         "}",
         "$freed = 0; $cnt = 0",
-        "Get-ChildItem $env:TEMP -Directory -Filter '_MEI*' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cut -and -not $inuse.ContainsKey($_.Name) } | ForEach-Object {",
-        "  try {",
-        "    $sz = (Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum",
-        "    Remove-Item $_.FullName -Recurse -Force -ErrorAction Stop",
-        "    $freed += $sz; $cnt++",
-        "  } catch {}",
+        "if ($blind -gt 0) {",
+        "  # 审查 M-7: 有进程的模块列表读不到(多半是提权进程), 那就无法确认它是不是正在用",
+        "  # 某个 _MEI* 目录 —— 此时**一个都不删**(宁可留着, 也不误删别人正在用的解包目录)。",
+        "  W ('有 ' + $blind + ' 个非系统进程读不到模块列表, 无法确认它们有没有在用解包目录, 为安全起见本次跳过清理')",
+        "} else {",
+        "  Get-ChildItem $env:TEMP -Directory -Filter '_MEI*' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cut -and -not $inuse.ContainsKey($_.Name) } | ForEach-Object {",
+        "    try {",
+        "      $sz = (Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum",
+        "      Remove-Item $_.FullName -Recurse -Force -ErrorAction Stop",
+        "      $freed += $sz; $cnt++",
+        "    } catch {}",
+        "  }",
+        "  if ($cnt -gt 0) { W ('顺手清理解包残留 ' + $cnt + ' 个, 释放 ' + [math]::Round($freed/1MB) + ' MB') }",
         "}",
-        "if ($cnt -gt 0) { W ('顺手清理解包残留 ' + $cnt + ' 个, 释放 ' + [math]::Round($freed/1MB) + ' MB') }",
+        "# 审查 M-15: 这个助手脚本是一次性随机名, 跑完就删(旧版固定叫 update-apply.ps1,",
+        "# 同用户下别的程序可以提前把它换掉 —— 随机名 + 用完即删把这条面收窄)。",
         "$k = 0",
         "while ($k -lt 10) { try { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 500; $k++ } }",
+        "# 顺手扫掉上一次升级留下的旧助手脚本(只动本目录里 1 小时前的 update-apply*.ps1)",
+        "try {",
+        "  Get-ChildItem -LiteralPath (Split-Path -Parent $log) -Filter 'update-apply*.ps1' -ErrorAction SilentlyContinue |",
+        "    Where-Object { $_.FullName -ne $PSCommandPath -and $_.LastWriteTime -lt (Get-Date).AddHours(-1) } |",
+        "    ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch {} }",
+        "} catch {}",
     ]
     try:
         with open(helper, 'w', encoding='utf-8-sig', newline='\r\n') as f:
@@ -1193,8 +1671,12 @@ def _verify_download(path, node, sha):
     return True, '', ''
 
 
-def apply_update_async():
-    """后台线程: 下载 -> 校验 -> 叫小助手覆盖并重启。"""
+def apply_update_async(auto=False):
+    """后台线程: 下载 -> 校验 -> 叫小助手覆盖并重启。
+
+    auto=True 是"默认自动升级"那条路(用户 2026-10-09 要求): 不弹任何确认框,
+    校验不过就**静默保留旧版本**; 安全底线与手动升级完全一样。
+    """
     info = read_update_info()
     node = update_exe_node(info)
     if not node:
@@ -1202,7 +1684,13 @@ def apply_update_async():
         return
     exe = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
     new = exe + '.new'
-    _update_set(phase='downloading', got=0, pct=0, error='', msg='正在下载新版本')
+    ver_to = str(node.get('version') or (info or {}).get('version') or '')
+    silent = '--silent' in [a.lower() for a in sys.argv[1:]]
+    if auto:
+        _auto_update_mark(ver_to)
+        log('自动升级: 开始下载 v%s (不弹确认框; 校验不过会保留旧版本)' % ver_to)
+    _update_set(phase='downloading', got=0, pct=0, error='', msg='正在下载新版本',
+                auto=bool(auto))
     sha, err = _download_to(new, node['url'], int(node.get('size') or 0))
     if not sha:
         _update_set(phase='failed', error=err, msg='下载失败: %s' % err)
@@ -1218,11 +1706,14 @@ def apply_update_async():
         except Exception:
             pass
         return
-    if not _spawn_helper(exe, new, node.get('version') or (info or {}).get('version') or ''):
+    # 交给小助手之前先把"这次升级 + 升级前的状态"存档: 新实例起来后会读它,
+    # 在面板上留一行「已自动升级到 vX.Y.Z」, 并把系统代理开关接着用升级前的选择。
+    _write_update_done(APP_VERSION, ver_to or APP_VERSION, auto, silent)
+    if not _spawn_helper(exe, new, ver_to, silent=silent):
         _update_set(phase='failed', error='helper', msg='放小助手失败')
         return
     _update_set(phase='applying', pct=100, msg='校验通过, 正在覆盖并重启…')
-    log('升级: 已下好 %d 字节 (sha256=%s) 并通过校验, 交给小助手覆盖'
+    log('升级: 已下好 %d 字节 (sha256=%s) 并通过校验, 交给小助手覆盖(升级前状态已存档)'
         % (os.path.getsize(new), sha[:16]))
 
 PANEL_HTML = """<!doctype html>
@@ -1273,10 +1764,12 @@ PANEL_HTML = """<!doctype html>
     <span class="upd-ver" id="uvRemote">—</span>
     <button class="primary" id="btnUpdCheck">检查更新</button>
     <button class="primary" id="btnUpdGo" style="display:none">立即升级</button>
+    <label><input type="checkbox" id="autoUpd"> 自动升级</label>
   </div>
   <div class="upd-bar" id="updBarWrap" style="display:none"><i id="updBar"></i></div>
   <div class="upd-banner" id="updBanner" style="display:none"></div>
-  <div class="upd-note" id="updMsg">点「检查更新」看看有没有新版本。</div>
+  <div class="upd-note" id="updMsg">默认自动升级: 启动后发现有新版本会自动下好、校验、换上新版（不弹确认框）。</div>
+  <div class="upd-note upd-ok" id="updAuto"></div>
 </div>
 <div class="card">
   <div class="row" style="margin-bottom:10px">
@@ -1335,11 +1828,16 @@ function refresh(){
     s.className = d.enabled ? 'big' : 'big off';
     document.getElementById('time').textContent = d.last || '-';
     document.getElementById('auto').checked = d.autostart;
-    // 有新版本就亮一条提示（不自动升级，用户自己点）
+    // 自动升级开关 + 本次启动的升级结果(2026-10-09 用户要求: 默认自动升级、不弹提示)
+    document.getElementById('autoUpd').checked = !!d.autoupd;
+    document.getElementById('updAuto').textContent = d.upgraded || '';
+    // 有新版本时亮一条: 自动升级开着就说"会自动升", 关着才让用户自己点
     const nb = document.getElementById('updBanner');
     if (d.newver) {
       nb.style.display = 'block';
-      nb.innerHTML = '发现新版本 <b>v' + d.newver + '</b> —— 点下面的「检查更新」再点「立即升级」即可（不会自动升级）。';
+      nb.innerHTML = d.autoupd
+        ? ('发现新版本 <b>v' + d.newver + '</b> —— 已按设置自动升级（不弹确认框, 校验不过会保留旧版）。')
+        : ('发现新版本 <b>v' + d.newver + '</b> —— 自动升级已关闭, 点下面的「检查更新」再点「立即升级」。');
     } else {
       nb.style.display = 'none';
     }
@@ -1358,6 +1856,12 @@ function doAct(u){
     refresh();
   }).catch(()=>{_say('actMsg','面板没有响应, 操作结果未知',12000,true);refresh();});
 }
+document.getElementById('autoUpd').onchange = (e)=>{
+  // 默认开; 关掉就只提示(设置存在数据目录的 settings.json 里)
+  act('/api/autoupdate?on='+(e.target.checked?1:0)).then(r=>{
+    _say('updMsg', (r&&r.msg)||'已保存', 6000, false); refresh();
+  }).catch(()=>{_say('updMsg','设置没有保存成功',8000,true);refresh();});
+};
 document.getElementById('btnEnable').onclick = ()=>doAct('/api/enable');
 document.getElementById('btnDisable').onclick = ()=>doAct('/api/disable');
 document.getElementById('btnTest').onclick = ()=>{
@@ -1372,8 +1876,10 @@ document.getElementById('btnQuit').onclick = ()=>{
   }
 };
 function loadDiag(){
-  fetch('/api/diag').then(r=>r.text()).then(t=>{
-    document.getElementById('diag').textContent = t;
+  // /api/diag 现在是 JSON(审查 M-6: 不再是 text/plain, 免得被当脚本嗅探),
+  // 而且里面不含完整 IP(出口地址这类敏感字段不进 diag)。
+  api('/api/diag').then(d=>{
+    document.getElementById('diag').textContent = (d&&d.diag)||'读取失败';
   }).catch(()=>{});
 }
 function _say(id,txt,ms,err){const e=document.getElementById(id);if(e){e.textContent=txt;
@@ -1395,12 +1901,16 @@ document.getElementById('btnDiagRe').onclick = ()=>{loadDiag();refresh();};
 document.getElementById('btnIpSave').onclick = ()=>{
   const v=document.getElementById('ipInput').value.trim();
   if(!v){_say('ipMsg','先填一个 IP');return;}
-  act('/api/set-ip?ip='+encodeURIComponent(v)).then(()=>{
-    _say('ipMsg','已保存，正在重测…'); loadDiag(); refresh();
-  });
+  // 后端会拒收私网/回环地址并给人话(审查 M-14), 这里必须把原因显示出来, 不能一律说"已保存"
+  act('/api/set-ip?ip='+encodeURIComponent(v)).then(r=>{
+    if(r&&r.ok===false){_say('ipMsg',(r.msg||'这个地址不能用'),12000,true);return;}
+    _say('ipMsg',(r&&r.msg)||'已保存，正在重测…'); loadDiag(); refresh();
+  }).catch(()=>{_say('ipMsg','面板没有响应, 结果未知',12000,true);});
 };
 document.getElementById('btnIpClear').onclick = ()=>{
-  act('/api/set-ip?ip=').then(()=>{_say('ipMsg','已清除');loadDiag();refresh();});
+  act('/api/set-ip?ip=').then(r=>{
+    _say('ipMsg',(r&&r.msg)||'已清除');loadDiag();refresh();
+  }).catch(()=>{_say('ipMsg','面板没有响应',8000,true);});
 };
 loadDiag(); setInterval(loadDiag,10000);
 refresh(); setInterval(refresh,3000);
@@ -1428,7 +1938,7 @@ refresh(); setInterval(refresh,3000);
     if(v.phase==='downloading'){
       U.wrap.style.display='block';
       U.bar.style.width=(v.pct||0)+'%';
-      U.msg.textContent='正在下载新版本  '+kb(v.got)+(v.total?(' / '+kb(v.total)+'   '+(v.pct||0)+'%'):'');
+      U.msg.textContent=(v.auto?'正在自动下载新版本（已按设置自动升级）  ':'正在下载新版本  ')+kb(v.got)+(v.total?(' / '+kb(v.total)+'   '+(v.pct||0)+'%'):'');
       U.go.style.display='none';
     } else if(v.phase==='verifying'||v.phase==='applying'){
       U.wrap.style.display='block'; U.bar.style.width='100%';
@@ -1475,6 +1985,8 @@ class PanelHandler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype='text/html; charset=utf-8'):
         self.send_response(code)
         self.send_header('Content-Type', ctype)
+        # 审查 M-6: 没有 nosniff 时, 浏览器可能把 text/plain 的接口回话当脚本嗅探执行
+        self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         try:
@@ -1483,6 +1995,15 @@ class PanelHandler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
+        # 审查 M-6: 以前只有 POST 校验同源, GET 是敞开的 —— 任意网页/被挂马页面
+        # 都能触发这些接口(no-cors), 顺手把"本机可用地址、表源、已运行多久"这些
+        # 信息读走。现在 GET 也一样先过 Host 校验。
+        if not self._host_ok():
+            log('已拒绝一个非同源的 GET 请求(Host 校验未通过): %s'
+                % self.path.split('?')[0])
+            self._send(403, b'forbidden', 'text/plain; charset=utf-8')
+            return
+        _LAST_ACT[0] = time.time()
         path = self.path.split('?')[0]
         if path == '/pac':
             self._send(200, (PAC_TEMPLATE % PROXY_PORT).encode('ascii'),
@@ -1498,20 +2019,34 @@ class PanelHandler(BaseHTTPRequestHandler):
                 'enabled': proxy_on(),
                 'autostart': autostart_on(),
                 'last': time.strftime('%H:%M:%S', time.localtime(ts)) if ts else None,
-                # 有新版本时给面板一个提示字段（只提示，是否升级由用户点）
+                # 有新版本时给面板一个提示字段
                 'newver': (str(UPDATE.get('remote') or '')
                            if cmp_ver(str(UPDATE.get('remote') or ''), APP_VERSION) > 0 else ''),
+                # 自动升级开关(默认开) + 本次启动是不是"刚被升级上来的"
+                'autoupd': auto_update_on(),
+                'upgraded': upgraded_text(),
                 'logs': recent_logs(),
             }
             self._send(200, json.dumps(data, ensure_ascii=False).encode('utf-8'),
                        'application/json; charset=utf-8')
         elif path == '/api/diag':
-            self._send(200, diag_text().encode('utf-8'), 'text/plain; charset=utf-8')
+            # 审查 M-6: 这段文本以前是 text/plain 且不带任何同源校验, 浏览器可能
+            # 把它当脚本嗅探执行。现在改成 application/json(+上面的 nosniff),
+            # 且内容里不带完整 IP(出口地址这类敏感字段不进 diag)。
+            body = json.dumps({'ok': True, 'diag': diag_text()},
+                              ensure_ascii=False).encode('utf-8')
+            self._send(200, body, 'application/json; charset=utf-8')
         elif path == '/api/update/status':
             self._send(200, json.dumps(_update_get(), ensure_ascii=False).encode('utf-8'),
                        'application/json; charset=utf-8')
         else:
             self._send(404, b'not found')
+
+    def _host_ok(self):
+        """请求的 Host 必须是本机面板自己(挡 DNS rebinding: 域名指向 127.0.0.1 时
+        Host 会是那个域名, 这里就过不去)。GET 与 POST 都先过这一关(审查 M-6)。"""
+        host = (self.headers.get('Host') or '').lower()
+        return host in ('127.0.0.1:%d' % PANEL_PORT, 'localhost:%d' % PANEL_PORT)
 
     def _same_origin(self):
         """只接受来自本机面板页面的请求。
@@ -1520,9 +2055,9 @@ class PanelHandler(BaseHTTPRequestHandler):
         (简单请求不触发预检)。校验 Host 与 Origin, 挡掉网页 CSRF 与 DNS rebinding ——
         否则一个恶意页面就能把加速关掉, 甚至在无备份时清掉用户的 PAC。
         """
-        host = (self.headers.get('Host') or '').lower()
-        if host not in ('127.0.0.1:%d' % PANEL_PORT, 'localhost:%d' % PANEL_PORT):
+        if not self._host_ok():
             return False
+        _LAST_ACT[0] = time.time()
         origin = self.headers.get('Origin')
         if not origin:
             return True          # 同源 fetch 有些浏览器不带 Origin; Host 已经校验过
@@ -1548,9 +2083,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             resp = {'ok': ok, 'msg': msg}
         elif path == '/api/retest':
             threading.Thread(target=lambda: (HEALTH.refresh(candidate_list()),
-                                              HEALTH_RAW.refresh(CANDIDATE_IPS_RAW)),
+                                              HEALTH_RAW.refresh(CANDIDATE_IPS_RAW),
+                                              HEALTH_PAGES.refresh(CANDIDATE_IPS_RAW)),
                              daemon=True).start()
-            log('手动重测已触发(含 raw 池)')
+            log('手动重测已触发(含 raw 与 github.io 池)')
         elif path == '/api/quit':
             log('收到退出指令, 正在还原系统代理')
             disable_proxy()
@@ -1559,11 +2095,12 @@ class PanelHandler(BaseHTTPRequestHandler):
             st = do_update_check()
             log('手动检查升级: ' + str(st.get('msg')))
         elif path == '/api/update/start':
-            if UPDATE.get('phase') in ('downloading', 'verifying', 'applying'):
-                pass
-            else:
-                threading.Thread(target=apply_update_async, daemon=True).start()
+            if _start_update(auto=False):
                 log('收到升级指令, 开始下载新版本')
+        elif path == '/api/autoupdate':
+            # 设置里保留的开关(默认开): 关掉就回到"发现新版只提示"的老行为
+            ok, msg = set_auto_update('on=1' in query)
+            resp = {'ok': ok, 'msg': msg}
         elif path == '/api/set-ip':
             raw = ''
             for kv in query.split('&'):
@@ -1583,8 +2120,9 @@ class PanelHandler(BaseHTTPRequestHandler):
                    'application/json; charset=utf-8')
         if path == '/api/enable' and not resp['ok']:
             # 面板可能没被打开/没被看到 —— 沿用现有的弹窗机制再兜一次(审查 H-2)
-            threading.Thread(target=alert,
-                             args=('狐径: 启用加速失败', resp['msg'] or '加速没有生效'),
+            threading.Thread(target=alert_once,
+                             args=('enable-readback', '狐径: 启用加速失败',
+                                   resp['msg'] or '加速没有生效'),
                              daemon=True).start()
 
 
@@ -1592,11 +2130,7 @@ def start_panel():
     try:
         srv = ThreadingHTTPServer(('127.0.0.1', PANEL_PORT), PanelHandler)
     except OSError as e:
-        log('!! 端口 %d 被占用, 控制面板起不来: %s' % (PANEL_PORT, e))
-        alert('狐径: 端口被占用', '本机 %d 端口已被占用, 控制面板起不来。\n\n'
-              '多半是上一个狐径没退干净, 请在任务管理器结束它。\n\n日志: %s'
-              % (PANEL_PORT, LOG_FILE))
-        raise SystemExit(2)
+        _port_taken(PANEL_PORT, e, '控制面板')
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     log('控制面板 http://127.0.0.1:%d' % PANEL_PORT)
     return srv
@@ -1609,18 +2143,34 @@ def health_loop():
         need_meta = (time.time() - _last_meta_ok[0]) > 6 * 3600
         good = HEALTH.refresh(candidate_list())
         good_raw = HEALTH_RAW.refresh(CANDIDATE_IPS_RAW)
+        # GitHub Pages 与 raw/附件同一段 IP, 但证书记的是 *.github.io —— 单独体检
+        good_pages = HEALTH_PAGES.refresh(CANDIDATE_IPS_RAW)
         if need_meta or len(good) < 3:
             fetch_official_ips()
             good = HEALTH.refresh(candidate_list())
 
-        # 静默检查新版本（只提示，不自动升级）—— 启动后一次，之后每 12 小时一次。
+        # 静默检查新版本 —— 启动后一次, 之后每 12 小时一次。
+        # 2026-10-09 用户要求: 默认**自动升级、不弹确认框**; 关掉开关才回到"只提示"。
         if time.time() - _last_auto_check[0] > AUTO_CHECK_INTERVAL:
             _last_auto_check[0] = time.time()
             try:
                 st = do_update_check()
                 remote = str(st.get('remote') or '')
                 if cmp_ver(remote, APP_VERSION) > 0:
-                    log('发现新版本 v%s（面板上点一下就能升级，不会自动升）' % remote)
+                    if not auto_update_on():
+                        log('发现新版本 v%s（自动升级已关闭, 面板上点「立即升级」即可）' % remote)
+                    else:
+                        go, why = _auto_update_guard(remote, st.get('exe_url') or '')
+                        if go:
+                            log('发现新版本 v%s, 按设置自动升级(不弹确认框; 校验不过会保留旧版)'
+                                % remote)
+                            if _LAST_ACT[0] and (time.time() - _LAST_ACT[0]) < 60:
+                                log('面板 %d 秒前还有活动(用户可能正开着面板): 升级前的开关'
+                                    '状态已存档, 面板标签页升级后会自己接上, 不丢状态'
+                                    % int(time.time() - _LAST_ACT[0]))
+                            _start_update(auto=True)
+                        else:
+                            log('发现新版本 v%s, 但没有自动升级: %s' % (remote, why))
                 else:
                     log('已是最新版 v%s' % APP_VERSION)
             except Exception as e:
@@ -1633,10 +2183,11 @@ def health_loop():
             log('体检: 可用 %d/%d 已运行%d分钟 -> %s' % (
                 len(good), len(CANDIDATES), up_min,
                 ', '.join('%s(%dms)' % (i, m) for i, m in good[:3])))
-        elif good_raw:
-            log('raw 体检: 可用 %d/%d -> %s'
+        elif good_raw or good_pages:
+            log('raw/pages 体检: 可用 %d/%d 与 %d/%d -> %s'
                 % (len(good_raw), len(CANDIDATE_IPS_RAW),
-                   ', '.join('%s(%dms)' % (i, m) for i, m in good_raw[:2])))
+                   len(good_pages), len(CANDIDATE_IPS_RAW),
+                   ', '.join('%s(%dms)' % (i, m) for i, m in (good_raw or good_pages)[:2])))
         else:
             good = recover()
             if good:
@@ -1700,6 +2251,14 @@ def main():
             log('静默模式: 已有实例在运行, 本次直接退出(不动系统代理)')
         return
 
+    # 上一次升级留下的状态(用户 2026-10-09 要求: 不要丢状态):
+    #   ① 面板上留一行"已自动升级到 vX.Y.Z"; ② 系统代理开关接着用升级前的选择。
+    prev = consume_update_done()
+    keep_off = bool(_AUTO_UPGRADED[0]) and (prev or {}).get('proxy_on') is False
+    if keep_off and proxy_on():
+        log('升级前用户没有开启加速, 这里按原状态关掉, 不替他打开')
+        disable_proxy()
+
     start_proxy()
     start_panel()
     fetch_official_ips()
@@ -1709,7 +2268,9 @@ def main():
         # 静默模式(开机自启用)以前**没有**注册退出还原 —— 这正是"程序关了,
         # PAC 却留在注册表里"的根因。现在两种模式都注册。
         atexit.register(on_exit)
-        if not proxy_on():
+        if keep_off:
+            log('按升级前的状态: 没有开启加速')
+        elif not proxy_on():
             enable_proxy()
         elif _load_backup() is None:
             log('注意: 系统代理已指向本程序, 但没有还原备份 —— 退出时会直接清除该 PAC')
@@ -1718,15 +2279,22 @@ def main():
             time.sleep(60)
     else:
         atexit.register(on_exit)
-        if not proxy_on():
+        if keep_off:
+            log('按升级前的状态: 没有开启加速')
+        elif not proxy_on():
             enable_proxy()
         elif _load_backup() is None:
             log('注意: 系统代理已指向本程序, 但没有还原备份 —— 退出时会直接清除该 PAC')
-        try:
-            webbrowser.open('http://127.0.0.1:%d/ui' % PANEL_PORT)
-        except Exception:
-            pass
-        log('控制面板已打开: http://127.0.0.1:%d/ui' % PANEL_PORT)
+        if _AUTO_UPGRADED[0]:
+            # 原来开着的面板页每 3 秒轮询一次, 新实例起来后它会自己接上 ——
+            # 不再重复开一个浏览器窗口, 免得打断用户。
+            log('这次是升级后自动重启: 原来开着的面板标签页会自己接上, 不再重复打开浏览器')
+        else:
+            try:
+                webbrowser.open('http://127.0.0.1:%d/ui' % PANEL_PORT)
+            except Exception:
+                pass
+            log('控制面板已打开: http://127.0.0.1:%d/ui' % PANEL_PORT)
         log('想常驻后台请勾「开机自启」; 点「退出并还原」可安全关闭本程序')
         try:
             while True:
