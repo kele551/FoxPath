@@ -119,9 +119,9 @@ python build_exe.py                   # 打包成 FoxPath.exe
 主程序**零第三方依赖**（只用 Python 标准库），打包额外需要 `pyinstaller`，
 发布流水线 `tools/publish.py` 需要 `requests` —— 依赖口径见仓库根目录的 `requirements.txt`。
 
-> 图标不用管：`app.ico` 已经入库。仓库里那几个 `create_icon*.py` /
-> `make_icon_from_user_image.py` 是当初做图标用的一次性脚本，里面的输入输出路径都写死在
-> 作者本机（还有一个依赖本机剪贴板缓存），**在别的机器上跑不通**，正常构建不需要它们。
+> 图标不用管：`app.ico` 已经入库，且为**自绘**（不含任何第三方吉祥物或标志，见 `COMPLIANCE.md`）。
+> 当初做图标用的那几个一次性脚本（`create_icon*.py` / `make_icon_from_user_image.py`）已从仓库
+> 移除：它们把输入输出路径写死在作者本机，在别的机器上跑不通，正常构建也不需要它们。
 
 | 文件 | 说明 |
 | --- | --- |
@@ -134,8 +134,7 @@ python build_exe.py                   # 打包成 FoxPath.exe
 | `tools/compare_ips.py` | 把内置候选 IP 与 GitHub 官方 `meta` 网段对照（排查用） |
 | `tools/publish.py` | 一键发布流水线（Gitee 主 + GitHub 镜像），内置自检闸门 |
 | `requirements.txt` | 依赖口径：主程序零第三方依赖，只有发布脚本需要 `requests` |
-| `make_icon_from_user_image.py` | 图标生成（抠图 + 圆角底 + 多尺寸 ICO） |
-| `app.ico` | 程序图标 |
+| `app.ico` | 程序图标（自绘，不含第三方吉祥物或标志） |
 | `release-notes.md` | 发行说明 |
 | `使用说明.txt` | 中文使用说明 |
 

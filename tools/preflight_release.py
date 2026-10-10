@@ -35,7 +35,24 @@ import time
 import urllib.parse
 import urllib.request
 
-REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'repo')
+# 控制台编码可能是 GBK（Windows 中文默认）：结论行的 ✅/❌ 会让 print 抛
+# UnicodeEncodeError，于是"检查明明全绿"却以 traceback + 退出码 1 收场 ——
+# 2026-10-10 在仓库布局下第一次真正跑到 finish() 时实跑复现。
+# 写法与 tools\publish.py:266-269 保持一致。
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
+# 仓库根：本脚本既可能在 <项目>\tools\ 下（工作区那份，源码在 <项目>\repo），
+# 也可能在 <仓库>\tools\ 下（随仓库入库的那份，源码就在上一级）。
+# 两种位置都自己认出来 —— 写法与 tools\compare_ips.py:18-20 一致。
+# 2026-10-10：此前写死 <项目>\repo，导致在仓库里跑 README 那条命令时
+# REPO 解析成 ...\repo\repo，第 218 行直接 FileNotFoundError。
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = _HERE if os.path.exists(os.path.join(_HERE, 'github_direct.py')) \
+    else os.path.join(_HERE, 'repo')
 DATA = os.path.join(os.environ['LOCALAPPDATA'], 'FoxPath')
 PANEL = 'http://127.0.0.1:8788'
 REG = r'Software\Microsoft\Windows\CurrentVersion\Internet Settings'
@@ -441,7 +458,10 @@ CAND = _positional[0] if _positional else os.path.join(REPO, 'FoxPath.exe')
 # 为什么不再用"改 PE 时间戳"：
 #   新版小助手**按版本号确认升级成功**；改时间戳造出来的假新版自报版本仍是本版(1.0.7)，
 #   于是会被**正确地判为失败并回滚** —— 演练却断言"换上去的应该就是新版"，必然报红（真事）。
-NEW999 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+# 9.9.9 测试版 exe（完整升级演练拿它当"假新版本"）：两种布局下都在 <项目>\builds\ 里，
+# 而 <项目> 正好是 REPO 的上一级。builds\ 不入库，所以别人 clone 之后这里通常不存在，
+# ④ 段会明确报红提示先跑 tools\造测试版-9.9.9.py，而不是抛异常。
+NEW999 = os.path.join(os.path.dirname(REPO),
                       'builds', '测试用v9.9.9', 'FoxPath-9.9.9-test.exe')
 print('狐径发版前自检%s' % ('（--dry-run：只做静态检查）' if DRY else ''))
 print('  候选 exe: %s' % CAND)
@@ -481,6 +501,13 @@ cache = os.path.join(DATA, 'update.json')
 had_url = os.path.exists(url_txt)
 if had_url:
     shutil.copy2(url_txt, url_txt + '.preflight')
+
+# 2026-10-10：_restore 必须在 try **之前**就存在 —— 收尾的 finally 会遍历它，把演练
+# 期间被改写的真实文件放回去。此前它是 ④ 段（原第 533 行）才赋值的，于是 ②冷启动演练 /
+# ③接口自测 任何一步抛异常时，finally 第一件事就是 NameError：注册表是否还原的校验、
+# update_url.txt 的还原、把用户机器上原来在跑的狐径重新拉起来，全都不会执行，
+# 而且原始异常还会被这个 NameError 盖掉（真事复现过）。
+_restore = []          # [(备份路径, 原路径)]
 
 try:
     # ── 2 冷启动演练（上一版漏掉的那一步）────────────────────────────
@@ -530,7 +557,7 @@ try:
     # 2026-10-09：演练会往**真实数据目录**写 update.log / update-result.json。
     # 前者本来就删掉重来；后者**必须备份还原** —— 否则用户面板那行「上次升级结果」
     # 会挂着演练造出来的假记录（真事：面板显示"升级到 v9.9.9 失败, 回滚后也没能自动启动"）。
-    _restore = []          # [(备份路径, 原路径)]
+    # _restore 已在上面 try 之前初始化，这里只往里追加（见那里的原因说明）。
     _resf = os.path.join(DATA, 'update-result.json')
     _logf2 = os.path.join(DATA, 'update.log')
     for _p in (_resf, _logf2):
@@ -736,7 +763,9 @@ finally:
     check('注册表恢复到自检前', before == after, '%s -> %s' % (before, after))
     shutil.rmtree(TMP, ignore_errors=True)
     # 把用户机器上原来在跑的狐径重新拉起来
-    installed = r'D:\Program Files\FoxPath.exe'
+    # 把用户机器上原来在跑的狐径重新拉起来。
+    # 安装位置允许用 FOXPATH_INSTALLED_EXE 覆盖（别人机器上不一定是 D:\Program Files）。
+    installed = os.environ.get('FOXPATH_INSTALLED_EXE') or r'D:\Program Files\FoxPath.exe'
     if os.path.exists(installed):
         subprocess.Popen([installed, '--silent'])
         time.sleep(10)
