@@ -17,6 +17,14 @@ OWNER = 'kele551'
 REPO = 'FoxPath'
 API = 'https://api.github.com'
 
+# 2026-10-10：删掉四个一次性图标脚本条目。
+#   create_icon_octocat.py —— 仓库里早已不存在（本体已归档到 logs\归档-遗留脚本\），
+#       却一直留在清单里；put_file 对不存在的文件只打印"跳过(不存在)"并返回 False，
+#       于是其余文件全成功也永远打印"完成 14/15"并返回失败码。
+#   create_icon.py / create_icon_from_image.py / make_icon_from_user_image.py ——
+#       一次性脚本，写死了作者机器路径（其中一个还写着 Octocat 素材），与
+#       COMPLIANCE.md「图标为自绘、不含任何第三方吉祥物或标志」的声明冲突。
+#       app.ico 已入库，构建完全不需要它们。
 FILES = [
     'README.md',
     'LICENSE',
@@ -24,15 +32,11 @@ FILES = [
     'github_direct.py',
     'build_exe.py',
     'publish_files.py',
-    'make_icon_from_user_image.py',
     'app.ico',
     '使用说明.txt',
     'release-notes.md',
     'Fix-GitHub.ps1',
     'Run-GitHubFix.bat',
-    'create_icon.py',
-    'create_icon_from_image.py',
-    'create_icon_octocat.py',
 ]
 
 VERSION = 'v1.0.7'      # 提交信息里的版本号, 改版本时同步改这里(已并入 tools/publish.py 的自动改版)

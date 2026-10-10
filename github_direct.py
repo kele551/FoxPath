@@ -2119,6 +2119,14 @@ def _spawn_helper(exe, new, ver, silent=False):
     突然给用户弹一个浏览器窗口。
     """
     import subprocess
+    # 2026-10-10: 版本号来自升级源 version.json，是**外部输入**，而且是这个函数里唯一
+    # 没走 q() 转义的变量（见下面 $newver）。真被塞进单引号会让整个助手脚本语法错误，
+    # 于是备份/覆盖/重试/三重兜底/回滚一行都跑不到，用户侧只看到"点了升级没反应"，
+    # 还会把 .new 留在 exe 旁边。这里先按字符集卡死，不合法直接拒绝（fail-closed）。
+    _v = str(ver)
+    if not (_v and _v.isascii() and all(c.isalnum() or c in '.+-' for c in _v)):
+        log('拒绝升级: 升级源里的版本号含非法字符 %r' % (ver,))
+        return False
     # 审查 M-15: 助手脚本改成**一次性随机名** —— 固定叫 update-apply.ps1 时,
     # 数据目录里任何一个同用户程序都能提前把它替换掉。脚本跑完会删掉自己(见末尾)。
     helper = os.path.join(DATA_DIR, 'update-apply-%s.ps1' % uuid.uuid4().hex[:8])
@@ -2129,7 +2137,7 @@ def _spawn_helper(exe, new, ver, silent=False):
         '$exe = ' + q(exe),
         '$new = ' + q(new),
         '$log = ' + q(logf),
-        "$newver = '" + str(ver) + "'",
+        "$newver = " + q(ver),
         "$silent = " + ('$true' if silent else '$false'),
         "$args0 = " + ("'--silent'" if silent else "''"),
         "# ★★ 先把自己环境里的 PyInstaller 记账变量删干净, 再启动任何狐径 exe(2026-10-09 真机事故):",
