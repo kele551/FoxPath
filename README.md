@@ -1,8 +1,17 @@
-﻿# 狐径 FoxPath
+﻿<div align="center">
+<img src="docs/icon.png" alt="狐径 FoxPath" height="120" width="120">
 
-> 作者：**海风（kele551）** · 仓库：https://github.com/kele551/FoxPath （Gitee 同名镜像：https://gitee.com/kele551/FoxPath ）
+<h1>狐径 FoxPath</h1>
 
-![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Version](https://img.shields.io/badge/version-v1.0.8-blue) ![Downloads](https://img.shields.io/github/downloads/kele551/FoxPath/total?label=downloads&color=green)
+<img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square">
+<img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?style=flat-square">
+<img alt="Version" src="https://img.shields.io/badge/version-v1.0.8-blue?style=flat-square">
+<img alt="Downloads" src="https://img.shields.io/github/downloads/kele551/FoxPath/total?style=flat-square&label=downloads&color=green">
+
+<p>🦊 <b>GitHub 访问优化助手</b>　——　只在本机做网络分流，不改 hosts、不改系统 DNS，退出即还原</p>
+
+<p>作者 <b>海风（kele551）</b>　·　Gitee（主）<a href="https://gitee.com/kele551/FoxPath">kele551/FoxPath</a>　·　GitHub（镜像）<a href="https://github.com/kele551/FoxPath">kele551/FoxPath</a></p>
+</div>
 
 GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，直连当前实测可用的 GitHub 官方 IP。
 
@@ -45,6 +54,10 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 
 ## 原理
 
+<details>
+<summary><b>原理</b>（点击展开）</summary>
+
+
 ```
 浏览器 ──PAC──> 狐径本地代理 127.0.0.1:8787 ──> 实测可用的 GitHub 官方 IP
               （接管 github.com + raw/附件 + Pages）  （不依赖域名解析）
@@ -56,6 +69,9 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 | 依赖系统 DNS 解析 | 不查 DNS，直连实测能用的官方 IP |
 | IP 失效后彻底打不开 | 每 5 分钟重测一轮，死 IP 自动换 |
 | 程序退出后系统代理指向空端口，比原来更糟 | 退出/点「退出并还原」都会还原；PAC 带 `DIRECT` 兜底；还有 `--restore` 一键收尾 |
+
+</details>
+
 
 ## 用法
 
@@ -92,6 +108,10 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 
 ## 核心机制
 
+<details>
+<summary><b>核心机制</b>（点击展开）</summary>
+
+
 - **体检**：每 5 分钟并发重测候选池，条件是 TCP 443 握手 + TLS 证书校验 + HTTP 首包必须返回 2xx/3xx。
   最后这条很关键——有些 IP 证书是对的，但只服务 API/CDN，访问 github.com 首页会返回 400，必须过滤掉。
 - **候选池刷新**：定期从 `api.github.com/meta` 重拉 GitHub 官方公布的 IP 段，官方换 IP 了也能跟上。
@@ -108,7 +128,14 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
   关掉后升级结果仍会留在卡片里的「上次升级结果」那一行。
 - **单实例**：用 Windows 命名互斥保证只有一个实例；重复双击不会起两个进程去抢 8787/8788。
 
+</details>
+
+
 ## 从源码构建
+
+<details>
+<summary><b>从源码构建</b>（点击展开）</summary>
+
 
 ```bash
 pip install pyinstaller
@@ -146,7 +173,14 @@ python build_exe.py                   # 打包成 FoxPath.exe
   中文会变乱码，字符串/花括号被破坏后直接 ParserError —— `Fix-GitHub.ps1` 在 v1.0.1 之前
   就是这样：文件本身完整，但因为没有 BOM 而**从未成功运行过**。
 
+</details>
+
+
 ## 发版前自检（发布闸门）
+
+<details>
+<summary><b>发版前自检（发布闸门）</b>（点击展开）</summary>
+
 
 **发版前自检脚本随仓库提供，位置 `tools/preflight_release.py`**（同目录的 `tools/compare_ips.py`
 用于对照官方 `meta` 网段排查候选 IP）：
@@ -173,7 +207,14 @@ python tools/preflight_release.py --dry-run    # 只跑静态项：不写注册�
 > 警告级（WARN）不阻断发布，但会在结尾单独列出来，发布前应当看一眼。
 > `tools/publish.py release` 已内置这道闸门：自检不全绿直接中止发布（`--skip-preflight` 只留给线上事故回滚，且要在 `logs\` 写明原因）。
 
+</details>
+
+
 ## 升级时请注意
+
+<details>
+<summary><b>升级时请注意</b>（点击展开）</summary>
+
 
 - **不会把「降级」当「升级」**：升级前按版本号语义比较（`1.0.10 > 1.0.9` 这种也算得对），
   只有线上确实比本地新才会提示「发现新版本」；线上不比本地新时，面板直接说明是
@@ -190,7 +231,14 @@ python tools/preflight_release.py --dry-run    # 只跑静态项：不写注册�
 - **从 v1.0.6 升到 v1.0.7 这一跳**用的仍是老版小助手（不重试、不回滚），所以**仍可能失败一次**；
   失败了双击 `FoxPath.exe` 即可。**从 v1.0.7 往后，升级全程带护栏。**
 
+</details>
+
+
 ## 已知边界
+
+<details>
+<summary><b>已知边界</b>（点击展开）</summary>
+
 
 - 代理 `github.com` / `www.github.com`，以及 **`raw.githubusercontent.com` /
   `objects.githubusercontent.com`**（raw 文件与发布附件下载，v1.0.6 起）。
@@ -213,7 +261,14 @@ python tools/preflight_release.py --dry-run    # 只跑静态项：不写注册�
   （中文文件名在部分平台下载下来会乱码，所以对外链接一律给 ASCII 名）。
   两个核心附件 `FoxPath.exe` / `version.json` 两平台逐字节一致；每次发布都会把附件下载回来比对 SHA256。
 
+</details>
+
+
 ## 版本记录
+
+<details>
+<summary><b>版本记录</b>（点击展开）</summary>
+
 
 > 当前对外发布版本是 **v1.0.7**（2026-10-09，Gitee 与 GitHub 同步；
 > 已随 v1.0.7 发布：升级护栏（拒绝降级、失败自动回滚、小助手不再把 _PYI_* 传给新版本）。
@@ -230,6 +285,9 @@ python tools/preflight_release.py --dry-run    # 只跑静态项：不写注册�
 | v1.0.7 | 2026-10-09 | **升级护栏**：① 版本号按语义比较，**拒绝把降级当升级**（面板置灰 + 服务端拦截）；② 升级失败**自动回滚**旧版；③ 找到「升级后起不来」的**真因**（小助手把 `_PYI_*`/`_MEIPASS*` 环境变量传给了新版本，导致引导程序误判已解包）；④ 升级结果气泡 + 回执文件 |
 
 详细发行说明见 [release-notes.md](release-notes.md)。
+
+</details>
+
 
 ## 联系与反馈
 
@@ -269,3 +327,17 @@ MIT
 | 安全 | 漏洞请**不要**开公开 Issue，按 [SECURITY.md](SECURITY.md) 私下报告 |
 | 发布纪律 | 主程序零第三方依赖；每次发布都要先跑发版前自检 `tools/preflight_release.py`（版本一致性、冷启动演练、升级演练、失败分支、退出还原）全绿，才允许上传附件 |
 | 合规 | 本项目的法律与知识产权边界见 [COMPLIANCE.md](COMPLIANCE.md)：只在本机运行、不提供代理服务、只连接服务方公开地址、不采集用户数据；不使用他人商标作为品牌名 |
+---
+
+## ♥️ 支持项目
+
+如果 **狐径 FoxPath** 帮到了你，**给仓库点个 Star ⭐** 就是最好的支持 —— 它能让更多人看到这个项目。
+
+如果想再进一步，也可以请作者喝杯咖啡（**完全自愿，不影响任何功能**）：
+
+| 微信 | 支付宝 |
+|:---:|:---:|
+| ![微信收款码](docs/qr-wechat.png) | ![支付宝收款码](docs/qr-alipay.png) |
+
+> 本项目以 MIT 协议自由开源，**没有付费版、也没有付费功能**；捐赠纯属自愿，
+> 与功能开放、版本更新、Issue 响应**没有任何关系**。
