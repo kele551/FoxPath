@@ -39,6 +39,7 @@ import ctypes
 import ipaddress
 import json
 import os
+import collections
 import queue
 import re
 import select
@@ -363,6 +364,17 @@ LOG_MAX = 512 * 1024
 LOG_TAIL_BYTES = 128 * 1024   # 超过上限时保留的尾部**字节数**(审查 M-9: 不再按行)
 LOG_PANEL_LINES = 200      # 面板 /api/status 只回尾部这么多行
 LOG_QUEUE_MAX = 2000       # 面板没打开时队列也要有个上限, 不然会一直涨
+
+# 【2026-10-10 修·面板「日志」卡实际是空的】面板那条日志原来读的是 _log_q，
+# 而且是**读空式**读法（get_nowait 一路取到 Empty），面板 JS 又每 3 秒拿返回值
+# **整体替换** #log —— 两者一叠加：首次打开能刷出历史，3 秒后就被换成"这 3 秒里
+# 新产生的几行"。体检（5 分钟一轮）、自愈、升级、还原这些**关键行只会闪现 3 秒
+# 然后消失**，绝大多数时候卡片是空白的；而 README 把它写成"foxpath.log 的尾部、
+# 自动滚到最新"，并让用户"打不开 GitHub 先看这里"复制给作者 —— 实际拿到的基本没价值。
+# 现在加一条**旁路环形缓冲**：log() 除了写队列与文件，再往这里塞一份；
+# recent_logs() 只读它、**不清空** —— 面板随时都能看到最近 200 行关键日志。
+# 必须定义在 LOG_PANEL_LINES 之后（maxlen 用它）。
+_log_ring = collections.deque(maxlen=LOG_PANEL_LINES)
 # 连接级日志(每转发一次写一行)的降级参数(审查 H-5): 正常浏览 GitHub 几十秒就能
 # 产生几百行, 而面板只显示尾部 200 行、文件只留尾部一块(按字节) —— 不降级的话,
 # 体检/自愈/升级/还原这些关键行会被直接挤出可视范围。
@@ -411,6 +423,7 @@ def log(msg, debug=False):
             except queue.Empty:
                 pass
         _log_q.put(line)
+        _log_ring.append(line)               # 【2026-10-10】旁路环形缓冲, 面板只读它
         _log_to_file(line)
     try:
         print(line, flush=True)
@@ -452,13 +465,20 @@ def log_conn(msg):
 
 
 def recent_logs(n=LOG_PANEL_LINES):
-    out = []
+    """面板「日志」卡要的最近 n 行。
+
+    【2026-10-10 修·卡片实际是空的】以前是**读空** _log_q（get_nowait 一路取到
+    Empty）；面板 JS 每 3 秒拿这个返回值**整体替换** #log 的文本，于是读完队列就空了
+    —— 首次打开还能刷出历史，3 秒后只剩"这 3 秒里新产生的几行"。
+    体检（5 分钟一轮）、自愈、升级、还原这些**关键行只闪现 3 秒就消失**，
+    而 README 让用户"打不开 GitHub 先看这里"复制给作者 —— 实际拿到的基本没价值。
+    现在只读**旁路环形缓冲**（log() 每次都往里塞一份）、**不清任何东西**，
+    面板随时都能看到最近 200 行。
+    """
     try:
-        while True:
-            out.append(_log_q.get_nowait())
-    except queue.Empty:
-        pass
-    return out[-n:]
+        return list(_log_ring)[-n:]
+    except Exception:
+        return []
 
 
 def is_raw_host(host):
@@ -485,6 +505,36 @@ def is_pages_host(host):
     """
     host = (host or '').lower().split(':')[0]
     return host == 'github.io' or host.endswith(GITHUB_IO_SUFFIX)
+
+
+# 【2026-10-10 修 声明不符】本代理**只允许转发 GitHub 相关域名**。
+#
+# 为什么补这一道：对外声明（COMPLIANCE.md、给组委会的材料）写的是
+# 「只接管 GitHub 相关域名；**不提供代理服务、不转发他人流量**」，
+# 而 `_connect()` 的兜底原来**对任何 host 都照常建隧道**（见下面那处修改），
+# 本机任意程序、或用户照教程把系统代理手填成 127.0.0.1:8787，
+# 就能把它当成通用转发用 —— 与声明直接冲突。
+# `SECURITY.md` 自己也把这一条列进"算漏洞"，只是代码一直没收。
+#
+# 名单口径：**基名完全相同 或 以「.基名」结尾**。
+#   · github.com            -> github.com / www.github.com / api.github.com / gist.github.com
+#   · githubusercontent.com -> raw. / objects. / avatars. / camo. …
+#   · github.io             -> github.io 与 user.github.io
+# 这样旧 PAC 缓存送来的 api.github.com 之类**仍能正常走直连**（不会因为收窄而误伤），
+# 而 example.com、内网地址、任意第三方站点一律拒。
+GITHUB_HOST_BASES = ('github.com', 'githubusercontent.com', 'github.io',
+                     'githubassets.com', 'githubapp.com')
+
+
+def is_github_related_host(host):
+    """该主机是否属于"允许本代理转发的 GitHub 相关域名"。"""
+    h = (host or '').lower().split(':')[0].strip().strip('.')
+    if not h:
+        return False
+    for b in GITHUB_HOST_BASES:
+        if h == b or h.endswith('.' + b):
+            return True
+    return False
 
 
 # ------------------------------------------------------------------- 注册表
@@ -574,6 +624,18 @@ class Health(object):
                 # github.io(证书里是 *.github.io)。混用会把好 IP 判死。
                 if not cert_matches(names, self.expect):
                     return None
+                # 【2026-10-10 修·用户最早报的那句"搜出来的 IP 延迟太久了"】
+                # 延迟**在这里就定下来** —— TLS 握手完成、证书也验过的这一刻。
+                # 因为"连上这个 IP 有多快"只取决于 TCP + TLS 这两步。
+                # 下面那次 HTTP GET 是**通过/不通过的体检**，不该算进延迟：
+                #   · 以前算的是"TCP + TLS + HTTP"三段之和；
+                #   · 而 HTTP 那步超时（s.settimeout(2.0)）会被下面的 except 吞掉、
+                #     IP 照样算可用 —— 可那 2 秒**算进了延迟**。于是好 IP 也能报出
+                #     2200ms 左右（实测真实链路只有 200ms 上下），日志里那一簇
+                #     2190~2240ms 就是这么来的；
+                #   · 更糟的是候选池**按这个数排前 4**：链路快、只是 HTTP 那一拍慢的
+                #     IP 会被排到后面，代理因此挑不到最好的那个。
+                _lat = int((time.time() - t0) * 1000)
                 # TLS 握手通了还不够: 某些 IP 的证书对, 但只跑 API/CDN,
                 # 直接访问 github.com 会返回 4xx, 这种不能要。
                 # 这里发一发 GET /; 如果 HTTP 测试自己超时(偶尔发生),
@@ -601,7 +663,7 @@ class Health(object):
                     pass
                 except (socket.timeout, TimeoutError, OSError):
                     pass
-            return int((time.time() - t0) * 1000)
+            return _lat
         except Exception:
             return None
         finally:
@@ -828,6 +890,13 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             pass
 
     def _connect(self, host, port):
+        # 【2026-10-10 修 声明不符】先卡域名：本代理只转发 GitHub 相关域名。
+        # 对外写的是「只接管 GitHub 相关域名、不转发他人流量」，
+        # 原来这里的兜底对任何 host 都建隧道，与声明冲突（SECURITY.md 自己也列了这条）。
+        # 现在拒绝并记一行日志 —— 不静默，出问题能从日志看出来是谁在借用。
+        if not is_github_related_host(host):
+            log('拒绝转发非 GitHub 域名: %s:%s（本代理只接管 GitHub 相关域名）' % (host, port))
+            return None, None
         if is_raw_host(host):
             # raw 文件 / 发布附件：走 185.199.108.0/22 那段专属池。
             # 以前没有这段，所以 githubusercontent 只能直连（用户提的 issue #1）。
@@ -849,7 +918,18 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     continue
             log('github.io 候选 IP 全灭, 本次退回系统解析')
         elif is_github_host(host):
-            for ip in HEALTH.candidates()[:4]:
+            # 【2026-10-10 修·"手动指定 IP 会优先使用"其实做不到】面板的输入框、
+            # save_manual_ip 的回话、以及 candidate_list() 的注释都承诺手填的 IP
+            # **永远排第一** —— 但 HEALTH.refresh() 会把探测结果**按毫秒重排**，
+            # 而代理真正取的是 HEALTH.candidates()[:4]：
+            # 手填的那个只有恰好也进前 4 才会被用上。
+            # 用户为救急填的地址通常**不是最快的、只是"能通"**，于是被排到后面，
+            # 只有当最快的 4 个连 TCP 都失败时才有机会 —— 体感就是"我填了 IP 也没用"。
+            # 这里把手填的 IP **钉在最前面**单独先试一次。
+            if not _MANUAL_IP[0]:
+                _MANUAL_IP[0] = load_manual_ip()
+            _first = [_MANUAL_IP[0]] if _MANUAL_IP[0] else []
+            for ip in _first + [x for x in HEALTH.candidates()[:4] if x not in _first]:
                 try:
                     return socket.create_connection((ip, port), timeout=5), ip
                 except OSError:
@@ -1103,6 +1183,16 @@ def disable_proxy():
     """
     with _REG_LOCK:
         saved = _load_backup()
+        # 【2026-10-10 修·还原会覆盖用户设置】有备份、但**当前系统代理已经不是狐径设的**
+        # —— 说明中间被别的东西改过(用户自己改的、公司策略下发的、别的工具设的)。
+        # 这时候按备份还原 = 把人家刚设好的东西覆盖成"狐径启用之前的那个旧值"，
+        # 而且那份新设置**原文再也找不回**；面板还会回一句"已停用, 系统代理已还原"，
+        # 用户根本不知道自己的设置被动了。
+        # 与下面"没有备份"那一支同一个口径：**不是我们设的，就一个字节都不动**。
+        if saved is not None and not proxy_on():
+            log('有还原备份, 但当前系统代理不是狐径所设 —— 保持原样, 不覆盖')
+            return False, ('当前系统代理不是狐径所设（中途可能被别的程序或策略改过）—— '
+                           '已保持原样，没有做任何修改')
         if saved is None:
             # 没有备份时要分两种情况, 不能一律删:
             #   a) 当前值确实指向本程序 -> 是本程序留下的残留, 清掉(用户删程序后
@@ -1136,6 +1226,17 @@ def disable_proxy():
         if no_backup:
             return True, ('已停用: 清掉了本程序写的 PAC；ProxyEnable / ProxyServer '
                           '原值未知, 按"未知即不动"保持原样')
+        # 【2026-10-10 修·撤掉用完的备份】还原成功后把那份快照删掉 —— 它已经用完了。
+        # 留着就是隐患：盘上永远躺着一份**过期快照**，下次"停用并还原"若在异常路径上
+        # 用到它，就会拿旧值覆盖用户此刻的设置(上面那道闸门也拦得住，但不如根本不留)。
+        # 删掉是安全的：此刻注册表里就是用户的原值，备份已无用处；
+        # 用户再点"启用加速"时 enable_proxy 会重新备份一份。
+        try:
+            if os.path.exists(BACKUP_FILE):
+                os.remove(BACKUP_FILE)
+                log('还原备份已用完, 已撤掉: %s' % BACKUP_FILE)
+        except OSError as e:
+            log('还原备份撤掉失败(不影响本次还原结果): %s' % e)
         return True, '已停用, 系统代理已还原'
 
 
@@ -2999,12 +3100,21 @@ def health_loop():
             log('体检: 可用 %d/%d 已运行%d分钟 -> %s' % (
                 len(good), len(CANDIDATES), up_min,
                 ', '.join('%s(%dms)' % (i, m) for i, m in good[:3])))
-        elif good_raw or good_pages:
-            log('raw/pages 体检: 可用 %d/%d 与 %d/%d -> %s'
-                % (len(good_raw), len(CANDIDATE_IPS_RAW),
-                   len(good_pages), len(CANDIDATE_IPS_RAW),
-                   ', '.join('%s(%dms)' % (i, m) for i, m in (good_raw or good_pages)[:2])))
         else:
+            # 【2026-10-10 修·自愈只跑第一步】这里原来是
+            #     elif good_raw or good_pages:  只写一行日志
+            #     else:                         good = recover()
+            # 于是"github.com 这一池全灭、而 raw/pages 还活着"这种**最典型的半坏状态**
+            # 永远走不进 recover() —— 也就是说 README 承诺的自愈三步
+            # （重拉官方表 → 问系统 DNS → 放宽超时到 6 秒重测）在这种状态下**根本不生效**，
+            # 用户看到的只是"面板说一个都不通"，程序自己不会去救。
+            # 现在：只看 github.com 这一池是不是空的；raw/pages 的体检结果
+            # 降级成"顺带记一行参考信息"，不再决定要不要自愈。
+            if good_raw or good_pages:
+                log('raw/pages 体检: 可用 %d/%d 与 %d/%d -> %s'
+                    % (len(good_raw), len(CANDIDATE_IPS_RAW),
+                       len(good_pages), len(CANDIDATE_IPS_RAW),
+                       ', '.join('%s(%dms)' % (i, m) for i, m in (good_raw or good_pages)[:2])))
             good = recover()
             if good:
                 log('自愈成功(已运行%d分钟): 可用 %d 个, 最快 %s(%dms)'
