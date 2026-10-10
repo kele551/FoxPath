@@ -20,6 +20,10 @@ _fox_preview.png
 *.old
 backups/
 
+# 【2026-10-10】tools/publish.py 自动生成的发布说明中转文件，不是源文件
+# （源文件是 release-notes.md）。早前被误提交到 GitHub，已删除；这条防止再被带上库。
+_notes.md
+
 # 代理状态快照(运行时生成)
 .proxy-backup.json
 
