@@ -335,9 +335,9 @@ MIT
 
 如果想再进一步，也可以请作者喝杯咖啡（**完全自愿，不影响任何功能**）：
 
-| 微信 | 支付宝 |
+| 微信（WeChat） | 支付宝（Alipay） |
 |:---:|:---:|
-| ![微信收款码](docs/qr-wechat.png) | ![支付宝收款码](docs/qr-alipay.png) |
+| <img src="docs/qr-wechat.png" alt="微信收款码" width="220" height="220"> | <img src="docs/qr-alipay.png" alt="支付宝收款码" width="220" height="220"> |
 
 > 本项目以 MIT 协议自由开源，**没有付费版、也没有付费功能**；捐赠纯属自愿，
 > 与功能开放、版本更新、Issue 响应**没有任何关系**。
