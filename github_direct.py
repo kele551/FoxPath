@@ -57,7 +57,7 @@ from ctypes import wintypes          # 升级结果气泡要用(Shell_NotifyIcon
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = '狐径'
-APP_VERSION = '1.0.7'
+APP_VERSION = '1.0.8'
 # 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
 AUTHOR = '海风（kele551）'
 AUTHOR_ASCII = 'HaiFeng (kele551)'

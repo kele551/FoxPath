@@ -48,7 +48,13 @@ TOKEN_CANDIDATES = [
     r'F:\Harness\secrets\raw\workbuddy-secrets\gitee_token',
     r'C:\Users\kele551\.workbuddy\secrets\gitee_token',
 ]
-PY = r'F:\Harness\toolchain\python\envs\default\Scripts\python.exe'
+# 2026-10-10: 打包用的解释器必须能覆盖 —— 这个 PY 既用来跑 build_exe.py（打包），
+# 也用来跑发版前自检。**打包绝不能用 envs\default**：那是「3.13.12 的 DLL + venv 的库」
+# 混搭环境，打出来的 exe 一启动就弹
+#   Security validation failure: unexpected name of application's home directory!
+# （真机复现过，见 logs\待发版-积压事项.md 第八节第 2 条）。桌面壁纸那边的 publish.py
+# 早就改成读环境变量了，这里是补上同样的一条。默认值保持原样（不改既有行为）。
+PY = os.environ.get('FOXPATH_PY') or r'F:\Harness\toolchain\python\envs\default\Scripts\python.exe'
 GIT_EXEC_PATH = r'F:/Harness/toolchain/PortableGit/versions/1.2.0/mingw64/bin'
 GIT_EXE = GIT_EXEC_PATH + '/git.exe'        # 绝对路径: 有的执行环境按名字找不到 git(WinError 2)
 GH_PUSH = r'F:\Harness\tools\github_push.py'
