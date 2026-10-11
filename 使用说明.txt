@@ -19,9 +19,11 @@
        raw.githubusercontent.com            (raw 文件, 例如各种一键脚本、配置文件)
        objects.githubusercontent.com        (GitHub 发布附件的下载)
        github.io / *.github.io              (GitHub Pages 网页, 例如项目自建的演示页)
-     其中 raw / 附件 / Pages 走**专属 IP 池** (官方 185.199.108.0/22), 不会连错服务器。
-     页面渲染用的头像与资源域 (avatars / camo / githubassets) 仍然直连 ——
-     它们本来就通, 走代理反而会让页面样式脚本加载失败、按钮点不动。
+     其中 raw / 附件 / Pages / avatars / camo 走**专属 IP 池** (官方 185.199.108.0/22):
+     它们同一段、同一张 *.githubusercontent.com 证书, 既不会连错服务器也不会撞证书。
+     实测同一张 282KB 头像: 直连 5.7~14.2 秒, 走代理 1.1~4.7 秒 ——
+     页面上有几十个头像, 它们直连被堵时主站就算秒开页面也一直转圈。
+     只有 githubassets.com 仍直连 (不同域、证书不同, 实测 0.27 秒本来就快)。
    - 其他网站完全走原路线, 不受影响
    - 屏幕上看不到窗口是正常的: exe 没有控制台, 日志写在
      %LOCALAPPDATA%\FoxPath\foxpath.log

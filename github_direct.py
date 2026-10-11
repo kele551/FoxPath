@@ -85,9 +85,18 @@ GITHUB_IO_SUFFIX = '.github.io'
 # **它们必须走自己的 IP 池**（见下面 CANDIDATE_IPS_RAW）：官方 meta 里
 # 185.199.108.0/22 才是这些主机的段；塞进 github.com 的池子会连到错误服务器，
 # 页面脚本会全废（这正是以前"不能代理 githubusercontent"的真正原因）。
-# 注意：这里刻意**不含** avatars / camo / githubassets —— 那些是页面渲染用的，
-# 保持直连，就不会重演当年的坑。
-PROXY_HOSTS_RAW = ('raw.githubusercontent.com', 'objects.githubusercontent.com')
+# 【2026-10-11 改·avatars/camo 纳入】本机实测推翻了上面"刻意直连"的老结论：
+#   同一张 avatars 头像 282KB，直连 5.7~14.2s（均值 10.68s），
+#   走本机代理 1.1~4.7s（均值 2.65s）——快约 4 倍，4 轮全胜。
+# 原因：avatars / camo 与 raw/objects **同一段 185.199.108.0/22**（本机解析
+#   全是 185.199.108~111.133），证书也是同一张 *.githubusercontent.com，
+#   所以放进 raw 池既不会连错服务器、也不会撞证书。
+# 意义：GitHub 页面上有几十个头像/camo 图片，它们直连被堵时，主站 HTML 就算
+#   秒开，页面也会一直转圈 —— 这正是"加速了但网页还是打不开"的另一半原因。
+# githubassets 仍保持直连：它不在 githubusercontent 域（证书不同），
+#   且本机实测 0.27s 本来就快，没必要动。
+PROXY_HOSTS_RAW = ('raw.githubusercontent.com', 'objects.githubusercontent.com',
+                   'avatars.githubusercontent.com', 'camo.githubusercontent.com')
 
 # GitHub 官方 IP 池（2026-10-08 从 api.github.com/meta 全量对齐）。
 # 以前只有 15 个手写地址：联通/移动拉不到 /meta 时就只剩这些旧地址，
@@ -131,12 +140,770 @@ CANDIDATE_IPS_RAW = [
 #   2) 将来我们往 meta.json 的 web6 字段里放实测可用的地址。
 CANDIDATE_IPS_V6 = []
 
+# 【2026-10-11 实测·IPv6 只有 raw 和 Pages 用得上, 主站用不上】
+# 今天下午 IPv4 全线拥塞时实测的对比(同一个确定存在的资源
+# raw.githubusercontent.com/github/gitignore/main/Python.gitignore):
+#   IPv4 185.199.108.133 / 109.133 -> 超时失败
+#   IPv6 2606:50c0:800x::154       -> 200, 5588 字节, 0.15~0.17 秒
+# 同一时刻 github.io 也一样: IPv6 2606:50c0:800x::153 访问 facebook.github.io
+# 返回 200, 而 IPv4 185.199.108.133 连不上 —— IPv6 走的是另一条路, 不跟 IPv4 一起堵。
+# 反过来 **github.com 主站根本没有 IPv6**: 扫了 144 个候选(2606:50c0:8000~8003::140~175),
+# 没有能对 github.com 返回 2xx/3xx 的(::153 是 Pages 的节点, 拿 github.com 去问一律 404)。
+# 所以下面两组只喂给 raw / pages 池, 主站池(CANDIDATE_IPS_V6)继续留空。
+CANDIDATE_IPS_RAW_V6 = [
+    '2606:50c0:8000::154', '2606:50c0:8001::154',
+    '2606:50c0:8002::154', '2606:50c0:8003::154',
+]
+CANDIDATE_IPS_PAGES_V6 = [
+    '2606:50c0:8000::153', '2606:50c0:8001::153',
+    '2606:50c0:8002::153', '2606:50c0:8003::153',
+]
+# 池子入参: raw 用"IPv4 + raw 的 IPv6", pages 用"IPv4 + pages 的 IPv6"。
+# 两组不能混 —— ::154 的证书不含 *.github.io, 塞进 pages 池只会被判死、白占探测名额。
+CANDIDATE_IPS_RAW_ALL = CANDIDATE_IPS_RAW + CANDIDATE_IPS_RAW_V6
+CANDIDATE_IPS_PAGES_ALL = CANDIDATE_IPS_RAW + CANDIDATE_IPS_PAGES_V6
+
 # ── 手动指定 IP（2026-10-08 加）──────────────────────────────────────────────
 # 现场救急用：自动探测一个都不通时，让用户填一个他这条线能连上的官方 IP。
 # 存在数据目录里，重启后仍然生效；填空 = 清除。
 MANUAL_IP_FILE = 'manual-ip.txt'
 _MANUAL_IP = ['']          # 内存缓存，免得每次都用磁盘
 _META_SOURCE = ['']        # 上次成功同步 IP 表的来源（体检信息里要报出来）
+# 【2026-10-11 修·"网页又打不开"的最后一公里】
+# 体检排第一的 IP 常常在两次体检之间悄悄死掉。实测 12:18:06 体检报
+# "20.27.177.119 = 224ms 排第一"，同一分钟直连它 TCP 就超时；而真正能通的
+# 20.200.245.247 排在后面。转发若死守"体检名次"串行试错，就要先撞死 IP、
+# 各等一轮超时 —— github 实测 8.15 秒才返回 200，浏览器体感就是"打不开"。
+# 这里记下"上一次真正连通成功的 IP"，下次转发优先复用：同一个 IP 几分钟内
+# 基本还是通的，于是首次连接就命中，不再串行试错。
+_LAST_GOOD = {'github': '', 'raw': '', 'pages': ''}
+# 【2026-10-11 修·失败计数降权】体检每 5 分钟重排一次名次, 会把刚被证实**已经连不上**
+# 的 IP 又排回第一(实测: 12:23 体检把 20.27.177.113 排第一, 12:26 转发又去撞它)。
+# 这里的失败计数**跨体检周期保留**: 连续失败过的往后靠, 一旦成功就清零。
+# 于是"时好时坏"的 IP 会自动让位给稳定的, 不用等下一次体检。
+_FAIL_CNT = {}
+_FAIL_LOCK = threading.Lock()
+
+
+def _fail_note(ip):
+    with _FAIL_LOCK:
+        _FAIL_CNT[ip] = _FAIL_CNT.get(ip, 0) + 1
+
+
+def _fail_clear(ip):
+    with _FAIL_LOCK:
+        _FAIL_CNT.pop(ip, None)
+
+
+def _fail_rank(ip):
+    with _FAIL_LOCK:
+        return _FAIL_CNT.get(ip, 0)
+
+
+# ------------------------------------------------------- 这次是池子赢还是直连赢
+# 让"直连参与竞速"这件事在面板上看得见: 否则用户只看到快了, 不知道为什么快,
+# 出问题时也没法判断是池子选错了还是外面那条路本来就堵。
+_ROUTE = {}          # key -> {'src': 'pool'|'sys', 'ip': ..., 'ts': ...}
+
+
+def _note_route(key, ip, sys_ips):
+    src = 'sys' if ip in (sys_ips or ()) else 'pool'
+    _ROUTE[key] = {'src': src, 'ip': ip, 'ts': time.time()}
+    return src
+
+
+# --------------------------------------------------------------- IP 寿命台账
+# 【2026-10-11 修·"多久会被锁死、在锁死之前就换掉"】
+# 用户的核心诉求不是"死了能救回来"，而是**别让它死在手上**：救回来要等超时
+# (实测 8~16 秒)，浏览器体感就是"打不开"；而提前换掉是零感知的。
+# 做法是给每个 IP 记一本寿命台账：
+#   _IP_BORN  这个 IP 第一次**验证成功**的时刻
+#   _LIFE_SAMPLES  它们各自"从出生到证实死亡"活了多久(秒)
+# 于是能算出"这类 IP 平均能撑多久"，并在用到 80% 寿命时主动让位给热备 ——
+# 也就是**在锁死之前下手**。
+_IP_BORN = {}            # ip -> 出生时间戳
+_LIFE_SAMPLES = []       # 每个元素 = 某个 IP 从出生到死亡的存活秒数
+# 冷启动基准 = 300 秒。这不是拍脑袋: 用户实测"结束进程重启又打开了、大概维持了
+# 5 分钟", 而第一轮自己的样本要等几个 IP 死掉才攒得出来 —— 在那之前先用这个
+# 经验值顶上, 让预防性轮换**从第一次转发就生效**, 而不是先挨几轮锁死攒数据。
+DEFAULT_LIFE = 300.0
+_AVG_LIFE = [DEFAULT_LIFE]
+_IP_LIFE_LOCK = threading.Lock()
+
+# 热备池: 后台持续复检、保证"随时能顶上"的 IP。
+# 体检是 5 分钟一轮的全池扫描, 中间那 5 分钟里名次是会过期的;
+# 热备池只盯少数几个候选、20 秒复检一次, 始终有一批**刚刚验过**的 IP 待命。
+_HOT = {'github': [], 'raw': [], 'pages': []}   # key -> [(ip, 复检时间戳)]
+_HOT_LOCK = threading.Lock()
+
+# ---- IP 吞吐台账: 每个 IP 量出来的真实下载速度 --------------------------------
+# 【2026-10-11 修·把吞吐判据下沉到池内】
+# 上一轮只修了"直连 vs 候选池"这一层对决, 池内几十个 IP 之间仍然按 TCP 握手
+# 抢连 —— 于是实测出现"后台明明判池内有 194 KB/s, 端到端却走了 10.87 秒",
+# 因为抢连让某个握手快、传不动的 IP 赢了。
+# 现在给**每个验过的 IP** 都记一笔吞吐, 转发时先看台账: 谁实测最快就直连谁,
+# 不再让握手速度替我们做决定。只测主站(github.com): raw / Pages 的 GET / 返回
+# 404、拿不到字节, 硬测会误判成"传不动"。
+_KBPS = {}                 # ip -> (kbps, ts)
+_KBPS_LOCK = threading.Lock()
+_KBPS_TTL = 150.0          # 吞吐会随时间变, 超过这个时间没重测就不作数
+_KBPS_DIRECT_MIN = 60      # 低于这个速度谈不上"快", 不值得绕开抢连
+_KBPS_WIN_RATIO = 1.15     # 池内取最快时要领先次快 15%, 否则可能是测量噪声
+
+
+def _kbps_set(ip, kbps):
+    if not ip or not kbps:
+        return
+    with _KBPS_LOCK:
+        _KBPS[ip] = (kbps, time.time())
+
+
+def _kbps_of(ip):
+    """这个 IP 的实测吞吐; 没量过或已过期返回 None。"""
+    if not ip:
+        return None
+    with _KBPS_LOCK:
+        hit = _KBPS.get(ip)
+    if not hit:
+        return None
+    kbps, ts = hit
+    if time.time() - ts >= _KBPS_TTL:
+        return None
+    return kbps
+
+
+def _kbps_ts(ip):
+    with _KBPS_LOCK:
+        hit = _KBPS.get(ip)
+    return hit[1] if hit else 0.0
+
+
+def _kbps_forget(ip):
+    """这个 IP 刚让我们赌输了 —— 立刻作废它的证据, 别让下一次转发再赌一遍。
+
+    【2026-10-11 修·赌输要付学费, 但只付一次】
+    实测第 6 次经狐径 28.01s、直连只要 21.07s: 台账里那笔"107 KB/s"还在
+    150 秒有效期内, 可链路其实已经断了, 于是每一发请求都先白等一轮超时。
+    赌输一次就把它忘了, 代价从"每次都赔"降到"只赔一次"。
+    """
+    if not ip:
+        return
+    with _KBPS_LOCK:
+        _KBPS.pop(ip, None)
+
+
+def _kbps_pick(cand):
+    """从候选里挑"实测吞吐最快"和"次快"的兩個 —— 用来决定要不要绕过抢连。
+
+    没量过 / 证据过期 / 最近在连着失败的, 一律不参与。
+    """
+    best, second = None, None
+    for x in cand or ():
+        k = _kbps_of(x)
+        if not k or _fail_rank(x):
+            continue
+        if best is None or k > best[1]:
+            second, best = best, (x, k)
+        elif second is None or k > second[1]:
+            second = (x, k)
+    return best, second
+
+
+def _ip_born(ip):
+    """IP 第一次被证实可用 —— 记下出生时刻。"""
+    if not ip:
+        return
+    with _IP_LIFE_LOCK:
+        if ip not in _IP_BORN:
+            _IP_BORN[ip] = time.time()
+
+
+def _ip_died(ip, sure=False):
+    """IP 已证实失效: 结掉它这一生, 把"活了多久"记进样本。
+
+    2026-10-11 实测抓到的漏子: 热备复检发现**当前正在用的那个 IP** 已经不通,
+    把它从寿命台账里注销了, 却**没让它下岗** —— _LAST_GOOD 还指着它, 于是
+    下次转发照样优先去撞这个死 IP, 而且面板还显示它"刚出生、还能撑满一整段"。
+    所以这里一旦发现死的就是在用的那个, 立刻让它下岗。
+    """
+    if not ip:
+        return
+    for _k in ('github', 'raw', 'pages'):
+        if _LAST_GOOD.get(_k) == ip:
+            _LAST_GOOD[_k] = ''
+            log('在用 IP %s 复检已不通, 提前下岗(下次转发改抢新鲜的)' % ip)
+    with _IP_LIFE_LOCK:
+        born = _IP_BORN.pop(ip, None)
+        if not born:
+            return
+        life = time.time() - born
+        # 太短的多半是偶发丢包误判, 计进去会把平均值拉得毫无意义
+        if life >= 10:
+            _LIFE_SAMPLES.append(life)
+            if len(_LIFE_SAMPLES) > 40:
+                _LIFE_SAMPLES.pop(0)
+            _AVG_LIFE[0] = sum(_LIFE_SAMPLES) / len(_LIFE_SAMPLES)
+
+
+def _avg_life():
+    with _IP_LIFE_LOCK:
+        return _AVG_LIFE[0]
+
+
+def _life_samples():
+    with _IP_LIFE_LOCK:
+        return len(_LIFE_SAMPLES)
+
+
+def _ip_age(ip):
+    with _IP_LIFE_LOCK:
+        b = _IP_BORN.get(ip)
+    return (time.time() - b) if b else 0.0
+
+
+def _ip_remaining(ip):
+    """按历史规律, 这个 IP 还能撑多久(秒)。
+
+    返回 None 有两种情况, 面板都要如实显示"未知"而不是编一个数字:
+      ① 还没有寿命样本; ② 这个 IP 没有出生记录(已失效或从未用过)。
+    """
+    avg = _avg_life()
+    if not avg:
+        return None
+    with _IP_LIFE_LOCK:
+        if ip not in _IP_BORN:
+            return None
+    return avg - _ip_age(ip)
+
+
+def _ip_expiring(ip):
+    """是不是已经用掉了大半寿命 —— 是的话就该在它死之前让位。"""
+    avg = _avg_life()
+    if not avg or not ip:
+        return False
+    # 没有自己的样本时用 300 秒的冷启动基准(用户实测"大约维持 5 分钟"),
+    # 攒到样本后自动换成这台机器上真实测出来的均值。
+    return _ip_age(ip) >= avg * 0.8
+
+
+def _hot_get(key, max_age=120.0):
+    """取热备池里**最近 max_age 秒内验过**的 IP, 新鲜的排前面。"""
+    now = time.time()
+    with _HOT_LOCK:
+        return [ip for ip, ts in _HOT.get(key, []) if now - ts <= max_age]
+
+
+def _hot_drop(key, ip):
+    with _HOT_LOCK:
+        _HOT[key] = [(i, t) for i, t in _HOT.get(key, []) if i != ip]
+
+
+def hot_refresh(key, pool, want=4):
+    """复检热备池: 只盯少数候选(并发 4, 不惊动整条链路), 补满 want 个待命 IP。
+
+    为什么不做全池扫描: 全池 49 个并发探测在国际链路上会自己把自己挤拥塞
+    (实测并发 14 个时转发退化到 7~10 秒)。热备池只维持 4 个, 成本可忽略。
+    """
+    fresh = _hot_get(key)
+
+    # 【2026-10-11 修·热备也要量吞吐, 而且要复测】
+    # 光"能连上"不够 —— 连得上和传得动是两回事(握手 0.12s 却 25 秒下不完的 IP
+    # 今天坑过一次)。所以进热备的 IP 都要量一次真实吞吐, 记进台账供转发决策。
+    # 吞吐还会随时间变, 所以每轮顺手重测**证据最旧**的那个, 否则台账会一直
+    # 停在几十秒前的老数字上。只对主站测: raw / Pages 的 GET / 拿不到字节。
+    if key == 'github' and fresh:
+        oldest = min(fresh, key=_kbps_ts)
+        if _kbps_of(oldest) is None or time.time() - _kbps_ts(oldest) > _KBPS_TTL * 0.6:
+            _measure_hot([oldest], 'github.com')
+    if len(fresh) >= want:
+        return fresh
+    # 从体检名次里跨网段取样, 优先补"没在热备里"的, 一段全死还有别的段
+    spread = _pick_spread(pool.candidates()[:20], per_group=1, limit=8)
+    todo = [ip for ip in spread if ip not in fresh][:6]
+    if not todo:
+        return fresh
+    ok = []
+
+    def _chk(ip):
+        # 完整验一遍: TCP + TLS + 证书 + GET / 要 2xx/3xx —— 与体检同一把尺子
+        if pool._probe(ip, timeout=3.0) is not None:
+            ok.append(ip)
+            # 【2026-10-11 修·寿命台账也要给热备记出生】
+            # 原先只有"转发成功"才 _ip_born, 于是用户不访问时(实测 36 分钟零转发)
+            # 一个样本都攒不出来, 面板上的寿命基准**一直停在 300 秒经验值** ——
+            # 用户问的"多久会被锁死"永远给不出这台机器的真答案。
+            # 热备每 20 秒复检一次, 让它也记出生, 复检失败时就能结出样本,
+            # 寿命基准很快收敛到真实值。
+            _ip_born(ip)
+        else:
+            _ip_died(ip)
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(_chk, todo))
+    except Exception:
+        pass
+    if ok and key == 'github':
+        _measure_hot(ok, 'github.com')
+    now = time.time()
+    with _HOT_LOCK:
+        have = {i for i, _t in _HOT.get(key, [])}
+        for ip in ok:
+            if ip not in have:
+                _HOT[key].append((ip, now))
+        _HOT[key] = [(i, t) for i, t in _HOT[key] if now - t <= 180][-8:]
+        return [i for i, _t in _HOT[key]]
+
+
+def _measure_hot(ips, host):
+    """给少数几个 IP 量真实吞吐, 写进台账。
+
+    并发刻意压到 2、窗口压到 1.2 秒: 国际链路上并发测速会**互相挤占带宽**,
+    今天已经在"并发做 TLS 握手"上栽过一次(探测本身成了负担, 反而更慢)。
+    """
+    def _one(ip):
+        try:
+            r = _cap_test(host, ip, window=1.2, max_bytes=131072, min_ok=4096)
+        except Exception:
+            return
+        if r and r.get('ok'):
+            _kbps_set(ip, r['kbps'])
+    try:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            list(ex.map(_one, list(ips)[:4]))
+    except Exception:
+        pass
+
+
+# 【2026-10-11 修·让用户一眼分清"狐径坏了"还是"网络不通"】
+# 用户反复报"打不开网页", 但同一时刻直连也是超时的 —— 那是线路在抽风, 狐径换什么
+# IP 都没用。可用户看不到这一层, 只会觉得"狐径没用"。这里后台定期**绕开狐径**、
+# 用系统 DNS 直连试一下 github.com: 直连也不通就在面板上明说, 别让用户自己猜。
+_DIRECT_OK = [None, 0.0]     # [是否通, 上次探测时刻]
+
+
+def direct_probe_once():
+    """绕开代理, 用系统解析直连 github.com 探一次。通不通都记下来。"""
+    try:
+        raw = socket.create_connection(('github.com', 443), timeout=4.0)
+        try:
+            ctx = ssl.create_default_context()
+            with ctx.wrap_socket(raw, server_hostname='github.com') as s:
+                s.settimeout(3.0)
+                s.sendall(b'GET / HTTP/1.1\r\nHost: github.com\r\n'
+                          b'User-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n')
+                first = s.recv(32)
+            # 拿到任何 HTTP 响应都算"通"(4xx 也是对面答的, 只说明对面活着)
+            ok = bool(first[:1] in (b'2', b'3', b'4'))
+        except Exception:
+            ok = False
+        finally:
+            try:
+                raw.close()
+            except Exception:
+                pass
+    except Exception:
+        ok = False
+    _DIRECT_OK[0] = ok
+    _DIRECT_OK[1] = time.time()
+    return ok
+
+
+def direct_probe_loop():
+    while True:
+        try:
+            direct_probe_once()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+# 【2026-10-11 补·"连得上"不等于"打得开"】
+# 实测抓到的现场: TCP 握手 0.10 秒、TLS 握手 0.19 秒, 全都正常(说明 IP 没被锁死),
+# 可同一个连接的页面数据要 6~25 秒才下得完 —— 浏览器表现就是转圈半天、最后超时,
+# 用户看到的只有"打不开"。只测"通不通"会给假绿灯(握手成功 = 通), 所以这里再
+# **真下载一小段首页**, 量出两个更贴近体感的数:
+#   ① 首字节多久来(ttfb): 对面响不响应
+#   ② 平均下载速度(KB/s): 数据下不下的来
+# 而且**走狐径**和**直连**各测一次 —— 两者一对比, "是线路拥塞"还是"狐径没帮上忙"
+# 就一目了然, 不用再靠猜。
+_SPEED = {'direct': {'ts': 0.0}, 'proxy': {'ts': 0.0}}
+_SPEED_BUSY = [False]
+_SPEED_BUSY_LOCK = threading.Lock()
+
+
+def _err_text(e):
+    """异常转成人看得懂的短句。
+
+    不能直接用 str(e): socket.timeout 的 str 经常是**空字符串**, 面板就会显示
+    "失败(不通)" —— 看着像代理没开, 其实是超时。空的就退回异常类名并翻译成
+    中文, 免得用户对着一个空括号猜。
+    """
+    s = (str(e) or '').strip()
+    if not s:
+        s = type(e).__name__
+    trans = {'timeout': '超时', 'TimedOutError': '超时', 'gaierror': 'DNS 解析失败',
+             'ConnectionRefusedError': '连接被拒绝', 'ConnectionResetError': '连接被重置',
+             'OSError': '系统网络错误', 'SSLError': 'TLS 握手失败'}
+    return trans.get(s, s)[:60]
+
+
+def _speed_download(use_proxy, max_bytes=65536, overall=20.0):
+    """连 github 首页真下载最多 64KB, 量首字节与速度。
+
+    use_proxy=True 走本机狐径(对 127.0.0.1:PROXY_PORT 发 CONNECT), False 直连。
+    下到一半超时不算失败 —— 照样如实记下"这么多秒只下了这么多", 因为那正是
+    用户"转圈半天"的那一段, 记成失败反而看不到真相。
+    """
+    t0 = time.time()
+    s = None
+    peer = ''
+    try:
+        if use_proxy:
+            raw = socket.create_connection(('127.0.0.1', PROXY_PORT), timeout=6.0)
+            # create_connection 的 timeout 只管"连上"这一步, 连上之后 socket 又变回
+            # 阻塞模式 —— 不给 recv 设超时的话, 对面不回就永远卡在这儿, 整个测速线程
+            # 挂死(实测出现过: 一轮测速卡住, 直连那条一直没结果)。
+            raw.settimeout(10.0)
+            raw.sendall(b'CONNECT github.com:443 HTTP/1.1\r\n'
+                        b'Host: github.com:443\r\n\r\n')
+            head = b''
+            while b'\r\n\r\n' not in head and time.time() - t0 < 10:
+                c = raw.recv(1024)
+                if not c:
+                    break
+                head += c
+            if b'200' not in head.split(b'\r\n')[0]:
+                return {'ok': False, 'err': '代理隧道没建起来', 'peer': '狐径'}
+            peer = '狐径'
+        else:
+            raw = socket.create_connection(('github.com', 443), timeout=6.0)
+            raw.settimeout(10.0)      # 同上: 连上之后也要给 recv 设上限
+            try:
+                peer = raw.getpeername()[0]
+            except Exception:
+                peer = ''
+        try:
+            ctx = ssl.create_default_context()
+            s = ctx.wrap_socket(raw, server_hostname='github.com')
+            s.settimeout(overall)
+            t1 = time.time()
+            s.sendall(b'GET / HTTP/1.1\r\nHost: github.com\r\n'
+                      b'User-Agent: Mozilla/5.0\r\nAccept: */*\r\n'
+                      b'Connection: close\r\n\r\n')
+            got = 0
+            ttfb = None
+            while got < max_bytes:
+                c = s.recv(8192)
+                if not c:
+                    break
+                if ttfb is None:
+                    ttfb = time.time() - t1
+                got += len(c)
+                if time.time() - t1 > overall:
+                    break
+            total = max(0.001, time.time() - t1)
+            return {'ok': got > 0, 'bytes': got, 'total': round(total, 2),
+                    'ttfb': None if ttfb is None else round(ttfb, 2),
+                    'kbps': round(got / 1024.0 / total, 1), 'peer': peer}
+        except Exception as e:
+            return {'ok': False, 'err': _err_text(e), 'peer': peer}
+        except Exception as e:
+            return {'ok': False, 'err': _err_text(e), 'peer': peer}
+    finally:
+        try:
+            if s is not None:
+                s.close()
+        except Exception:
+            pass
+
+
+def speed_probe_once():
+    """走狐径、直连各测一次, 结果进 _SPEED 供面板显示。"""
+    out = {}
+    for name, use in (('proxy', True), ('direct', False)):
+        try:
+            r = _speed_download(use)
+        except Exception as e:
+            # 双保险: 测速是后台守护, 任何漏网的异常都不能让它写不进结果 ——
+            # 写不进的话面板会一直显示上一轮(可能是很久以前)的数字, 反而误导人。
+            r = {'ok': False, 'err': _err_text(e), 'peer': ''}
+        r['ts'] = time.time()
+        _SPEED[name] = r
+        out[name] = r
+    p, d = out['proxy'], out['direct']
+    def _txt(r):
+        if not r.get('ok'):
+            if r.get('total'):
+                # 连上了、隧道也建了, 却一个字节都没等到 —— 这正是"转圈半天最后
+                # 打不开"的那一种。显示成"不通"会让人以为代理没开, 得说清是超时。
+                return '超时(等了 %ss 零字节)' % r['total']
+            return '失败(%s)' % (r.get('err') or '不通')
+        return '%dKB/%ss ≈ %sKB/s(首字节 %ss)' % (
+            int(r.get('bytes', 0) / 1024), r.get('total'),
+            r.get('kbps'), r.get('ttfb'))
+    try:
+        log('线路测速: 经狐径 %s · 直连 %s' % (_txt(p), _txt(d)))
+    except Exception:
+        pass
+    return out
+
+
+def speed_probe_loop():
+    # 启动先缓 25 秒: 别跟启动预体检抢带宽(那会儿正在并发探 49 个 IP)
+    time.sleep(25)
+    while True:
+        try:
+            speed_probe_once()
+        except Exception as e:
+            log('线路测速异常: %s' % e)
+        time.sleep(150)
+
+
+def speed_probe_async():
+    """面板「立即测速」用: 后台测, 不卡住页面。"""
+    with _SPEED_BUSY_LOCK:
+        if _SPEED_BUSY[0]:
+            return False
+        _SPEED_BUSY[0] = True
+
+    def _run():
+        try:
+            speed_probe_once()
+        finally:
+            _SPEED_BUSY[0] = False
+    threading.Thread(target=_run, daemon=True).start()
+    return True
+
+
+# ------------------------------------------------- 直连的"传输能力"体检
+# 【2026-10-11 修·握手快 ≠ 传得动】
+# 第一版让系统解析的 IP 直接进抢连名单, 实测当场吃到一个 **30 秒超时**:
+# 系统把 github.com 解析到 20.205.243.166, 它 TCP 握手只要 0.12s(全场最快),
+# 于是赢下竞速; 可它的页面要 25 秒还下不完。而体检只 recv(64) 字节就判可用,
+# 根本筛不掉这类"握手快、传不动"的 IP。
+# 所以直连要参与竞速, 必须先拿出"真能传数据"的证据: 后台真下载一段再下结论。
+_SYS_CAP = {}          # host -> {'ip','ok','kbps','bytes','cost','ts'}
+_SYS_CAP_TTL = 120.0   # 证据有效期: 超过这个时间没复测就先不采信
+_SYS_WIN_RATIO = 1.25  # 直连要快过候选池 25% 才值得换, 否则两边抖来抖去反而不稳
+_SYS_MIN_KBPS = 60     # 直连自己低于这个速度就没必要绕开池子(60KB/s 约等于能开但会转圈)
+
+
+def _cap_test(host, ip, window=2.5, max_bytes=262144, min_ok=8192, deadline=8.0):
+    """测某个 IP 到底能不能真的把数据传下来, 而不是只握得上。
+
+    【2026-10-11 再修·测持续吞吐, 别测"凑够字节的时间"】
+    上一版是"读满 32KB 就停", 日志里恒定显示 37KB。问题在于这测的是
+    **达到阈值所花的时间**(含 TLS 后的首字节等待), 不是稳态速度, 会系统性
+    **低估**快 IP: 同一个 20.205.243.166, 体检测出 48 KB/s, 实际跑 161 KB/s。
+    低估直连 = 永远轮不到它上位。
+    现在改成**固定读满 window 秒**, 到点或读够上限才收, 得到的是真实吞吐。
+    """
+    try:
+        raw = socket.create_connection((ip, 443), timeout=6.0)
+    except OSError:
+        return None
+    try:
+        s = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        s.settimeout(deadline)
+        s.sendall(('GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n'
+                   'Accept: text/html\r\nConnection: close\r\n\r\n' % host)
+                  .encode('ascii'))
+        got = 0
+        t1 = time.time()
+        while True:
+            c = s.recv(65536)
+            if not c:
+                break
+            got += len(c)
+            if got >= max_bytes:
+                break
+            if time.time() - t1 >= window:
+                break
+        cost = max(0.001, time.time() - t1)
+        r = {'bytes': got, 'cost': round(cost, 2), 'ok': got >= min_ok}
+        if r['ok']:
+            r['kbps'] = int(got / 1024 / cost)
+        return r
+    except Exception as e:
+        return {'ok': False, 'bytes': 0, 'cost': 0, 'err': type(e).__name__}
+    finally:
+        try:
+            raw.close()
+        except Exception:
+            pass
+
+
+_POOL_CAP = {}         # host -> {'ip','ok','kbps','bytes','cost','ts'}  池内首选的对照体检
+
+
+def sys_cap_loop():
+    """后台定期测"系统解析出来的 IP 传不传得动", 有证据才让它进竞速名单。
+
+    只测 github.com 主站: raw / Pages 的候选池里已有 IPv6 通道且表现很好,
+    而它们的 GET / 会返回 404、拿不到可观的字节数, 硬测只会误判成"传不动"。
+
+    【2026-10-11 再修·两边都测, 才好比】
+    只测直连没法裁决 —— 没有对手就没有"谁更快"。现在**同一轮里连着测两次**:
+    系统解析的 IP 一次、池内当前首选一次, 两边用同一把尺子(固定窗口吞吐)。
+    转发时谁快用谁, 不再让抢连(比握手快慢)替我们做这个决定。
+    """
+    time.sleep(20)     # 别跟启动预体检抢带宽
+    while True:
+        try:
+            host, key = 'github.com', 'github'
+            ips = ProxyHandler._sys_ips(host, force=True)
+            if ips:
+                r = _cap_test(host, ips[0])
+                if r:
+                    r['ip'] = ips[0]
+                    r['ts'] = time.time()
+                    _SYS_CAP[host] = r
+                else:
+                    _SYS_CAP.pop(host, None)
+            # 池内对手: 上次真正连通过的优先, 没有/撞车就退到体检名次里找。
+            # 【2026-10-11 修·对手不能是自己】
+            # 系统解析出来的 IP 往往也正是池子里刚连成功的那个(_LAST_GOOD),
+            # 于是一轮里两个"对手"是同一个 IP: 68 vs 27 KB/s 全是噪声, 而 sys_wins
+            # 恒为真 —— 对比形同虚设。所以池内必须挑一个**跟直连不同**的 IP。
+            sys_ip = (ips or [''])[0]
+            p_ip = _LAST_GOOD.get(key) or ''
+            if (not p_ip) or p_ip == sys_ip:
+                p_ip = ''
+                try:
+                    for c in (HEALTH.candidates() or []):
+                        if c != sys_ip:
+                            p_ip = c
+                            break
+                except Exception:
+                    p_ip = ''
+            if p_ip and p_ip != sys_ip:
+                pr = _cap_test(host, p_ip)
+                if pr:
+                    pr['ip'] = p_ip
+                    pr['ts'] = time.time()
+                    _POOL_CAP[host] = pr
+                else:
+                    _POOL_CAP.pop(host, None)
+            else:
+                _POOL_CAP.pop(host, None)   # 没有可比的对手, 别拿旧证据糊弄
+            s, p = _SYS_CAP.get(host), _POOL_CAP.get(host)
+            # 两边都写进统一台账, 转发时跟热备一起按吞吐排序 —— 别各管一摊
+            for r in (s, p):
+                if r and r.get('ok') and r.get('ip'):
+                    _kbps_set(r['ip'], r.get('kbps', 0))
+            _t = lambda r: ('%d KB/s' % r.get('kbps', 0)) if (r and r.get('ok')) else \
+                           ('传不动' if r else '连不上')
+            log('吞吐对比 %s: 直连 %s(%s) vs 候选池 %s(%s) -> 选 %s' % (
+                host,
+                (s or {}).get('ip', '-'), _t(s),
+                (p or {}).get('ip', '-'), _t(p),
+                ('直连' if _sys_wins(host) else '候选池')))
+        except Exception as e:
+            log('吞吐对比异常: %s' % e)
+        time.sleep(60)
+
+
+def _cap_of(host, tbl):
+    """取一份还新鲜的体检证据; 过期或无效返回 None。"""
+    r = tbl.get(host)
+    if not r or not r.get('ok') or not r.get('ip'):
+        return None
+    if time.time() - (r.get('ts') or 0) >= _SYS_CAP_TTL:
+        return None
+    return r
+
+
+def _sys_wins(host):
+    """直连是不是**明显**快过候选池 —— 是就让它上位。
+
+    必须留余量(_SYS_WIN_RATIO): 两边速度本来就在抖, 谁高一点就切谁会导致
+    来回横跳, 反而更不稳定。要快出一截才值得换。
+    """
+    s, p = _cap_of(host, _SYS_CAP), _cap_of(host, _POOL_CAP)
+    if not s:
+        return False
+    if not p:
+        return True                      # 池子没证据, 直连有 —— 可以试
+    if s.get('ip') == p.get('ip'):
+        return False                     # 对手是自己, 这轮对比不作数
+    sp, pp = s.get('kbps', 0), p.get('kbps', 0)
+    if sp < _SYS_MIN_KBPS:
+        return False                     # 直连自己也不快, 没必要绕开池子
+    return sp >= pp * _SYS_WIN_RATIO
+
+
+def dns_warm_loop():
+    """后台定时预解析常用域名 —— 真实请求来时缓存是热的, 不用现场等 DNS。
+
+    【2026-10-11 修·别让直连输在起跑线】
+    直连要参与竞速, 就得先知道"系统解析到哪个 IP"。要是等请求来了才解析,
+    DNS 那几十毫秒先耗掉, 直连在抢连里天然落后半个身位 —— 竞速就成了摆设。
+    这里提前解析好存着, 转发时直接取用。
+    """
+    hosts = ('github.com', 'raw.githubusercontent.com', 'github.io',
+             'objects.githubusercontent.com', 'codeload.github.com',
+             'api.github.com', 'avatars.githubusercontent.com',
+             'github.githubassets.com')
+    while True:
+        try:
+            for h in hosts:
+                ProxyHandler._sys_ips(h, force=True)
+        except Exception as e:
+            log('DNS 预热异常: %s' % e)
+        # 缓存 60 秒过期, 这里 45 秒刷一次 —— 永远赶在过期前, 取用时总是热的
+        time.sleep(45)
+
+
+def hot_loop():
+    """后台守护: 每 20 秒给三个池补一次热备 + 空闲期主动换岗。
+
+    【2026-10-11 修·空闲期也要换岗】
+    预防性换 IP 原本只在**转发那一刻**判定 —— 可实测日志显示: 13:49 之后整整
+    36 分钟没有任何一次转发(这期间没人开浏览器), 于是那个 IP 就这么"躺着变老",
+    等用户隔一阵再来访问时, 拿到的还是个用了半小时的老 IP —— 一上来就撞上寿命
+    尽头, 正是"用着用着就打不开"的典型场景。
+    这里在**没有流量的时候**也盯一把: 在用的 IP 一到寿命就**直接换岗**给热备
+    里新鲜的, 下次访问拿到的就是新的, 不需要用户先挨一次超时。
+    """
+    while True:
+        try:
+            hot_refresh('github', HEALTH)
+            hot_refresh('raw', HEALTH_RAW)
+            hot_refresh('pages', HEALTH_PAGES)
+            for key in ('github', 'raw', 'pages'):
+                cur = _LAST_GOOD.get(key) or ''
+                if not cur or not _ip_expiring(cur):
+                    continue
+                alt = [x for x in _hot_get(key) if not _ip_expiring(x)]
+                if alt:
+                    _LAST_GOOD[key] = alt[0]
+                    _ip_born(alt[0])
+                    log('空闲期换岗: %s 已撑 %d 秒(基准 %d 秒), 让位给热备 %s'
+                        % (cur, int(_ip_age(cur)), int(_avg_life()), alt[0]))
+                else:
+                    _LAST_GOOD[key] = ''
+                    log('空闲期换岗: %s 已撑 %d 秒但暂时没有新鲜热备, 下次转发重新抢连'
+                        % (cur, int(_ip_age(cur))))
+        except Exception:
+            pass
+        time.sleep(20)
+
+
+def _pick_spread(cands, per_group=2, limit=10):
+    # 【2026-10-11 修·跨网段取样】同一段(IP 前两段)最多取 per_group 个。
+    # 实测: 20.27.* 那一整段连不上时, 140.82.* 段还好好的(140.82.116.3 = 874ms/200)。
+    # 而候选是按延迟排的 —— 延迟低的恰好扎堆在同一段, 只取"前 N 个"就会
+    # 正好全落在死的那一段里, 于是日志刷"候选 IP 全军覆没"、网页打不开。
+    # 这里强制把候选摊到不同网段上, 一段全死还有别的段顶上。
+    used = {}
+    out = []
+    for ip in cands:
+        g = '.'.join(ip.split('.')[:2])
+        if used.get(g, 0) < per_group:
+            used[g] = used.get(g, 0) + 1
+            out.append(ip)
+    return out[:limit]
 
 
 def _manual_ip_path():
@@ -254,8 +1021,8 @@ def diag_text(redact=True):
             'pages 可用 %d/%d | 表源 %s | 最快 %s | 系统代理 %s | 手动IP %s | '
             '上次体检 %s | 已运行 %d 分钟'
             % (APP_VERSION, len(v4), len(all4), len(v6), len(all6),
-               len(raw_good), len(CANDIDATE_IPS_RAW),
-               len(pages_good), len(CANDIDATE_IPS_RAW),
+               len(raw_good), len(CANDIDATE_IPS_RAW_ALL),
+               len(pages_good), len(CANDIDATE_IPS_PAGES_ALL),
                _META_SOURCE[0] or '未同步(用内置表)', fastest,
                '已开启' if proxy_on() else '未开启', _MANUAL_IP[0] or '无', last, up_min))
     detail = ('停用' if not good else
@@ -298,24 +1065,16 @@ def modal_allowed():
 
 
 def alert(title, text):
-    """重要提示。启动阶段(尤其升级交接后)**不弹模态框**, 只写日志 + 弹一个非模态气泡。
+    """重要提示 —— **只写日志, 绝不往屏幕上送任何东西**。
 
-    exe 是 --noconsole 的: 致命错误只写日志的话, 用户双击后看到的是"没反应" —— 所以
-    该提示还是要提示, 只是不再用会挂住启动的模态框; 命令行跑源码时屏幕上看得到, 不弹。
+    2026-10-11 用户明确要求: 双击完什么都别冒出来。以前这里过了启动宽限期就弹一个
+    MessageBox(红叉错误框), 端口被占用、启动失败都会弹一下; 上一版换成右下角气泡,
+    用户照样算它"弹窗"。现在一律只落日志, 去面板或日志文件里看。
+    命令行跑源码时 stdout 看得到, 也不需要弹。
     """
     try:
-        if (not getattr(sys, 'frozen', False)) and sys.stdout is not None:
-            return                          # 有控制台: 命令行下不该被打断
-        if modal_allowed():
-            ctypes.windll.user32.MessageBoxW(None, text, title, 0x10)   # MB_ICONERROR
-            return
-        log('提示(启动阶段不弹模态框, 只写日志+气泡): %s | %s'
+        log('提示(按用户要求: 不弹窗口、不弹气泡): %s | %s'
             % (title, ' '.join(str(text).split())))
-        try:
-            if bubble_on():                 # 非模态气泡: 看一眼就没了, 不会挂住启动
-                _spawn_bubble(str(title), str(text))
-        except Exception:
-            pass
     except Exception:
         pass
 
@@ -678,6 +1437,13 @@ class Health(object):
             res = list(pool.map(lambda ip: (ip, self._probe(ip, timeout)), ips))
         good = sorted([(i, m) for i, m in res if m is not None], key=lambda x: x[1])
         with self._lock:
+            # 【2026-10-11 修·别让一次糟糕的体检清空候选池】
+            # 高丢包时一轮探测会把大半 IP 判成超时(实测: 49 个只测出 4 个可用),
+            # 候选池骤减就没得挑了。上一轮**证实可用**的先留着压在后面兜底 ——
+            # 真死了也没关系: 转发有失败降权 + 并发抢连, 死 IP 会被自然跳过。
+            if self._good and len(good) < len(self._good) // 2:
+                have = {i for i, _ in good}
+                good = good + [(i, m) for i, m in self._good if i not in have]
             self._good = good
             self._last = time.time()
         return good
@@ -839,14 +1605,20 @@ PAC_TEMPLATE = """function FindProxyForURL(url, host) {
     // raw/objects.githubusercontent.com -> local proxy as well, but they use
     // their OWN ip pool inside the proxy (185.199.108.0/22). Sending them to the
     // github.com pool lands on the wrong server and breaks the download.
-    // avatars/camo/githubassets stay DIRECT on purpose: they render the pages,
-    // and proxying them with the wrong pool is what broke pages in the past.
+    // avatars./camo.githubusercontent.com also go through the local proxy now.
+    // They are in the SAME 185.199.108.0/22 range as raw/objects and serve the
+    // same *.githubusercontent.com certificate, so the raw pool fits them.
+    // Measured on this machine (2026-10-11): one 282KB avatar took 5.7-14.2s
+    // DIRECT but 1.1-4.7s through the proxy. githubassets stays DIRECT: it is a
+    // different domain with a different certificate and is already fast (0.27s).
     // github.io and *.github.io (GitHub Pages) also go through the local proxy.
     // They share the 185.199.108.0/22 pool with raw/objects, but the proxy checks
     // them against the *.github.io certificate, NOT the githubusercontent one.
     if (host === "github.com" || host === "www.github.com" ||
         host === "raw.githubusercontent.com" ||
         host === "objects.githubusercontent.com" ||
+        host === "avatars.githubusercontent.com" ||
+        host === "camo.githubusercontent.com" ||
         host === "github.io" || dnsDomainIs(host, ".github.io")) {
         return "PROXY 127.0.0.1:%d; DIRECT";
     }
@@ -889,6 +1661,200 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         except Exception:
             pass
 
+    def _connect_race(self, ips, port, timeout=2.5, max_race=4):
+        # 【2026-10-11 修·并发抢连(Happy Eyeballs)】
+        # 原来是**串行**试候选: 撞上一个死 IP 就要干等它超时(3s)才换下一个,
+        # 前面有几个死 IP 就是几倍超时 —— 实测 github 要 8.15 秒才返回 200。
+        # 现在同时对前 N 个候选发起 TCP 连接, 谁先成功就用谁, 其余立刻关掉:
+        # 死 IP 自己超时即可, 不再阻塞别人; 活的那个 200ms 就回来了。
+        ips = [x for x in ips if x][:max_race]
+        if not ips:
+            return None, None
+        if len(ips) == 1:
+            try:
+                return socket.create_connection((ips[0], port), timeout=timeout), ips[0]
+            except OSError:
+                return None, None
+        st = {'sock': None, 'ip': None, 'closed': False}
+        lock = threading.Lock()
+        done = threading.Event()
+
+        def _try(ip):
+            try:
+                s = socket.create_connection((ip, port), timeout=timeout)
+            except OSError:
+                return
+            with lock:
+                # 已经有人赢了、或主线程已经放弃 —— 立刻关掉, 别留着占连接
+                if st['closed'] or st['sock'] is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                    return
+                st['sock'] = s
+                st['ip'] = ip
+            done.set()
+
+        for ip in ips:
+            threading.Thread(target=_try, args=(ip,), daemon=True).start()
+        done.wait(timeout + 0.5)
+        with lock:
+            st['closed'] = True
+            if st['sock'] is not None:
+                return st['sock'], st['ip']
+        return None, None
+
+    # 2026-10-11 记录(别再走回头路): 这里曾试过"并发做 TCP+TLS 探测、验到 TLS 层
+    # 再把 IP 交给浏览器"(_race_pick)。实测**反而更慢** —— 4.5~14.7 秒, raw 还出现
+    # "候选 IP 全军覆没"。原因是国际链路上并发做 TLS 握手会互相挤占带宽,
+    # 探测本身成了负担。已移除, 改为纯 TCP 并发抢连(_connect_race),
+    # TLS 握手仍交给浏览器自己做。
+
+    # ---- 系统解析结果(直连)参与竞速 ------------------------------------------
+    # 【2026-10-11 修·别只在自己人里比】
+    # 以前候选只来自"上次成功 / 手填 / 热备 / 体检名次", 系统解析只在**全军覆没**
+    # 时才当退路。实测打脸: 线路恢复后直连 1.25s, 池子挑出来的却要 4.7s ——
+    # 池子只在自己圈子里排名, 压根不知道外面那条路其实更快。
+    # 现在把系统解析结果也放进抢连名单, 跟候选池一起并发抢连, 谁先握手成功用谁。
+    # DNS 被污染也不怕: 解析出来的 IP 连不上就在抢连里被淘汰, 不会拖慢其他人。
+    _SYS_DNS = {}          # host -> (ts, [ip, ...])
+    _SYS_DNS_TTL = 60.0    # 缓存 60 秒: 运营商解析会变, 缓存太久会失真
+
+    @staticmethod
+    def _sys_ips(host, limit=2, force=False):
+        """系统 DNS 解析结果 —— 即"不走狐径时浏览器本来会连的那个 IP"。"""
+        now = time.time()
+        if not force:
+            hit = ProxyHandler._SYS_DNS.get(host)
+            if hit and now - hit[0] < ProxyHandler._SYS_DNS_TTL:
+                return hit[1]
+        v4, v6 = [], []
+        try:
+            for fam, _t, _p, _c, addr in socket.getaddrinfo(
+                    host, 443, proto=socket.IPPROTO_TCP):
+                ip = addr[0]
+                if not ip:
+                    continue
+                (v4 if fam == socket.AF_INET else v6).append(ip)
+        except Exception:
+            pass
+        # IPv4 优先: 本机 IPv6 出网不一定通, 让它占满名额会挤掉真能用的 v4
+        ips = []
+        for ip in v4 + v6:
+            if ip not in ips:
+                ips.append(ip)
+            if len(ips) >= limit:
+                break
+        ProxyHandler._SYS_DNS[host] = (now, ips)
+        return ips
+
+    def _connect_pool(self, host, port, pool, key, label, prefer=''):
+        # 候选顺序: 上次真正连通成功的 IP > 手填 IP > 体检名次(按失败次数降权)。
+        # 体检名次会过期(两次体检之间路由悄悄挂掉), 所以只当兜底排在后面。
+        cand = []
+        cur = _LAST_GOOD.get(key) or ''
+
+        # 【2026-10-11 修·在锁死之前下手】
+        # 一直复用同一个"上一把成功"的 IP 是舒服的, 但它会**用完寿命就突然死掉**,
+        # 死的那一下要等一轮超时才换得过来(实测 8~16 秒, 体感=打不开)。
+        # 这里按台账算寿命: 用到 80% 就**趁它还活着主动让位**给热备池里的新鲜 IP。
+        # 换是零成本的 —— 反正都是同域名同端口, 浏览器完全感知不到。
+        if cur and _ip_expiring(cur):
+            avg = _avg_life()
+            log('预防性换 IP: %s 已撑 %d 秒(这类 IP 平均撑 %d 秒), 趁它还通着先让位'
+                % (cur, int(_ip_age(cur)), int(avg)))
+            cur = ''
+
+        # 系统解析(直连)想进名单, 得先拿出"真能传数据"的证据 ——
+        # 抢连比的是 TCP 握手快慢, 而 20.205.243.166 握手只要 0.12s(全场最快)、
+        # 页面却 25 秒下不完, 系统偏偏最爱解析到它。第一版让它直接进名单, 它靠
+        # 握手快赢下竞速, 实测当场吃到一个 30 秒超时, 把真能传数据的 IP 挤掉了。
+        # 现在只有后台真下过一段、证明传得动的直连 IP 才有资格参与, 没验过的不赌
+        # (池子全灭时还有下面原有的系统兜底)。
+        sys_ips = []
+        _cap = _cap_of(host, _SYS_CAP)
+        if (_cap and _fail_rank(_cap['ip']) == 0
+                and _cap['ip'] in self._sys_ips(host)):
+            sys_ips = [_cap['ip']]
+
+        for x in (cur, prefer) + tuple(sys_ips):
+            if x and x not in cand:
+                cand.append(x)
+        # 热备池里的 IP 是 20 秒内刚验过的(体检名次可能已经过期 5 分钟)
+        for x in _hot_get(key):
+            if x not in cand:
+                cand.append(x)
+        rest = [x for x in pool.candidates()[:24] if x not in cand]
+        rest.sort(key=lambda ip: _fail_rank(ip))   # 连着失败的往后靠
+        # 摊到不同网段后再并发抢连: 一段全死还有别的段顶上
+        cand += _pick_spread(rest, per_group=2, limit=6)
+        # 同样把"寿命将尽"的从候选里剔掉 —— 否则刚让它让位、转头又从热备/名次里
+        # 把它捡回来, 预防就白做了。全都要过期时才不挑食(总得有个能连的)。
+        young = [x for x in cand if not _ip_expiring(x)]
+        if young:
+            cand = young
+
+        # 【2026-10-11 三修·台账里实测最快的直接放行, 不进抢连】
+        # 抢连比的是 **TCP 握手快慢**, 而"握手快 ≠ 传得动" —— 前两版都栽在这:
+        #   1) 直连放进抢连名单, 结果握手快的坏 IP 赢了, 当场吃 30 秒超时;
+        #   2) 改成"直连 vs 池"用吞吐对决, 可池子赢下对决后, **池内几十个 IP 之间
+        #      仍按握手抢连** —— 实测后台判池内有 194 KB/s, 端到端却走了 10.87 秒。
+        # 现在每个验过的 IP 都有一笔实测吞吐(热备量过、直连/池首选也量过),
+        # 谁最快就直连谁, 握手速度不再参与裁决。
+        # 余量: 跨到直连那条路要快 25%(换路径代价大、防两边抖动来回切),
+        # 池内只需领先 15%。赌输的代价可控 —— 超时 2.5 秒就回落抢连。
+        best, second = _kbps_pick(cand)
+        if best and best[1] >= _KBPS_DIRECT_MIN:
+            need = _SYS_WIN_RATIO if best[0] in sys_ips else _KBPS_WIN_RATIO
+            if second is None or best[1] >= second[1] * need:
+                try:
+                    # 超时压到 2.0 秒: 证据新鲜时连接通常 <0.5 秒就回来,
+                    # 超过 2 秒基本可以断定"台账已过期", 早撤早回落抢连。
+                    _s = socket.create_connection((best[0], port), timeout=2.0)
+                    _note_route(key, best[0], sys_ips)
+                    _LAST_GOOD[key] = best[0]
+                    _fail_clear(best[0])
+                    _ip_born(best[0])
+                    log('按实测吞吐直连 %s: %d KB/s, 次快 %s'
+                        % (best[0], best[1],
+                           ('%d KB/s' % second[1]) if second else '无'))
+                    return _s, best[0]
+                except OSError:
+                    _fail_note(best[0])
+                    _hot_drop(key, best[0])
+                    _kbps_forget(best[0])   # 赌输了就忘掉它, 下次别再赔一轮超时
+
+        # 一批并发抢连(6 个): 谁先通就用谁。
+        # 不做"分批重试" —— 每多一批就多叠加一轮超时, 实测分批版出现过 16 秒尖峰。
+        # 并发数**不是越多越好**: 试过 14 个, 国际链路上这些连接会互相挤占带宽,
+        # 结果每个都变慢(实测退化到 7~10 秒); 6 个兼顾"覆盖多网段"与"不自拥塞"。
+        # timeout 4 秒: 并发抢连的返回时间取决于"最快成功的那个", 不是这个上限,
+        # 所以放宽它是零成本的, 高丢包时给 TCP 重传留够时间。
+        sock, ip = self._connect_race(cand, port, timeout=4.0, max_race=6)
+        if sock is not None:
+            _note_route(key, ip, sys_ips)
+            _LAST_GOOD[key] = ip
+            _fail_clear(ip)
+            _ip_born(ip)          # 寿命台账: 这个 IP 第一次被证实可用
+            return sock, ip
+        for dead in cand[:6]:
+            pool.drop(dead)
+            _fail_note(dead)
+            _ip_died(dead)        # 结掉这一生, 记进"能撑多久"的样本
+            _hot_drop(key, dead)  # 热备里也剔掉, 下轮补新的
+
+        _LAST_GOOD[key] = ''
+        # 整批都撞死了 —— 热备池多半也过期了, 立刻补一批新的待命
+        threading.Thread(target=lambda: hot_refresh(key, pool), daemon=True).start()
+        log('%s 候选 IP 全军覆没, 本次退回系统解析' % label)
+        trigger_selfheal()
+        try:
+            return socket.create_connection((host, port), timeout=10), None
+        except OSError as e:
+            log('连接 %s 失败: %s' % (host, e))
+            return None, None
+
     def _connect(self, host, port):
         # 【2026-10-10 修 声明不符】先卡域名：本代理只转发 GitHub 相关域名。
         # 对外写的是「只接管 GitHub 相关域名、不转发他人流量」，
@@ -899,43 +1865,15 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             return None, None
         if is_raw_host(host):
             # raw 文件 / 发布附件：走 185.199.108.0/22 那段专属池。
-            # 以前没有这段，所以 githubusercontent 只能直连（用户提的 issue #1）。
-            for ip in HEALTH_RAW.candidates()[:4]:
-                try:
-                    return socket.create_connection((ip, port), timeout=5), ip
-                except OSError:
-                    HEALTH_RAW.drop(ip)
-                    continue
-            log('raw 候选 IP 全灭, 本次退回系统解析')
-        elif is_pages_host(host):
-            # GitHub Pages: 与 raw/附件同一段 IP(185.199.108.0/22), 但证书是 *.github.io,
-            # 所以走**按 github.io 证书体检过**的那一池(HEALTH_PAGES)。
-            for ip in HEALTH_PAGES.candidates()[:4]:
-                try:
-                    return socket.create_connection((ip, port), timeout=5), ip
-                except OSError:
-                    HEALTH_PAGES.drop(ip)
-                    continue
-            log('github.io 候选 IP 全灭, 本次退回系统解析')
-        elif is_github_host(host):
-            # 【2026-10-10 修·"手动指定 IP 会优先使用"其实做不到】面板的输入框、
-            # save_manual_ip 的回话、以及 candidate_list() 的注释都承诺手填的 IP
-            # **永远排第一** —— 但 HEALTH.refresh() 会把探测结果**按毫秒重排**，
-            # 而代理真正取的是 HEALTH.candidates()[:4]：
-            # 手填的那个只有恰好也进前 4 才会被用上。
-            # 用户为救急填的地址通常**不是最快的、只是"能通"**，于是被排到后面，
-            # 只有当最快的 4 个连 TCP 都失败时才有机会 —— 体感就是"我填了 IP 也没用"。
-            # 这里把手填的 IP **钉在最前面**单独先试一次。
+            return self._connect_pool(host, port, HEALTH_RAW, 'raw', 'raw')
+        if is_pages_host(host):
+            # GitHub Pages: 证书是 *.github.io, 走按 github.io 体检过的那一池。
+            return self._connect_pool(host, port, HEALTH_PAGES, 'pages', 'github.io')
+        if is_github_host(host):
             if not _MANUAL_IP[0]:
                 _MANUAL_IP[0] = load_manual_ip()
-            _first = [_MANUAL_IP[0]] if _MANUAL_IP[0] else []
-            for ip in _first + [x for x in HEALTH.candidates()[:4] if x not in _first]:
-                try:
-                    return socket.create_connection((ip, port), timeout=5), ip
-                except OSError:
-                    HEALTH.drop(ip)
-                    continue
-            log('候选 IP 全军覆没, 本次退回系统解析')
+            return self._connect_pool(host, port, HEALTH, 'github', 'github.com',
+                                      prefer=_MANUAL_IP[0] or '')
         try:
             return socket.create_connection((host, port), timeout=10), None
         except OSError as e:
@@ -949,6 +1887,7 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         up, used = self._connect(host, port)
         if up is None:
             self._send(502, b'Bad Gateway')
+            trigger_selfheal()
             return
         try:
             self.wfile.write(b'HTTP/1.1 200 Connection established\r\n\r\n')
@@ -958,11 +1897,17 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             return
         if used:
             log_conn('%s -> %s' % (host, used))
-        self._relay(up)
+        up_err = self._relay(up)
+        if up_err and used:
+            log('上游返回 4xx/5xx, 剔除假活 IP %s 并触发自愈' % used)
+            HEALTH.drop(used)
+            trigger_selfheal()
 
     def _relay(self, up):
         conn = self.connection
         pair = [conn, up]
+        up_err = False
+        _first_up = True
         # 转发阶段由 select 统一管超时, 先把两端 socket 的超时都放宽到同一个空闲
         # 上限: 客户端那端带着 StreamRequestHandler 的 30 秒(self.timeout), 上游
         # 那端还是建连时 create_connection 留下的 5 秒 —— 大附件(raw /
@@ -995,6 +1940,17 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     except OSError:
                         stop = True
                         break
+                    # 【2026-10-11 修·嗅探上游首段】上游 IP 若"证书对但被限流/封禁",
+                    # 会返回 HTTP 4xx/5xx(典型 400): 这种假活 IP 之前 TCP/TLS 都通,
+                    # 代理以为成功转发, 实则用户拿到错误页。首段若是 4xx/5xx 即判死。
+                    if _first_up and s is up and data[:5] == b'HTTP/' and len(data) >= 12:
+                        code = data[9:12]
+                        if code[:2].isdigit() and code[2:3] in b'45':
+                            up_err = True
+                            stop = True
+                            break
+                    if s is up:
+                        _first_up = False
                     if not data:
                         stop = True
                         break
@@ -1010,13 +1966,14 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 if stop:
                     break
         except Exception:
-            pass
+            up_err = True
         finally:
             for s in pair:
                 try:
                     s.close()
                 except Exception:
                     pass
+        return up_err
 
 
 class ProxyServer(socketserver.ThreadingTCPServer):
@@ -1170,6 +2127,11 @@ def enable_proxy():
             log('!! ' + msg)
             alert_once('enable-readback', '狐径: 启用加速失败', msg)
             return False, msg
+        # 【2026-10-11 修复】Windows 下 PAC 要生效必须 ProxyEnable=1; 本程序之前
+        # 只写了 AutoConfigURL 没开总闸, 导致"启用了加速"浏览器/系统却仍不读 PAC
+        # —— 表现就是打开加速后 github 依然打不开。这里补开总闸; disable_proxy /
+        # 退出时会在下面按备份把 ProxyEnable 还原回原值, 不会残留。
+        reg_set(REG_INTERNET, 'ProxyEnable', 1, 4)
         notify_proxy_change()
         log('加速已开启 (原设置已备份到 %s)' % BACKUP_FILE)
         return True, '加速已开启, 原系统代理设置已备份'
@@ -1703,11 +2665,30 @@ def load_update_result():
     return _LAST_RESULT[0]
 
 
+def _consume_update_result_file():
+    """【2026-10-11·用户要求"只出现一次"】本会话首次把升级结果行展示给面板后,
+    删掉落盘记录(update-result.json), 只留内存。这样:
+      升级结束那次会话 → 看得到这一行;
+      程序重启后再开面板 → 读不到记录、不再显示。
+    既满足"升级结束出现一次", 又满足"用户再次打开时不出现"。
+    """
+    try:
+        if os.path.exists(UPDATE_RESULT_FILE):
+            os.remove(UPDATE_RESULT_FILE)
+    except Exception:
+        pass
+
+
 def last_result_text():
-    """面板「更新」卡片里那一行: 上次升级结果(成功/失败 + 时间 + 一句怎么办)。"""
+    """面板「更新」卡片里那一行: 上次升级结果(成功/失败 + 时间 + 一句怎么办)。
+
+    【2026-10-11·用户要求"只出现一次"】调用即视为"已展示过一次", 顺手清掉落盘记录
+    (见 _consume_update_result_file), 只留内存供本次会话继续回看; 重启后不再出现。
+    """
     d = _LAST_RESULT[0]
     if not d:
         return ''
+    _consume_update_result_file()
     try:
         when = time.strftime('%m-%d %H:%M',
                              time.localtime(float(d.get('ts') or 0)))
@@ -2639,10 +3620,16 @@ PANEL_HTML = """<!doctype html>
     <button class="primary" id="btnEnable">启用加速</button>
     <button id="btnDisable">停用并还原</button>
     <button id="btnTest">立即重测</button>
+    <button id="btnSpeed">立即测速</button>
     <label><input type="checkbox" id="auto"> 开机自启</label>
     <button class="danger" id="btnQuit">退出并还原</button>
     <span id="actMsg" style="font-size:13px;color:#16a34a"></span>
   </div>
+  <div class="row" id="lifeBar" style="margin-top:8px;font-size:13px;color:#64748b"></div>
+  <div class="row" id="directTip" style="margin-top:6px;font-size:13px"></div>
+  <div class="row" id="speedTip" style="margin-top:6px;font-size:13px;color:#64748b"></div>
+  <div class="row" id="routeTip" style="margin-top:6px;font-size:13px;color:#64748b"></div>
+  <div class="row" id="speedMsg" style="font-size:13px;color:#64748b"></div>
 </div>
 
 <div class="card">
@@ -2685,6 +3672,102 @@ function refresh(){
     s.textContent = d.enabled ? '已启用' : '未启用';
     s.className = d.enabled ? 'big' : 'big off';
     document.getElementById('time').textContent = d.last || '-';
+    // IP 寿命台账: 直接回答"多久会被锁死、还剩多久、有没有备胎"(2026-10-11)
+    const lb = document.getElementById('lifeBar');
+    if (d.life && d.cur_ip) {
+      const src = d.life_n ? ('本机实测 ' + d.life_n + ' 个样本') : '经验值(攒够样本后自动校准)';
+      const left = d.cur_left;
+      // cur_left 为 null = 这个 IP 已失效或还没建立寿命记录, 不能显示成"还能撑 X 秒"
+      const tail = (left === null || left === undefined)
+        ? '寿命未知(该 IP 已失效, 下次访问会换新的)'
+        : ('已撑 ' + d.cur_age + ' 秒, 约 ' + Math.max(0, left) + ' 秒后自动提前换掉(不等它锁死)');
+      lb.textContent = 'IP 寿命基准 ' + d.life + ' 秒(' + src + ') · 当前 ' + d.cur_ip
+        + ' · ' + tail + ' · 热备 ' + (d.hot || 0) + ' 个待命';
+      lb.style.color = (left !== null && left !== undefined && left < 30) ? '#dc2626' : '#64748b';
+    } else { lb.textContent = ''; }
+    // 线路体检: 明说"是线路不通还是狐径没干活", 别让用户猜(2026-10-11 用户反复报打不开)
+    const dt = document.getElementById('directTip');
+    if (d.direct === false) {
+      dt.textContent = '当前这台机器直连 github 主站也不通（不是狐径的问题，换 IP 也打不开）。'
+        + '狐径会在线路恢复时自动生效；急用可开手机热点，或先用 Gitee。';
+      dt.style.color = '#dc2626';
+    } else if (d.direct === true) {
+      dt.textContent = '直连 github 正常，狐径会挑更快的 IP 走。';
+      dt.style.color = '#16a34a';
+    } else { dt.textContent = ''; }
+    // 线路测速(2026-10-11): 光看"通不通"会误判 —— 实测里握手 0.1 秒就成功、
+    // 数据却要 20 秒才下完, 浏览器表现就是"打不开"。这里把真实下载速度摆出来,
+    // 走狐径和直连各一份, 谁在拖后腿一眼看清。
+    const stEl = document.getElementById('speedTip');
+    const sp = d.speed || {};
+    const rd = function(v){
+      if (!v || !v.ts) return null;
+      // 一个字节都没等到时别写"不通": 那是超时(连接其实建起来了), 写清楚
+      if (!v.ok) return {bad: true, txt: v.err || '不通', t: v.total || 0};
+      return {bad: false, kb: Math.round((v.bytes||0)/1024), t: v.total,
+              kbps: v.kbps, ttfb: v.ttfb, ts: v.ts};
+    };
+    const P = rd(sp.proxy), D = rd(sp.direct);
+    if (sp.busy) {
+      stEl.textContent = '正在测速…(真下载一段 github 首页, 最多 40 秒)';
+      stEl.style.color = '#64748b';
+    } else if (!P && !D) {
+      stEl.textContent = '';
+    } else {
+      const one = function(v){
+        if (v.bad) return v.t ? ('超时(等了 ' + v.t + 's 零字节)') : ('失败(' + v.txt + ')');
+        return v.kb + 'KB/' + v.t + 's ≈ ' + v.kbps + ' KB/s';
+      };
+      let txt = '';
+      const age = Math.round(Date.now()/1000 - (P ? P.ts : D.ts));
+      txt += '线路实测(' + age + '秒前)：经狐径 ' + (P ? one(P) : '未测')
+           + ' · 直连 ' + (D ? one(D) : '未测');
+      let verdict = '';
+      let color = '#64748b';
+      if (P && !P.bad && D && !D.bad) {
+        if (P.kbps < 50 && D.kbps < 50) {
+          verdict = ' —— 两条路都堵着，是这条宽带到 GitHub 的链路在拥塞，换 IP 也救不了，只能等它缓过来';
+          color = '#dc2626';
+        } else if (P.kbps >= 200) {
+          verdict = ' —— 通畅';
+          color = '#16a34a';
+        } else if (P.kbps >= 50) {
+          verdict = ' —— 偏慢，能开但会转圈';
+          color = '#b45309';
+        } else {
+          verdict = ' —— 经狐径也很慢';
+          color = '#dc2626';
+        }
+        if (D.kbps > 0 && P.kbps > D.kbps * 1.5) {
+          verdict += '（狐径比直连快 ' + (P.kbps / D.kbps).toFixed(1) + ' 倍，加速是生效的）';
+        }
+      } else if (P && P.bad && D && D.bad) {
+        verdict = ' —— 两边都连不上，等线路恢复';
+        color = '#dc2626';
+      }
+      stEl.textContent = txt + verdict;
+      stEl.style.color = color;
+    }
+    // 路由来源(2026-10-11): 最近一次转发到底走了谁 —— 候选池挑的 IP, 还是系统
+    // 解析出来的那个(也就是"直连"), 以及后台用同一把尺子量出来的两边吞吐。
+    // 一直显示池子 = 池子确实更快; 老显示直连 = 池子选得不如外面那条路。
+    const rtEl = document.getElementById('routeTip');
+    const rt = (d.route || {}).github || (d.route || {}).raw
+             || (d.route || {}).pages || null;
+    const cp = d.cap || {};
+    const kbps = function(o){ return (o && o.ok) ? (o.kbps + ' KB/s') : '传不动'; };
+    if (rt && rt.ip) {
+      const rage = Math.round(Date.now()/1000 - (rt.ts || 0));
+      let why = '';
+      if (cp.sys && cp.pool) {
+        why = ' —— 后台实测：直连 ' + kbps(cp.sys) + ' vs 候选池 ' + kbps(cp.pool)
+            + (cp.sys_wins ? '，直连更快所以放行' : '，池子更快所以走池');
+      }
+      rtEl.textContent = '上一次转发走了：' + (rt.src === 'sys'
+          ? ('系统解析(直连) ' + rt.ip) : ('候选池 ' + rt.ip)) + why
+        + '（' + rage + ' 秒前）';
+      rtEl.style.color = '#64748b';
+    } else { rtEl.textContent = ''; }
     document.getElementById('auto').checked = d.autostart;
     // 自动升级开关 + 本次启动的升级结果(2026-10-09 用户要求: 默认自动升级、不弹提示)
     document.getElementById('autoUpd').checked = !!d.autoupd;
@@ -2737,11 +3820,27 @@ document.getElementById('btnTest').onclick = ()=>{
   document.getElementById('btnTest').disabled=true;
   act('/api/retest').then(()=>{document.getElementById('btnTest').disabled=false;refresh()});
 };
+// 「立即测速」(2026-10-11): 真下载一段 github 首页量速度, 后台跑完自己刷新
+document.getElementById('btnSpeed').onclick = ()=>{
+  const b = document.getElementById('btnSpeed'), m = document.getElementById('speedMsg');
+  b.disabled = true; m.textContent = '测速中…';
+  act('/api/speedtest').then(r=>{
+    m.textContent = r.msg || '';
+    b.disabled = false;
+    setTimeout(refresh, 500); setTimeout(refresh, 8000); setTimeout(refresh, 20000);
+  });
+};
 document.getElementById('auto').onchange = (e)=>
   act('/api/autostart?on='+(e.target.checked?1:0)).then(refresh);
 document.getElementById('btnQuit').onclick = ()=>{
   if(confirm('退出后 GitHub 将恢复原有连接方式，确定退出？')){
-    act('/api/quit').then(()=>{ document.getElementById('state').textContent='正在退出...'; });
+    act('/api/quit').then(()=>{
+      clearInterval(_refreshTimer); clearInterval(_diagTimer);
+      document.getElementById('state').textContent='已安全退出，可关闭此页';
+      _say('actMsg','狐径已退出，系统代理已还原', 6000, false);
+    }).catch(()=>{
+      document.getElementById('state').textContent='已退出（面板无响应，可关闭此页）';
+    });
   }
 };
 function loadDiag(){
@@ -2781,8 +3880,8 @@ document.getElementById('btnIpClear').onclick = ()=>{
     _say('ipMsg',(r&&r.msg)||'已清除');loadDiag();refresh();
   }).catch(()=>{_say('ipMsg','面板没有响应',8000,true);});
 };
-loadDiag(); setInterval(loadDiag,10000);
-refresh(); setInterval(refresh,3000);
+loadDiag(); var _diagTimer = setInterval(loadDiag,10000);
+refresh(); var _refreshTimer = setInterval(refresh,3000);
 </script>
 <script>
 /* 在线升级: 版本迁移动画 + 渐变进度条 + 状态轮询 */
@@ -2903,6 +4002,9 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._send(200, PANEL_PAGE.encode('utf-8'))
         elif path == '/api/status':
             good, ts = HEALTH.snapshot()
+            _cur_ip = _LAST_GOOD.get('github') or (good[0][0] if good else '')
+            # 寿命未知要如实给 null: 转成 0 的话面板会显示"约 0 秒后换", 语义正好相反
+            _cur_left = _ip_remaining(_cur_ip)
             data = {
                 'ip': good[0][0] if good else None,
                 'ms': good[0][1] if good else None,
@@ -2929,6 +4031,34 @@ class PanelHandler(BaseHTTPRequestHandler):
                 'lastres': last_result_text(),
                 'lastok': bool(_LAST_RESULT[0] and _LAST_RESULT[0].get('ok')),
                 'logs': recent_logs(),
+                # 【2026-10-11】IP 寿命台账: 面板能直接看出"这类 IP 平均能撑多久"、
+                # 当前这个撑了多久、还剩多久, 以及有几个热备待命。
+                'life': int(_avg_life()),
+                'life_n': _life_samples(),
+                # 显示**真正在用的那个** IP 的寿命(不是体检第一名):
+                # 转发送出去的是 _LAST_GOOD, 它的年龄才是"会不会马上锁死"的那个数
+                'cur_ip': _cur_ip,
+                'cur_age': int(_ip_age(_cur_ip)),
+                'cur_left': None if _cur_left is None else int(_cur_left),
+                'hot': len(_hot_get('github')),
+                # 线路体检: 绕开狐径直连 github 通不通(None = 还没探过)
+                'direct': _DIRECT_OK[0],
+                'direct_age': int(time.time() - _DIRECT_OK[1]) if _DIRECT_OK[1] else None,
+                # 线路测速(2026-10-11): "连得上"和"打得开"是两回事, 把真实下载速度
+                # 也回给面板 —— 走狐径 / 直连各一份, 用户一眼能分出是谁在拖后腿。
+                'speed': {'proxy': dict(_SPEED.get('proxy') or {}),
+                          'direct': dict(_SPEED.get('direct') or {}),
+                          'busy': bool(_SPEED_BUSY[0])},
+                # 【2026-10-11】最近一次转发是"池子挑的 IP"赢还是"系统解析(直连)"赢。
+                # 不看这个数字就不知道加速到底有没有在干活: 一直 pool = 池子总比直连快;
+                # 老显示 sys 则说明池子选出来的不如外面那条路, 得回头查候选池。
+                'route': {k: dict(v) for k, v in _ROUTE.items()},
+                'cap': {'sys': dict(_cap_of('github.com', _SYS_CAP) or {}),
+                        'pool': dict(_cap_of('github.com', _POOL_CAP) or {}),
+                        'sys_wins': _sys_wins('github.com'),
+                        'hot': sorted([{'ip': i, 'kbps': k} for i, k in
+                                       ((x, _kbps_of(x)) for x in _hot_get('github'))
+                                       if k], key=lambda d: -d['kbps'])},
             }
             self._send(200, json.dumps(data, ensure_ascii=False).encode('utf-8'),
                        'application/json; charset=utf-8')
@@ -2986,14 +4116,25 @@ class PanelHandler(BaseHTTPRequestHandler):
             resp = {'ok': ok, 'msg': msg}
         elif path == '/api/retest':
             threading.Thread(target=lambda: (HEALTH.refresh(candidate_list()),
-                                              HEALTH_RAW.refresh(CANDIDATE_IPS_RAW),
-                                              HEALTH_PAGES.refresh(CANDIDATE_IPS_RAW)),
+                                              HEALTH_RAW.refresh(CANDIDATE_IPS_RAW_ALL),
+                                              HEALTH_PAGES.refresh(CANDIDATE_IPS_PAGES_ALL)),
                              daemon=True).start()
             log('手动重测已触发(含 raw 与 github.io 池)')
+        elif path == '/api/speedtest':
+            # 面板「立即测速」(2026-10-11): 后台跑, 不卡页面; 已在测就直接告诉它等着
+            started = speed_probe_async()
+            resp = {'ok': True, 'msg': '正在测速…(约 10~40 秒后刷新)'
+                    if started else '上一次还没测完, 稍等几秒再刷新'}
+            if started:
+                log('手动测速已触发')
         elif path == '/api/quit':
             log('收到退出指令, 正在还原系统代理')
             disable_proxy()
-            threading.Thread(target=lambda: (time.sleep(0.3), os._exit(0)), daemon=True).start()
+            # 先回执再延迟杀进程, 让面板收到 200 后停轮询并显示"已退出", 不再卡"正在退出"
+            self._send(200, json.dumps({'ok': True, 'msg': '已退出'}).encode('utf-8'),
+                      'application/json; charset=utf-8')
+            threading.Thread(target=safe_quit, daemon=True).start()
+            return
         elif path == '/api/update/check':
             st = do_update_check()
             log('手动检查升级: ' + str(st.get('msg')))
@@ -3051,15 +4192,33 @@ def start_panel():
     return srv
 
 
+# 【2026-10-11 修·连接级自愈】"IP 锁死"根因: Health 池每 5 分钟体检一次,
+# 两次体检之间候选 IP 过期/被限流(返回 4xx)却仍锁在池里, 代理反复试死 IP →
+# 用户只能重启才重置。这里在**转发实际失败**时立刻触发一次全池重测(含 HTTP 预检,
+# 能把"TCP 通但 HTTP 4xx"的假活 IP 判死剔除), 带 60 秒冷却, 不等 5 分钟、不用用户重启。
+_RETEST_COOLDOWN_TS = [0.0]
+def trigger_selfheal():
+    now = time.time()
+    if now - _RETEST_COOLDOWN_TS[0] < 60:
+        return
+    _RETEST_COOLDOWN_TS[0] = now
+    log('连接级自愈: 转发连续失败, 立即全池重测(不等5分钟)')
+    threading.Thread(target=lambda: (
+        HEALTH.refresh(candidate_list()),
+        HEALTH_RAW.refresh(CANDIDATE_IPS_RAW_ALL),
+        HEALTH_PAGES.refresh(CANDIDATE_IPS_PAGES_ALL),
+    ), daemon=True).start()
+
+
 def health_loop():
     while True:
         # 官方 IP 表每 6 小时同步一次; 可用数量少于 3 个也顺手同步一次,
         # 免得 GitHub 换了地址我们还抱着旧表。
         need_meta = (time.time() - _last_meta_ok[0]) > 6 * 3600
         good = HEALTH.refresh(candidate_list())
-        good_raw = HEALTH_RAW.refresh(CANDIDATE_IPS_RAW)
+        good_raw = HEALTH_RAW.refresh(CANDIDATE_IPS_RAW_ALL)
         # GitHub Pages 与 raw/附件同一段 IP, 但证书记的是 *.github.io —— 单独体检
-        good_pages = HEALTH_PAGES.refresh(CANDIDATE_IPS_RAW)
+        good_pages = HEALTH_PAGES.refresh(CANDIDATE_IPS_PAGES_ALL)
         if need_meta or len(good) < 3:
             fetch_official_ips()
             good = HEALTH.refresh(candidate_list())
@@ -3097,9 +4256,16 @@ def health_loop():
         # 它是持续在跑、还是中途死过又重开。
         up_min = int((time.time() - _START_TS[0]) / 60) if _START_TS[0] else 0
         if good:
-            log('体检: 可用 %d/%d 已运行%d分钟 -> %s' % (
+            avg = _avg_life()
+            # 寿命台账(用户问的就是"多久会被锁死"): 有样本就把平均寿命一并报出来,
+            # 没有就说明还处在观察期、暂时不做预防性轮换。
+            _n = _life_samples()
+            life_txt = (' | IP 寿命基准 %d 秒(%s), 热备 %d 个' % (
+                int(avg), ('%d 个实测样本' % _n) if _n else '冷启动经验值',
+                len(_hot_get('github'))))
+            log('体检: 可用 %d/%d 已运行%d分钟 -> %s%s' % (
                 len(good), len(CANDIDATES), up_min,
-                ', '.join('%s(%dms)' % (i, m) for i, m in good[:3])))
+                ', '.join('%s(%dms)' % (i, m) for i, m in good[:3]), life_txt))
         else:
             # 【2026-10-10 修·自愈只跑第一步】这里原来是
             #     elif good_raw or good_pages:  只写一行日志
@@ -3112,8 +4278,8 @@ def health_loop():
             # 降级成"顺带记一行参考信息"，不再决定要不要自愈。
             if good_raw or good_pages:
                 log('raw/pages 体检: 可用 %d/%d 与 %d/%d -> %s'
-                    % (len(good_raw), len(CANDIDATE_IPS_RAW),
-                       len(good_pages), len(CANDIDATE_IPS_RAW),
+                    % (len(good_raw), len(CANDIDATE_IPS_RAW_ALL),
+                       len(good_pages), len(CANDIDATE_IPS_PAGES_ALL),
                        ', '.join('%s(%dms)' % (i, m) for i, m in (good_raw or good_pages)[:2])))
             good = recover()
             if good:
@@ -3122,6 +4288,225 @@ def health_loop():
 
         time.sleep(CHECK_INTERVAL)
 
+
+# ── 常驻系统托盘(右键菜单: 显示控制面板 / 退出并还原)──────────────────────
+# 用户 2026-10-11 要求: 托盘图标常驻(不是只弹面板), 右键就能干净退出,
+# 不用每次进任务管理器手动结束进程。独立 daemon 线程跑消息循环, 不阻塞主线程。
+_TRAY_HWND = [None]
+_TRAY_CB = 0x8001                       # WM_APP + 1, 托盘回调消息
+_MENU_SHOW, _MENU_QUIT = 1, 2
+
+def _tray_delete_icon(hwnd):
+    """从通知区摘掉托盘图标(进程退出前清干净, 不留僵尸图标)。"""
+    try:
+        s = ctypes.WinDLL('shell32', use_last_error=True)
+        nid = _NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+        nid.hWnd = hwnd
+        nid.uID = 1
+        s.Shell_NotifyIconW(_NIM_DELETE, ctypes.byref(nid))
+    except Exception:
+        pass
+
+def safe_quit():
+    """统一的干净退出: 还原系统代理 -> 摘托盘图标 -> 终止进程。"""
+    try:
+        if proxy_on():
+            log('程序退出, 还原系统代理')
+            disable_proxy()
+    except Exception:
+        pass
+    hwnd = _TRAY_HWND[0]
+    if hwnd:
+        _tray_delete_icon(hwnd)
+    os._exit(0)
+
+def _tray_thread():
+    if os.name != 'nt':
+        return
+    try:
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        shell32 = ctypes.WinDLL('shell32', use_last_error=True)
+        user32.DefWindowProcW.restype = ctypes.c_ssize_t
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                          wintypes.WPARAM, wintypes.LPARAM]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HANDLE, wintypes.HINSTANCE, ctypes.c_void_p]
+        user32.RegisterClassExW.restype = wintypes.ATOM
+        user32.RegisterClassExW.argtypes = [ctypes.POINTER(_WNDCLASSEXW)]
+        user32.UnregisterClassW.restype = wintypes.BOOL
+        user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+        user32.LoadIconW.restype = wintypes.HANDLE
+        user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.PostQuitMessage.argtypes = [ctypes.c_int]
+        user32.GetMessageW.restype = ctypes.c_ssize_t
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                       wintypes.UINT, wintypes.UINT]
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.restype = ctypes.c_ssize_t
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.GetCursorPos.restype = wintypes.BOOL
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        user32.TrackPopupMenu.restype = ctypes.c_uint
+        user32.TrackPopupMenu.argtypes = [wintypes.HMENU, ctypes.c_uint,
+                                          ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                          wintypes.HWND, ctypes.c_void_p]
+        user32.CreatePopupMenu.restype = wintypes.HMENU
+        user32.CreatePopupMenu.argtypes = []
+        user32.AppendMenuW.restype = wintypes.BOOL
+        user32.AppendMenuW.argtypes = [wintypes.HMENU, ctypes.c_uint,
+                                       ctypes.c_ulonglong, wintypes.LPCWSTR]
+        user32.DestroyMenu.argtypes = [wintypes.HMENU]
+        user32.PostMessageW.restype = wintypes.BOOL
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+        shell32.Shell_NotifyIconW.argtypes = [ctypes.c_uint,
+                                              ctypes.POINTER(_NOTIFYICONDATAW)]
+        shell32.ExtractIconExW.restype = ctypes.c_uint
+        shell32.ExtractIconExW.argtypes = [wintypes.LPCWSTR, ctypes.c_int,
+                                           ctypes.POINTER(wintypes.HANDLE),
+                                           ctypes.POINTER(wintypes.HANDLE),
+                                           ctypes.c_uint]
+        user32.DestroyIcon.restype = wintypes.BOOL
+        user32.DestroyIcon.argtypes = [wintypes.HANDLE]
+
+        WM_RBUTTONUP = 0x0205
+        WM_LBUTTONUP = 0x0202
+        WM_LBUTTONDBLCLK = 0x0203
+        WM_NULL = 0x0000
+        NIF_MESSAGE = 0x01
+        TPM_RIGHTBUTTON = 0x0002
+        TPM_RETURNCMD = 0x0100
+        MF_STRING = 0x0000
+
+        hinst = kernel32.GetModuleHandleW(None)
+        cls = 'FoxPathTray_%d' % os.getpid()
+
+        @ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
+                            wintypes.WPARAM, wintypes.LPARAM)
+        def wndproc(hwnd, msg, wp, lp):
+            if msg == _TRAY_CB:
+                evt = lp & 0xFFFF
+                if evt == WM_RBUTTONUP:
+                    hmenu = user32.CreatePopupMenu()
+                    user32.AppendMenuW(hmenu, MF_STRING, _MENU_SHOW, '显示控制面板')
+                    user32.AppendMenuW(hmenu, MF_STRING, _MENU_QUIT, '退出并还原')
+                    # 微软要求: TrackPopupMenu 前先 SetForegroundWindow,
+                    # 之后发一个 WM_NULL, 否则菜单点一次后不消失。
+                    user32.SetForegroundWindow(hwnd)
+                    pt = wintypes.POINT()
+                    user32.GetCursorPos(ctypes.byref(pt))
+                    cmd = user32.TrackPopupMenu(hmenu,
+                                                TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                                                pt.x, pt.y, 0, hwnd, None)
+                    user32.DestroyMenu(hmenu)
+                    user32.PostMessageW(hwnd, WM_NULL, 0, 0)
+                    if cmd == _MENU_SHOW:
+                        try:
+                            webbrowser.open('http://127.0.0.1:%d/ui' % PANEL_PORT)
+                        except Exception:
+                            pass
+                    elif cmd == _MENU_QUIT:
+                        safe_quit()
+                elif evt in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+                    try:
+                        webbrowser.open('http://127.0.0.1:%d/ui' % PANEL_PORT)
+                    except Exception:
+                        pass
+            elif msg == 0x0010:        # WM_CLOSE
+                user32.DestroyWindow(hwnd)
+            elif msg == 0x0002:        # WM_DESTROY
+                user32.PostQuitMessage(0)
+            return user32.DefWindowProcW(hwnd, msg, wp, lp)
+
+        wc = _WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(_WNDCLASSEXW)
+        wc.lpfnWndProc = ctypes.cast(wndproc, ctypes.c_void_p)
+        wc.hInstance = hinst
+        wc.lpszClassName = cls
+        if not user32.RegisterClassExW(ctypes.byref(wc)):
+            log('托盘: 注册窗口类失败')
+            return
+        try:
+            hicon_large = wintypes.HANDLE()
+            hicon_small = wintypes.HANDLE()
+            _extracted = False
+            hwnd = user32.CreateWindowExW(0, cls, APP_NAME, 0, 0, 0, 0, 0,
+                                          None, None, hinst, None)
+            if not hwnd:
+                log('托盘: 创建窗口失败')
+                return
+            _TRAY_HWND[0] = hwnd
+            nid = _NOTIFYICONDATAW()
+            nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+            nid.hWnd = hwnd
+            nid.uID = 1
+            nid.uFlags = NIF_MESSAGE | _NIF_ICON | _NIF_TIP
+            nid.uCallbackMessage = _TRAY_CB
+            # 托盘图标用 exe 自带原生图标(和文件图标一致), 不再用系统蓝色"i"
+            try:
+                n_ext = shell32.ExtractIconExW(
+                    sys.executable, 0,
+                    ctypes.byref(hicon_large), ctypes.byref(hicon_small), 1)
+                if n_ext and int(hicon_small.value or 0):
+                    nid.hIcon = hicon_small
+                    _extracted = True
+                elif n_ext and int(hicon_large.value or 0):
+                    nid.hIcon = hicon_large
+                    _extracted = True
+                else:
+                    nid.hIcon = user32.LoadIconW(None, ctypes.c_wchar_p(_IDI_INFORMATION))
+            except Exception:
+                nid.hIcon = user32.LoadIconW(None, ctypes.c_wchar_p(_IDI_INFORMATION))
+            if _extracted:
+                log('托盘图标取 exe 原生图标')
+            nid.szTip = APP_NAME
+            if not shell32.Shell_NotifyIconW(_NIM_ADD, ctypes.byref(nid)):
+                log('托盘: 添加图标失败')
+                return
+            log('托盘图标已就绪(右键可退出, 左键打开面板)')
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            if _extracted:
+                try:
+                    if int(hicon_small.value or 0):
+                        user32.DestroyIcon(hicon_small)
+                    if int(hicon_large.value or 0):
+                        user32.DestroyIcon(hicon_large)
+                except Exception:
+                    pass
+            try:
+                _tray_delete_icon(hwnd)
+            except Exception:
+                pass
+            try:
+                user32.DestroyWindow(hwnd)
+            except Exception:
+                pass
+            try:
+                user32.UnregisterClassW(cls, hinst)
+            except Exception:
+                pass
+    except Exception as e:
+        log('托盘线程异常: %s' % e)
+
+def tray_serve():
+    """启动常驻托盘(daemon 线程)。"""
+    t = threading.Thread(target=_tray_thread, daemon=True)
+    t.start()
+    return t
 
 def on_exit():
     """程序退出时, 如果我们正在管理系统代理, 把它还原成之前的样子。"""
@@ -3133,7 +4518,18 @@ def on_exit():
         pass
 
 
+def _enable_dpi_aware():
+    """高分屏声明 DPI 感知: 否则 Windows 把窗口/菜单按 100% 画好再整块放大,
+    文字发虚起毛刺。对齐热点新闻的做法(SetProcessDPIAware)。
+    必须在创建任何窗口前调用 —— 放在 main 最开头。"""
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
 def main():
+    _enable_dpi_aware()               # 高分屏清晰: 必须在任何窗口创建前
     args = [a.lower() for a in sys.argv[1:]]
     _START_TS[0] = time.time()
     log('%s v%s 启动 (日志: %s)' % (APP_NAME, APP_VERSION, LOG_FILE))
@@ -3194,8 +4590,41 @@ def main():
 
     start_proxy()
     start_panel()
+    tray_serve()                       # 常驻托盘(右键退出 / 左键开面板), 两种模式都挂
     fetch_official_ips()
     threading.Thread(target=health_loop, daemon=True).start()
+    # 热备池守护: 20 秒补一次"刚验过、随时能顶上"的 IP, 让预防性换 IP 有米下锅
+    threading.Thread(target=hot_loop, daemon=True).start()
+    # 线路体检: 60 秒探一次"不走狐径时 github 通不通", 好如实告诉用户是谁的问题
+    threading.Thread(target=direct_probe_loop, daemon=True).start()
+    # 线路测速: 每 150 秒真下载一段首页, 量"经狐径/直连"各自的下载速度
+    # (握手成功≠打得开: 实测握手 0.1 秒、数据却要 20 秒, 面板必须显示这一层)
+    threading.Thread(target=speed_probe_loop, daemon=True).start()
+    # DNS 预热: 提前备好常用域名的系统解析结果, 让"直连"在竞速里不输在起跑线
+    threading.Thread(target=dns_warm_loop, daemon=True).start()
+    # 直连能力体检: 只有"真能传数据"的直连 IP 才给竞速资格, 免得握手快的坏 IP 抢到
+    threading.Thread(target=sys_cap_loop, daemon=True).start()
+
+    # 【2026-10-11 修·启动预体检改为后台异步】消除"启动后头几分钟候选池为空/过期"全灭窗口,
+    # 但必须放在 start_proxy/tray_serve 之后、用后台线程跑 —— 否则会阻塞代理/托盘起来,
+    # 用户双击后要等十几秒才出图标、github 才走代理(体感"启动慢/打不开")。
+    # 即便预体检还没完, 代理已开, 连接级自愈(selfheal)会在撞全灭时立即重测兜底。
+    def _precheck():
+        try:
+            HEALTH.refresh(candidate_list())
+            HEALTH_RAW.refresh(CANDIDATE_IPS_RAW_ALL)
+            HEALTH_PAGES.refresh(CANDIDATE_IPS_PAGES_ALL)
+            log('启动预体检完成(后台)')
+            # 候选池刚填满 —— 这是补热备的最佳时机(不等 hot_loop 的下一轮 20 秒),
+            # 否则启动后头 20 秒里转发只能靠体检名次, 预防性换 IP 没米下锅。
+            hot_refresh('github', HEALTH)
+            hot_refresh('raw', HEALTH_RAW)
+            hot_refresh('pages', HEALTH_PAGES)
+            log('热备池就绪: github %d 个 / raw %d 个 / pages %d 个' % (
+                len(_hot_get('github')), len(_hot_get('raw')), len(_hot_get('pages'))))
+        except Exception as e:
+            log('启动预体检失败(将交由 health_loop 稍后补): %s' % e)
+    threading.Thread(target=_precheck, daemon=True).start()
 
     if '--silent' in args:
         # 静默模式(开机自启用)以前**没有**注册退出还原 —— 这正是"程序关了,
@@ -3223,11 +4652,11 @@ def main():
             # 不再重复开一个浏览器窗口, 免得打断用户。
             log('这次是升级后自动重启: 原来开着的面板标签页会自己接上, 不再重复打开浏览器')
         else:
-            try:
-                webbrowser.open('http://127.0.0.1:%d/ui' % PANEL_PORT)
-            except Exception:
-                pass
-            log('控制面板已打开: http://127.0.0.1:%d/ui' % PANEL_PORT)
+            # 【2026-10-11 再改·启动彻底安静】上一版把浏览器窗口换成了右下角气泡,
+            # 用户照样嫌烦 —— 他要的是"双击完什么也别冒出来"。
+            # 现在: 冷启动只驻托盘、不弹窗、不弹气泡, 一行都不往屏幕上送。
+            # 要看面板: 左键托盘图标(或第二次双击 exe)。
+            log('启动静默: 已常驻托盘(左键开面板, 右键退出并还原); 不弹窗也不弹气泡')
         log('想常驻后台请勾「开机自启」; 点「退出并还原」可安全关闭本程序')
         try:
             while True:

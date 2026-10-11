@@ -58,8 +58,9 @@
 - **杀软报毒 / 首次升级后被杀软拦一下**。程序没有代码签名，属于可预期现象 ——
   请以发行页上的 SHA256 自行核对来源。详见 [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)。
 - 「出口 IP」在控制面板上可见：那是**你自己**的出口信息，面板只监听 `127.0.0.1`，不对局域网开放。
-- 某些域名不代理（`avatars.githubusercontent.com` / `camo.githubusercontent.com` / `githubassets.com` /
-  `api.github.com`）：这是设计如此。
+- 某些域名不代理（`githubassets.com` / `api.github.com`）：这是设计如此。
+  （`avatars.` / `camo.githubusercontent.com` 自 2026-10-11 起也走代理：与 raw/objects
+  同段 `185.199.108.0/22`、同一张 `*.githubusercontent.com` 证书，共用 raw 池。）
 - 不能用 `nohup ... &` 后台常驻：这是 Windows 上 shell 的行为，不是缺陷。
 
 ## 报告里请不要包含

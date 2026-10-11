@@ -27,6 +27,13 @@ _notes.md
 # 代理状态快照(运行时生成)
 .proxy-backup.json
 
+# 【2026-10-11】本机实测用的临时脚本/结果与报告，不进仓库
+# （publish.py 发版时跑的是 git add -A，不加这几条会把调试文件一并带上库）
+_*.py
+_*.txt
+_*.sh
+本机实测-*.md
+
 # 【2026-10-09 事故防线】误落进仓库的凭据文件（文件名被反斜杠吃掉产生的野文件）
 Harnesssecrets*
 *git-credentials

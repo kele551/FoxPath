@@ -254,8 +254,12 @@ python tools/preflight_release.py --dry-run    # 只跑静态项：不写注册�
   `objects.githubusercontent.com`**（raw 文件与发布附件下载，v1.0.6 起）。
   后两个走**专属 IP 池**（官方 `185.199.108.0/22`）：以前不代理它们，是因为塞进 `github.com`
   的池子会连到错误服务器、页面脚本全废 —— 那是池子不对，不是「不能代理」。
-- **仍然直连**：`avatars.githubusercontent.com` / `camo.githubusercontent.com` /
-  `githubassets.com`。这些是页面渲染用的，保持直连最稳，也避免重演当年的坑。
+- **`avatars.githubusercontent.com` / `camo.githubusercontent.com` 也走代理**（2026-10-11 起）：
+  它们与 raw/objects 同在 `185.199.108.0/22`、用的是同一张 `*.githubusercontent.com` 证书，
+  共用 raw 池既不会连错服务器也不会撞证书。改它的原因：本机实测同一张 282KB 头像，
+  直连 5.7~14.2 秒、走代理 1.1~4.7 秒 —— 页面上有几十个头像，它们直连被堵时，
+  主站 HTML 就算秒开，页面也一直转圈。
+- **仍然直连**：`githubassets.com`（不同域、证书不同，实测 0.27 秒本来就快）与 `api.github.com`。
 - 不代理 `api.github.com`（本来就通），Git 命令行操作不受影响。
 - 绿色单文件，无需安装；但**不能**用 `nohup ... &` 在 shell 里后台启动，那样命令结束进程会被终止。要常驻就双击运行或开开机自启。
 - 如果程序被**强制结束**（任务管理器结束进程、关机时强杀），`atexit` 不会执行，系统代理可能仍指向本程序。
