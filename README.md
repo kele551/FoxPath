@@ -5,7 +5,7 @@
 
 <img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square">
 <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?style=flat-square">
-<img alt="Version" src="https://img.shields.io/badge/version-v1.1.0-blue?style=flat-square">
+<img alt="Version" src="https://img.shields.io/badge/version-v1.1.1-blue?style=flat-square">
 <img alt="Downloads" src="https://img.shields.io/github/downloads/kele551/FoxPath/total?style=flat-square&label=downloads&color=green">
 
 <p>🦊 <b>GitHub 访问优化助手</b>　——　只在本机做网络分流，不改 hosts、不改系统 DNS，退出即还原</p>
@@ -75,7 +75,7 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 
 ## 用法
 
-1. 从 [Releases](https://github.com/kele551/FoxPath/releases) 下载 `FoxPath.exe`
+1. 从 [Gitee Releases](https://gitee.com/kele551/FoxPath/releases)（国内主源，直连快）或 [GitHub Releases](https://github.com/kele551/FoxPath/releases) 下载 `FoxPath.exe`
 2. 双击运行 → 浏览器自动打开控制面板 `http://127.0.0.1:8788/ui`
 3. 勾选「开机自启」即可后台常驻
 
@@ -240,6 +240,10 @@ python tools/preflight_release.py --dry-run    # 只跑静态项：不写注册�
   结果 `Failed to load Python DLL`。**该问题自 v1.0.7 起修复**（起新版本前先擦掉这些变量）。
 - **从 v1.0.6 升到 v1.0.7 这一跳**用的仍是老版小助手（不重试、不回滚），所以**仍可能失败一次**；
   失败了双击 `FoxPath.exe` 即可。**从 v1.0.7 往后，升级全程带护栏。**
+- **升级源不通时怎么办（2026-10-12 补）**：如果点「检查更新」长时间显示「连不上升级源」或
+  「联网失败，显示的是上次检查的结果」（Gitee/GitHub 两个 raw 源都够不着的极端线路），
+  不必干等——直接到 [Gitee 发行页](https://gitee.com/kele551/FoxPath/releases) 手动下载最新的
+  `FoxPath.exe`，**关掉旧程序后双击覆盖**即可，配置全部保留、无需卸载重装。
 
 </details>
 

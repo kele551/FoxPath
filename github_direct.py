@@ -58,7 +58,7 @@ from ctypes import wintypes          # 升级结果气泡要用(Shell_NotifyIcon
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = '狐径'
-APP_VERSION = '1.1.0'
+APP_VERSION = '1.1.1'
 # 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
 AUTHOR = '海风（kele551）'
 AUTHOR_ASCII = 'HaiFeng (kele551)'
@@ -3064,7 +3064,7 @@ def _start_update(auto=False):
     版本**不高于**本地版本, 一律拒绝执行并写日志。前端把「立即升级」置灰只是提示,
     真正的门必须在服务端 —— 本机任何程序都能直接 POST /api/update/start。
     """
-    info = read_update_info()
+    info = read_update_info(use_cache=False, stale_fallback=True)
     remote = str((info or {}).get('version') or '') or str(UPDATE.get('remote') or '')
     rel = ver_relation(remote, APP_VERSION)
     allow, why, logline = update_gate(remote, APP_VERSION)
@@ -3098,8 +3098,16 @@ load_settings()          # 启动即生效: 默认 auto_update=True, notify_bubb
 load_update_result()     # 上次升级结果(面板那一行要用; 读不到就算了, 不挡启动)
 
 
-def read_update_info(use_cache=True):
-    """读升级信息; use_cache=True 时 6 小时内不重复联网。"""
+def read_update_info(use_cache=True, stale_fallback=False):
+    """读升级信息; use_cache=True 时 6 小时内不重复联网。
+
+    【2026-10-12 修·手动检查吃了 6 小时缓存】以前面板「检查更新」也走默认缓存:
+    旧版实例(或上一轮自动检查)写进 update.json 的结果, 6 小时内用户怎么点都不碰
+    网络 —— 新版发布后老用户最长 6 小时毫无感知; 刚升级完的实例更惨, 读到的还是
+    升级前那份旧缓存, 面板直接误报"本地版本比线上新"。手动检查必须联网;
+    stale_fallback: 联网全失败时回读缓存并标 _stale —— 宁可明说"显示的是上次结果",
+    也不静默把过期结论当现状。
+    """
     if use_cache and os.path.isfile(UPDATE_CACHE):
         try:
             with open(UPDATE_CACHE, encoding='utf-8') as f:
@@ -3140,6 +3148,15 @@ def read_update_info(use_cache=True):
         except Exception as e:
             log('升级检查失败(%s): %s' % (u, e))
             continue
+    if stale_fallback and os.path.isfile(UPDATE_CACHE):
+        # 联网全挂: 回读缓存, 但打上 _stale 标记, 由调用方在面板上明说
+        try:
+            with open(UPDATE_CACHE, encoding='utf-8') as f:
+                c = json.load(f)
+            c['_stale'] = True
+            return c
+        except Exception:
+            pass
     return None
 
 
@@ -3158,7 +3175,8 @@ def do_update_check():
     if UPDATE.get('phase') in ('downloading', 'verifying', 'applying'):
         return _update_get()
     _update_set(phase='checking', msg='正在检查升级源…', error='')
-    info = read_update_info()
+    # 用户明确按下"检查更新" = 必须联网(2026-10-12 修): 不许被 6 小时缓存挡过去
+    info = read_update_info(use_cache=False, stale_fallback=True)
     if not info:
         _update_set(phase='failed', error='net', msg='连不上升级源(或还没发布升级信息)')
         return _update_get()
@@ -3167,6 +3185,8 @@ def do_update_check():
     # ★ 结论只按版本号语义下(2026-10-09 线上事故): 只有**远程严格大于本地**才是
     # 「发现新版本」。面板拿 relation / newer 两个字段渲染, 不再自己比字符串。
     rel, newer, msg = ver_verdict(remote, APP_VERSION)
+    if info.get('_stale'):
+        msg = msg + '（联网失败，显示的是上次检查的结果）'
     _update_set(local=APP_VERSION, remote=remote, notes=str(info.get('notes') or ''),
                 phase='idle', exe_url=node.get('url', ''), exe_sha=str(node.get('sha256') or '').upper(),
                 total=int(node.get('size') or 0),
@@ -3556,7 +3576,26 @@ def apply_update_async(auto=False):
         log('自动升级: 开始下载 v%s (不弹确认框; 校验不过会保留旧版本)' % ver_to)
     _update_set(phase='downloading', got=0, pct=0, error='', msg='正在下载新版本',
                 auto=bool(auto))
-    sha, err = _download_to(new, node['url'], int(node.get('size') or 0))
+    # 【2026-10-12 新增 · 下载多源回退】以前只认 exe.url 单源: Gitee 偶发抽风/限速(451)
+    # 时升级链直接断死, 用户只能"手动去发行页下载"。现在按 **url + mirrors[]** 依次试,
+    # 只认 https(与升级源同一口径); 首个成功即采用, 全失败时把"试过哪几家"写清楚 ——
+    # 不再一句"下载失败"让人猜。mirrors 对老版本无害: 1.0.x 只读 url, 多出来的字段忽略。
+    urls = [str(node.get('url') or '')] + [str(u) for u in (node.get('mirrors') or [])]
+    urls = [u for u in urls if u.lower().startswith('https://')]
+    sha, err, tried = '', '', []
+    for idx, u in enumerate(urls):
+        sha, err = _download_to(new, u, int(node.get('size') or 0))
+        if sha:
+            if idx > 0:
+                log('升级: 主源之后第 %d 个镜像源成功: %s' % (idx, u.split('//', 1)[1].split('/')[0]))
+            break
+        tried.append(u.split('//', 1)[1].split('/')[0])
+        log('升级: 下载源 %s 失败(%s), 换下一个' % (tried[-1], err))
+    if not sha:
+        if not urls:
+            err = '升级源里没有可用的 https 下载地址'
+        elif len(tried) > 1:
+            err = '%s(共试 %d 个源: %s)' % (err, len(tried), ', '.join(tried))
     if not sha:
         _update_set(phase='failed', error=err, msg='下载失败: %s' % err)
         log('升级: 下载失败 %s' % err)
