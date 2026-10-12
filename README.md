@@ -5,7 +5,7 @@
 
 <img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square">
 <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?style=flat-square">
-<img alt="Version" src="https://img.shields.io/badge/version-v1.0.8-blue?style=flat-square">
+<img alt="Version" src="https://img.shields.io/badge/version-v1.1.0-blue?style=flat-square">
 <img alt="Downloads" src="https://img.shields.io/github/downloads/kele551/FoxPath/total?style=flat-square&label=downloads&color=green">
 
 <p>🦊 <b>GitHub 访问优化助手</b>　——　只在本机做网络分流，不改 hosts、不改系统 DNS，退出即还原</p>

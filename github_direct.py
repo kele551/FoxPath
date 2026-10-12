@@ -58,7 +58,7 @@ from ctypes import wintypes          # 升级结果气泡要用(Shell_NotifyIcon
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = '狐径'
-APP_VERSION = '1.0.8'
+APP_VERSION = '1.1.0'
 # 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
 AUTHOR = '海风（kele551）'
 AUTHOR_ASCII = 'HaiFeng (kele551)'
@@ -162,6 +162,37 @@ CANDIDATE_IPS_PAGES_V6 = [
 # 两组不能混 —— ::154 的证书不含 *.github.io, 塞进 pages 池只会被判死、白占探测名额。
 CANDIDATE_IPS_RAW_ALL = CANDIDATE_IPS_RAW + CANDIDATE_IPS_RAW_V6
 CANDIDATE_IPS_PAGES_ALL = CANDIDATE_IPS_RAW + CANDIDATE_IPS_PAGES_V6
+
+# 【2026-10-12 新增 · IPv6 闸门】本机没有 IPv6 出口线路时, IPv6 候选会整排超时:
+# 每轮白占 8 个探测名额、体检变慢, "IPv6 可用 0/N" 也会永远难看。先探一下
+# "本机到底有没有 IPv6 路由" —— UDP connect 不发任何包, 只查路由表, 立即返回,
+# 开销约等于零。失败只关 60 秒(别被一次网络打嗝永久锁死), 成功缓存 5 分钟。
+_IPV6_GATE = [None, 0.0]           # [结果, 上次探测时刻]
+_IPV6_GATE_LOCK = threading.Lock()
+
+
+def local_has_ipv6():
+    now = time.time()
+    with _IPV6_GATE_LOCK:
+        res, ts = _IPV6_GATE
+        if res is not None and now - ts < (300 if res else 60):
+            return res
+    ok = False
+    for probe in ('2606:50c0:8000::154', '2a0a:a440::1'):
+        try:
+            s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            try:
+                s.connect((probe, 443))     # UDP 不发包, 仅查 IPv6 路由
+                ok = True
+            finally:
+                s.close()
+            if ok:
+                break
+        except OSError:
+            ok = False
+    with _IPV6_GATE_LOCK:
+        _IPV6_GATE[0], _IPV6_GATE[1] = ok, time.time()
+    return ok
 
 # ── 手动指定 IP（2026-10-08 加）──────────────────────────────────────────────
 # 现场救急用：自动探测一个都不通时，让用户填一个他这条线能连上的官方 IP。
@@ -1433,6 +1464,10 @@ class Health(object):
 
     def refresh(self, ips=None, timeout=3.0):
         ips = ips or CANDIDATE_IPS
+        # IPv6 闸门: 本机没有 IPv6 出口时不浪费探测名额(IPv6 候选保留在池子里,
+        # 哪天 IPv6 通了/修好了, 下一轮体检自然把它们捡起来用)。
+        if not local_has_ipv6():
+            ips = [ip for ip in ips if ':' not in ip]
         with ThreadPoolExecutor(max_workers=12) as pool:
             res = list(pool.map(lambda ip: (ip, self._probe(ip, timeout)), ips))
         good = sorted([(i, m) for i, m in res if m is not None], key=lambda x: x[1])
