@@ -3,10 +3,32 @@
 
 <h1>狐径 FoxPath</h1>
 
-<img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square">
+<a href="https://github.com/kele551/FoxPath/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
 <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?style=flat-square">
-<img alt="Version" src="https://img.shields.io/badge/version-v1.1.1-blue?style=flat-square">
-<img alt="Downloads" src="https://img.shields.io/github/downloads/kele551/FoxPath/total?style=flat-square&label=downloads&color=green">
+<a href="https://github.com/kele551/FoxPath/releases"><img alt="Release" src="https://img.shields.io/github/v/release/kele551/FoxPath?style=flat-square&label=release&color=blue"></a>
+<img alt="Release Date" src="https://img.shields.io/github/release-date/kele551/FoxPath?style=flat-square&label=release%20date&color=blueviolet">
+<a href="https://github.com/kele551/FoxPath/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/kele551/FoxPath/total?style=flat-square&label=downloads&color=green"></a>
+
+<a href="https://github.com/kele551/FoxPath/stargazers"><img alt="GitHub Star" src="https://img.shields.io/github/stars/kele551/FoxPath?style=flat-square&logo=github&label=GitHub%20Star&color=gold"></a>
+<a href="https://gitee.com/kele551/FoxPath"><img alt="Gitee Star" src="https://gitee.com/kele551/FoxPath/badge/star.svg"></a>
+<a href="https://github.com/kele551/FoxPath/network/members"><img alt="GitHub Fork" src="https://img.shields.io/github/forks/kele551/FoxPath?style=flat-square&label=GitHub%20Fork&color=blue"></a>
+<a href="https://gitee.com/kele551/FoxPath"><img alt="Gitee Fork" src="https://gitee.com/kele551/FoxPath/badge/fork.svg"></a>
+<a href="https://github.com/kele551/FoxPath/issues"><img alt="Issues" src="https://img.shields.io/github/issues/kele551/FoxPath?style=flat-square&label=issues"></a>
+<img alt="Issues Closed" src="https://img.shields.io/github/issues-closed/kele551/FoxPath?style=flat-square&label=resolved">
+<a href="https://github.com/kele551"><img alt="Follow Author" src="https://img.shields.io/github/followers/kele551?style=flat-square&logo=github&label=follow%20author"></a>
+
+<img alt="Last Commit" src="https://img.shields.io/github/last-commit/kele551/FoxPath?style=flat-square&label=last%20commit&color=blue">
+<img alt="Commit Activity" src="https://img.shields.io/github/commit-activity/y/kele551/FoxPath?style=flat-square&label=commits%2Fyear&color=blue">
+<img alt="Contributors" src="https://img.shields.io/github/contributors/kele551/FoxPath?style=flat-square&label=contributors&color=blue">
+<img alt="Language" src="https://img.shields.io/github/languages/top/kele551/FoxPath?style=flat-square">
+<img alt="Code Size" src="https://img.shields.io/github/languages/code-size/kele551/FoxPath?style=flat-square&label=code%20size">
+<a href="https://github.com/kele551/FoxPath/blob/main/CONTRIBUTING.md"><img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square"></a>
+
+<img alt="No Admin" src="https://img.shields.io/badge/管理员权限-不需要-brightgreen?style=flat-square">
+<img alt="No Hosts DNS" src="https://img.shields.io/badge/hosts%2FDNS-不改-brightgreen?style=flat-square">
+<img alt="Zero Deps" src="https://img.shields.io/badge/第三方依赖-零-green?style=flat-square">
+<a href="https://www.bilibili.com/video/BV1tupx6kEPt"><img alt="Bilibili Demo" src="https://img.shields.io/badge/B站-演示视频-00a1d6?style=flat-square&logo=bilibili&logoColor=white"></a>
+<a href="https://github.com/kele551/FoxPath/issues"><img alt="Feedback" src="https://img.shields.io/badge/反馈-欢迎提Issue-orange?style=flat-square"></a>
 
 <p>🦊 <b>GitHub 访问优化助手</b>　——　只在本机做网络分流，不改 hosts、不改系统 DNS，退出即还原</p>
 
@@ -81,15 +103,9 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 
 **首次启动请等 15～20 秒**：程序要并发体检 49 个候选 IP，体检完成前代理还没完全生效。
 
-> **本次更新了安装包，但版本号没有变。**
-> 升级检查是拿「线上版本号」和「你本地的版本号」比的 —— 版本号没变，
-> **已经装着同一个版本号的朋友不会收到升级提示**；比线上旧的版本仍会正常自动升级。
-> 如果你用着不顺畅（例如**面板「日志」那一栏一直是空白的**、**搜出来的 IP 延迟虚高**），
-> 可以**重新下载最新安装包**覆盖安装一次，你的配置与收藏都会保留；更新内容以发行页说明为准。
->
-> 最新安装包里，**IP 延迟不再把 HTTP 超时算进去**（以前慢线路会被显示成"延迟很高"），
-> 代理**只接管 GitHub 相关域名**（`github.com` / `githubusercontent.com` / `github.io` 等），
-> 其余流量一律不经过它；仓库源码的同步会随后统一提交。
+> 升级最简单的方式是面板里的「检查更新 → 立即升级」（v1.1.1 起手动检查强制联网，不再被缓存挡住）。
+> 万一升级源也连不上，到 [Gitee 发行页](https://gitee.com/kele551/FoxPath/releases) 下载最新 `FoxPath.exe`
+> 覆盖安装即可，配置与收藏全部保留、无需卸载。
 
 ### 控制面板上有什么
 
@@ -288,10 +304,11 @@ python tools/preflight_release.py --dry-run    # 只跑静态项：不写注册�
 <summary><b>版本记录</b>（点击展开）</summary>
 
 
-> 当前对外发布版本是 **v1.0.8**（2026-10-10，Gitee 与 GitHub 同步；
-> 已随 v1.0.8 发布：一次完整的源码体检之后的修复（自检脚本可在仓库内直接运行、
-> 升级脚本的版本号转义、移除遗留的一次性图标脚本）。
-> 上一版 **v1.0.7**：升级护栏（拒绝降级、失败自动回滚、小助手不再把 _PYI_* 传给新版本）。
+> 当前对外发布版本是 **v1.1.1**（2026-10-12，Gitee 与 GitHub 同步）：
+> 「检查更新」强制联网（修复 6 小时缓存挡住升级提示的问题）、exe 下载支持 `mirrors[]` 多源回退。
+> 上一版 **v1.1.0**（2026-10-12，重大更新）：吞吐挑 IP、raw/pages IPv6 双池、
+> 好 IP 复用 + 失败降权、头像域纳入代理、静默启动、PAC 总闸修正。
+> 再往前：**v1.0.8**（2026-10-10）升级链路加固与仓库治理；**v1.0.7** 升级护栏（拒绝降级、失败自动回滚）。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
@@ -303,6 +320,9 @@ python tools/preflight_release.py --dry-run    # 只跑静态项：不写注册�
 | v1.0.5 | 2026-09-22 | **网页版在线升级**：控制面板里检查更新、版本迁移动画 + 渐变色进度条，下载到 `.new` 校验 SHA256 后由独立小助手接管（先让旧程序退出并还原系统代理 → 覆盖 → 重启） |
 | v1.0.6 | 2026-10-08 | **联通/移动友好**：内置候选池扩到官方全量 45 个 IPv4；IP 表三源依次兜底（官方 `meta` → Gitee 上的 `meta.json` → GitHub raw）；`raw.githubusercontent.com` / `objects.githubusercontent.com` 改走**专属 IP 池**（官方 `185.199.108.0/22`），raw 文件与发布附件也能加速（回应 Issue #1）；429 限流视为存活（实测可用 19/49 → 31/49）；面板新增「线路体检」与「手动指定 IP」；升级小助手加固（覆盖后轮询确认新实例真的起来、递增重试、失败弹窗提示手动双击）；对外文案措辞中性化 |
 | v1.0.7 | 2026-10-09 | **升级护栏**：① 版本号按语义比较，**拒绝把降级当升级**（面板置灰 + 服务端拦截）；② 升级失败**自动回滚**旧版；③ 找到「升级后起不来」的**真因**（小助手把 `_PYI_*`/`_MEIPASS*` 环境变量传给了新版本，导致引导程序误判已解包）；④ 升级结果气泡 + 回执文件 |
+| v1.0.8 | 2026-10-10 | 升级链路加固与仓库治理（10-11 曾同版本号换过一次包） |
+| v1.1.0 | 2026-10-12 | **重大更新**：吞吐挑 IP、raw/pages IPv6 双池、IPv6 闸门、好 IP 复用 + 失败降权、头像域纳入代理、静默启动、PAC 总闸修正 |
+| v1.1.1 | 2026-10-12 | 「检查更新」强制联网（修 6 小时缓存挡升级提示）；exe 下载多源回退 `mirrors[]`；手动下载口径进文档 |
 
 详细发行说明见 [release-notes.md](release-notes.md)。
 
