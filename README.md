@@ -1,6 +1,6 @@
-![浏览量](https://count.getloli.com/get/@gitee-kele551-FoxPath?theme=normal-1)
-
 <div align="center">
+<img src="https://count.getloli.com/get/@gitee-kele551-FoxPath?theme=normal-1" alt="浏览量">
+
 <img src="docs/icon.png" alt="狐径 FoxPath" height="120" width="120">
 
 <h1>狐径 FoxPath</h1>
