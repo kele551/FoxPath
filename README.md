@@ -1,3 +1,5 @@
+![浏览量](https://count.getloli.com/get/@gitee-kele551-FoxPath)
+
 ﻿<div align="center">
 <img src="docs/icon.png" alt="狐径 FoxPath" height="120" width="120">
 
