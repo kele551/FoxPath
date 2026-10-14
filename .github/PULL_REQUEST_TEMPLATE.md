@@ -28,7 +28,7 @@ python build_exe.py
 - [ ] **没有整文件重写行尾**：仓库文本文件是 **CRLF**，我的编辑器没把它变成 LF（`git diff --stat` 不应出现"整个文件都变了"）
 - [ ] 没把私人邮箱、令牌、口令写进任何文件（对外文档里反馈入口一律用 Issues 链接）
 - [ ] 没动 `version.json`（升级源）与 `github_direct.py` 里国内分发链路用的地址，除非这就是一次发版
-- [ ] 对外文案没有用禁用词，改用中性技术表述（清单见 [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md)）
+- [ ] 对外文案没有用禁用词，改用中性技术表述（清单见 [CONTRIBUTING.md](CONTRIBUTING.md)）
 - [ ] 改了行为的话，README 的「已知边界」或《使用说明》对应段落一起改了 —— 文档与实现不能各说各话
 - [ ] **没有新增第三方依赖**（主程序只用 Python 标准库；打包只额外需要 pyinstaller）
 - [ ] 新增/修改的 `.ps1` 是 **UTF-8 带 BOM**
