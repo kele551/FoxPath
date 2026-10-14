@@ -34,9 +34,9 @@ FILES = [
     'publish_files.py',
     'app.ico',
     '使用说明.txt',
-    'release-notes.md',
-    'Fix-GitHub.ps1',
-    'Run-GitHubFix.bat',
+    'docs/release-notes.md',
+    'tools/Fix-GitHub.ps1',
+    'tools/Run-GitHubFix.bat',
 ]
 
 VERSION = 'v1.1.1'      # 提交信息里的版本号, 改版本时同步改这里(已并入 tools/publish.py 的自动改版)
