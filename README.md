@@ -1,6 +1,4 @@
 <div align="center">
-<img src="https://count.getloli.com/get/@gitee-kele551-FoxPath?theme=normal-1" alt="浏览量">
-
 <img src="docs/icon.png" alt="狐径 FoxPath" height="120" width="120">
 
 <h1>狐径 FoxPath</h1>
@@ -25,6 +23,8 @@
 <a href="https://github.com/kele551/FoxPath"><img alt="GitHub mirror" src="https://img.shields.io/badge/%F0%9F%90%99_%E6%BA%90%E7%A0%81-GitHub%E9%95%9C%E5%83%8F-24292f?style=flat-square&logo=github&logoColor=white&labelColor=3d4552"></a>
 <a href="https://www.bilibili.com/video/BV1tupx6kEPt"><img alt="Bilibili demo" src="https://img.shields.io/badge/%F0%9F%93%BA_%E6%BC%94%E7%A4%BA-B%E7%AB%99%E8%A7%86%E9%A2%91-00a1d6?style=flat-square&logo=bilibili&logoColor=white&labelColor=3d4552"></a>
 <a href="https://github.com/kele551/FoxPath/issues"><img alt="Issues" src="https://img.shields.io/badge/%F0%9F%90%9E_%E5%8F%8D%E9%A6%88-%E6%8F%90Issue-0969da?style=flat-square&labelColor=3d4552"></a>
+
+<img src="https://count.getloli.com/get/@gitee-kele551-FoxPath?theme=normal-1" alt="浏览量">
 
 <p>🦊 <b>GitHub 访问优化助手</b>　——　只在本机做网络分流，不改 hosts、不改系统 DNS，退出即还原</p>
 
