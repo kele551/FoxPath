@@ -357,11 +357,13 @@ MIT
 
 如果 **狐径 FoxPath** 帮到了你，**给仓库点个 Star ⭐** 就是最好的支持 —— 它能让更多人看到这个项目。
 
-如果想再进一步，也可以请作者喝杯咖啡（**完全自愿，不影响任何功能**）：
+如果想再进一步，请作者喝杯咖啡（**完全自愿，不影响任何功能**）：
 
-| 微信（WeChat） | 支付宝（Alipay） |
-|:---:|:---:|
-| <img src="docs/qr-wechat.png" alt="微信收款码" width="220" height="220"> | <img src="docs/qr-alipay.png" alt="支付宝收款码" width="220" height="220"> |
+<p align="center">
+  <img src="docs/qr-sponsor.png" alt="海风的微信赞赏码" width="260">
+  <br>
+  <sub>微信扫一扫 · 金额随缘</sub>
+</p>
 
 > 本项目以 MIT 协议自由开源，**没有付费版、也没有付费功能**；捐赠纯属自愿，
 > 与功能开放、版本更新、Issue 响应**没有任何关系**。
