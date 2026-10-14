@@ -25,7 +25,7 @@
 <a href="https://github.com/kele551/FoxPath/issues"><img alt="Issues" src="https://img.shields.io/badge/%F0%9F%90%9E_%E5%8F%8D%E9%A6%88-%E6%8F%90Issue-0969da?style=flat-square&labelColor=3d4552"></a>
 <a href="#sponsor"><img alt="Sponsor" src="https://img.shields.io/badge/%E2%98%95_%E8%B5%9E%E8%B5%8F-%E8%AF%B7%E5%96%9D%E5%92%96%E5%95%A1-ff69b4?style=flat-square&labelColor=3d4552"></a>
 
-<img src="https://count.getloli.com/get/@gitee-kele551-FoxPath?theme=normal-1" alt="浏览量">
+<img src="https://count.getloli.com/get/@gitee-kele551-FoxPath?theme=normal-1" alt="浏览量" height="36">
 
 <p>🦊 <b>GitHub 访问优化助手</b>　——　只在本机做网络分流，不改 hosts、不改系统 DNS，退出即还原</p>
 
