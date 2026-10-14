@@ -249,10 +249,10 @@ def load_notes(ver, notes_file=None):
             sys.exit('--notes 指定的文件不存在: %s' % p)
         return p.read_text(encoding='utf-8')
 
-    rn = REPO_DIR / 'release-notes.md'
+    rn = REPO_DIR / 'docs' / 'release-notes.md'
     if not rn.exists():
-        sys.exit('既没有 --notes，也找不到 release-notes.md，无法确定发布说明。\n'
-                 '请补一份 release-notes.md（首行形如「狐径 FoxPath v%s — 标题」）'
+        sys.exit('既没有 --notes，也找不到 docs/release-notes.md，无法确定发布说明。\n'
+                 '请补一份 docs/release-notes.md（首行形如「狐径 FoxPath v%s — 标题」）'
                  '或用 --notes <文件> 指定。' % ver)
     text = rn.read_text(encoding='utf-8')
     first = next((l for l in text.splitlines() if l.strip()), '')
