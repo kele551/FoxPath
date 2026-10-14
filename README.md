@@ -43,7 +43,7 @@
 <img alt="Gitee Fork" src="https://gitee.com/kele551/FoxPath/badge/fork.svg">
 <img alt="Language" src="https://img.shields.io/github/languages/top/kele551/FoxPath?style=flat-square">
 <img alt="Code Size" src="https://img.shields.io/github/languages/code-size/kele551/FoxPath?style=flat-square&label=code%20size">
-<a href="https://github.com/kele551/FoxPath/blob/main/CONTRIBUTING.md"><img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square"></a>
+<a href="https://github.com/kele551/FoxPath/blob/main/.github/CONTRIBUTING.md"><img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square"></a>
 </p>
 
 </details>
@@ -54,7 +54,7 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 主程序从代码到运行都不碰 `hosts` 文件：它只把代理设置写进当前用户的注册表（HKCU），
 代理范围与还原方式见下面「原理」「核心机制」两节。
 
-> ⚠ 仓库里另有一个**独立的历史脚本** `Fix-GitHub.ps1`（配合 `Run-GitHubFix.bat`）：
+> ⚠ 仓库里另有一个**独立的历史脚本** `tools/Fix-GitHub.ps1`（配合 `tools/Run-GitHubFix.bat`）：
 > **只有它会改 `hosts`** —— 直接往系统 `hosts` 里钉 IP + 装一个计划任务定时换 IP，
 > **需要管理员权限**。它是上一代做法，与主程序**不共享代码、也不会一起运行**：
 > 用主程序就不需要它，两者**二选一**，别同时用（同时用会互相打架）。详见下方文件表。
@@ -87,8 +87,8 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 - [已知边界](#已知边界)
 - [版本记录](#版本记录)
 - [联系与反馈](#联系与反馈)
-- [代码签名政策](CODE_SIGNING_POLICY.md)
-- [贡献指南](CONTRIBUTING.md)　·　[安全政策](SECURITY.md)
+- [代码签名政策](.github/CODE_SIGNING_POLICY.md)
+- [贡献指南](.github/CONTRIBUTING.md)　·　[安全政策](.github/SECURITY.md)
 - [路线图（Roadmap）](#路线图roadmap)　·　[参与贡献与治理](#参与贡献与治理)
 - [许可](#许可)
 
@@ -202,10 +202,10 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 
 ## 从源码构建与发版自检
 
-构建命令、仓库文件说明、打包注意事项见 [CONTRIBUTING.md](CONTRIBUTING.md) 第四节与第七节；
-发版前自检（发布闸门 `tools/preflight_release.py`）的完整说明见 [CONTRIBUTING.md](CONTRIBUTING.md) 第八节。
+构建命令、仓库文件说明、打包注意事项见 [CONTRIBUTING.md](.github/CONTRIBUTING.md) 第四节与第七节；
+发版前自检（发布闸门 `tools/preflight_release.py`）的完整说明见 [CONTRIBUTING.md](.github/CONTRIBUTING.md) 第八节。
 主程序**零第三方依赖**（只用 Python 标准库）；产物由本仓库源码构建、可复现，
-逐项说明见 [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)。
+逐项说明见 [CODE_SIGNING_POLICY.md](.github/CODE_SIGNING_POLICY.md)。
 
 ---
 
@@ -277,7 +277,7 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 
 ## 版本记录
 
-> 当前对外发布版本 **v1.1.1**（2026-10-12，Gitee 与 GitHub 同步）。完整逐版说明见 [release-notes.md](release-notes.md)。
+> 当前对外发布版本 **v1.1.1**（2026-10-12，Gitee 与 GitHub 同步）。完整逐版说明见 [release-notes.md](docs/release-notes.md)。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
@@ -330,7 +330,7 @@ MIT
    要加的是"真的握手成功过才入池"的 IPv6 地址，而不是把段表直接塞进去。
 3. **线路自适应**：按当前线路的历史成败给候选排序，换网（宽带 ↔ 热点）后不从头再摸一遍。
 4. **代码签名申请**：产物已自带 SHA256 与可复现构建说明，下一步申请免费代码签名，
-   缓解"首次运行被安全软件拦一下"的体验问题。详见 [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)。
+   缓解"首次运行被安全软件拦一下"的体验问题。详见 [CODE_SIGNING_POLICY.md](.github/CODE_SIGNING_POLICY.md)。
 
 > 路线图只列真实在办的事，做完一项改一项；临时想到的、还没验证的想法不写在这里。
 
@@ -341,12 +341,12 @@ MIT
 | 项目 | 说明 |
 | --- | --- |
 | 维护者 | [@kele551](https://github.com/kele551)（海风），一人维护，同时担任提交者、审查者与发布批准者 |
-| 响应预期 | Issue / PR 一般 **7 天内**给第一次答复；安全类问题按 [SECURITY.md](SECURITY.md) 私下走，**3 天内**响应 |
+| 响应预期 | Issue / PR 一般 **7 天内**给第一次答复；安全类问题按 [SECURITY.md](.github/SECURITY.md) 私下走，**3 天内**响应 |
 | 许可 | MIT（见 [LICENSE](LICENSE)）；提交贡献即表示同意按同一许可发布 |
-| 怎么参与 | 提 Issue / PR 之前先看 [CONTRIBUTING.md](CONTRIBUTING.md)：Issue 模板、PR 流程、代码风格、本地构建与自查、提交信息规范都在里面 |
-| 安全 | 漏洞请**不要**开公开 Issue，按 [SECURITY.md](SECURITY.md) 私下报告 |
+| 怎么参与 | 提 Issue / PR 之前先看 [CONTRIBUTING.md](.github/CONTRIBUTING.md)：Issue 模板、PR 流程、代码风格、本地构建与自查、提交信息规范都在里面 |
+| 安全 | 漏洞请**不要**开公开 Issue，按 [SECURITY.md](.github/SECURITY.md) 私下报告 |
 | 发布纪律 | 主程序零第三方依赖；每次发布都要先跑发版前自检 `tools/preflight_release.py`（版本一致性、冷启动演练、升级演练、失败分支、退出还原）全绿，才允许上传附件 |
-| 合规 | 本项目的法律与知识产权边界见 [COMPLIANCE.md](COMPLIANCE.md)：只在本机运行、不提供代理服务、只连接服务方公开地址、不采集用户数据；不使用他人商标作为品牌名 |
+| 合规 | 本项目的法律与知识产权边界见 [COMPLIANCE.md](.github/COMPLIANCE.md)：只在本机运行、不提供代理服务、只连接服务方公开地址、不采集用户数据；不使用他人商标作为品牌名 |
 
 ---
 
