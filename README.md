@@ -27,9 +27,9 @@
 
 <img src="https://count.getloli.com/get/@gitee-kele551-FoxPath?theme=normal-1" alt="浏览量" height="36">
 
-<p>🦊 <b>GitHub 访问优化助手</b>　——　只在本机做网络分流，不改 hosts、不改系统 DNS，退出即还原</p>
+<p>🦊 <b>GitHub 访问优化助手</b>　·　只在本机做网络分流，退出即还原</p>
 
-<p>作者 <b>海风（kele551）</b>　·　Gitee（主）<a href="https://gitee.com/kele551/FoxPath">kele551/FoxPath</a>　·　GitHub（镜像）<a href="https://github.com/kele551/FoxPath">kele551/FoxPath</a></p>
+<p>作者 <b>海风（kele551）</b>　·　<a href="https://gitee.com/kele551/FoxPath">Gitee（主）</a>　·　<a href="https://github.com/kele551/FoxPath">GitHub（镜像）</a></p>
 </div>
 
 <details>
