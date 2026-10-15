@@ -64,8 +64,9 @@ GH_API = 'https://api.github.com'
 GITEE_API = 'https://gitee.com/api/v5'
 GITEE_MIN_GAP = 3.0            # Gitee 请求间隔 ≥3 秒（别把平台抓急，那是会自找 451 的）
 CORE_ASSETS = ('FoxPath.exe', 'version.json')
-# 令牌文件：优先环境变量 GITEE_TOKEN_FILE，否则用作者机器上的默认位置（只读，绝不打印明文）
-GITEE_TOKEN_FILE = os.environ.get('GITEE_TOKEN_FILE') or r'F:\Harness\secrets\raw\workbuddy-secrets\gitee_token'
+# 令牌文件：需要时用环境变量 GITEE_TOKEN_FILE 指定（例如 GITEE_TOKEN_FILE=D:\某个目录\gitee_token）。
+# 不设也能跑：走匿名访问，只是 Gitee API 更容易被限速（脚本会如实报告，不静默放过）。
+GITEE_TOKEN_FILE = os.environ.get('GITEE_TOKEN_FILE', '')
 
 USAGE = """狐径发版前自检 —— 用法
 
