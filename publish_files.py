@@ -23,7 +23,7 @@ API = 'https://api.github.com'
 #       于是其余文件全成功也永远打印"完成 14/15"并返回失败码。
 #   create_icon.py / create_icon_from_image.py / make_icon_from_user_image.py ——
 #       一次性脚本，写死了作者机器路径（其中一个还写着 Octocat 素材），与
-#       COMPLIANCE.md「图标为自绘、不含任何第三方吉祥物或标志」的声明冲突。
+#       docs/COMPLIANCE.md「图标为自绘、不含任何第三方吉祥物或标志」的声明冲突。
 #       app.ico 已入库，构建完全不需要它们。
 FILES = [
     'README.md',

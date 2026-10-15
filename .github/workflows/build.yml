@@ -2,7 +2,7 @@ name: build
 
 # 这个工作流只做一件事：在干净的 Windows runner 上，用仓库里的真实构建脚本
 # 把 FoxPath.exe 打出来，并把 SHA256 打印+存档 —— 证明"发布产物确实由本仓库源码构建"。
-# 它不发布、不上传 Release、不签名（签名步骤见 .github/CODE_SIGNING_POLICY.md，用占位注释标出）。
+# 它不发布、不上传 Release、不签名（签名步骤见 docs/CODE_SIGNING_POLICY.md，用占位注释标出）。
 
 on:
   push:
@@ -91,7 +91,7 @@ jobs:
           }
 
       # ── 代码签名占位 ───────────────────────────────────────────────
-      # 本项目正在申请免费代码签名（见 .github/CODE_SIGNING_POLICY.md）。
+      # 本项目正在申请免费代码签名（见 docs/CODE_SIGNING_POLICY.md）。
       # 通过之后，签名步骤插在这里：对 dist-staging\FoxPath.exe 签名，**然后再**算上面那份 SHA256。
       # 现在没有签名，所以产物是未签名的 —— 请以 SHA256SUMS.txt 自行核对来源。
 

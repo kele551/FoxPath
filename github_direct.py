@@ -1299,12 +1299,12 @@ def is_pages_host(host):
 
 # 【2026-10-10 修 声明不符】本代理**只允许转发 GitHub 相关域名**。
 #
-# 为什么补这一道：对外声明（COMPLIANCE.md、给组委会的材料）写的是
+# 为什么补这一道：对外声明（docs/COMPLIANCE.md、给组委会的材料）写的是
 # 「只接管 GitHub 相关域名；**不提供代理服务、不转发他人流量**」，
 # 而 `_connect()` 的兜底原来**对任何 host 都照常建隧道**（见下面那处修改），
 # 本机任意程序、或用户照教程把系统代理手填成 127.0.0.1:8787，
 # 就能把它当成通用转发用 —— 与声明直接冲突。
-# `SECURITY.md` 自己也把这一条列进"算漏洞"，只是代码一直没收。
+# `docs/SECURITY.md` 自己也把这一条列进"算漏洞"，只是代码一直没收。
 #
 # 名单口径：**基名完全相同 或 以「.基名」结尾**。
 #   · github.com            -> github.com / www.github.com / api.github.com / gist.github.com
@@ -1893,7 +1893,7 @@ class ProxyHandler(socketserver.StreamRequestHandler):
     def _connect(self, host, port):
         # 【2026-10-10 修 声明不符】先卡域名：本代理只转发 GitHub 相关域名。
         # 对外写的是「只接管 GitHub 相关域名、不转发他人流量」，
-        # 原来这里的兜底对任何 host 都建隧道，与声明冲突（SECURITY.md 自己也列了这条）。
+        # 原来这里的兜底对任何 host 都建隧道，与声明冲突（docs/SECURITY.md 自己也列了这条）。
         # 现在拒绝并记一行日志 —— 不静默，出问题能从日志看出来是谁在借用。
         if not is_github_related_host(host):
             log('拒绝转发非 GitHub 域名: %s:%s（本代理只接管 GitHub 相关域名）' % (host, port))

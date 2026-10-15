@@ -12,7 +12,7 @@ body:
           （哪些域名不走代理、被强杀后系统代理可能还指着本程序、端口占用会弹错误框等）。
         - **`foxpath.log` 最有价值**：`%LOCALAPPDATA%\FoxPath\foxpath.log` 的末尾几十行。
         - **不要贴出口 IP 之外的私人信息**；本程序不收集数据，日志里也不会有你的账号。
-        - **安全类问题不要发在这里**：如果怀疑是漏洞，请按 [SECURITY.md](https://github.com/kele551/FoxPath/blob/main/.github/SECURITY.md) 私下报告。
+        - **安全类问题不要发在这里**：如果怀疑是漏洞，请按 [SECURITY.md](https://github.com/kele551/FoxPath/blob/main/docs/SECURITY.md) 私下报告。
 
   - type: input
     id: version
