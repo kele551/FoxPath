@@ -4,7 +4,7 @@ r"""狐径 FoxPath —— 一键发布流水线（Gitee 主 + GitHub 镜像）
 和壁纸助手那份 `tools/publish.py` 是同一套路，只是产物/版本来源不同。
 
 依赖: 一枚 Gitee 私人令牌（仅勾 projects 权限），存一次长期复用。
-GitHub 侧走 `F:\Harness\tools\github_push.py`（纯 API，不用 github.com 的 git 端口）。
+GitHub 侧走一个纯 REST 的推送脚本（不用 github.com 的 git 端口；路径可用环境变量 FOXPATH_GH_PUSH 覆盖）。
 
 用法:
     python tools/publish.py set-token <令牌>
@@ -44,7 +44,8 @@ OWNER, REPO = 'kele551', 'FoxPath'
 BRANCH = 'main'
 GITEE_API = 'https://gitee.com/api/v5'
 GITEE_WEB = 'https://gitee.com'
-TOKEN_CANDIDATES = [
+TOKEN_CANDIDATES = ([
+os.environ['GITEE_TOKEN_FILE']] if os.environ.get('GITEE_TOKEN_FILE') else []) + [
     r'F:\Harness\secrets\raw\workbuddy-secrets\gitee_token',
     r'C:\Users\kele551\.workbuddy\secrets\gitee_token',
 ]
@@ -55,9 +56,9 @@ TOKEN_CANDIDATES = [
 # （真机复现过，见 logs\待发版-积压事项.md 第八节第 2 条）。桌面壁纸那边的 publish.py
 # 早就改成读环境变量了，这里是补上同样的一条。默认值保持原样（不改既有行为）。
 PY = os.environ.get('FOXPATH_PY') or r'F:\Harness\toolchain\python\envs\default\Scripts\python.exe'
-GIT_EXEC_PATH = r'F:/Harness/toolchain/PortableGit/versions/1.2.0/mingw64/bin'
+GIT_EXEC_PATH = os.environ.get('FOXPATH_GIT') or r'F:/Harness/toolchain/PortableGit/versions/1.2.0/mingw64/bin'
 GIT_EXE = GIT_EXEC_PATH + '/git.exe'        # 绝对路径: 有的执行环境按名字找不到 git(WinError 2)
-GH_PUSH = r'F:\Harness\tools\github_push.py'
+GH_PUSH = os.environ.get('FOXPATH_GH_PUSH') or r'F:\Harness\tools\github_push.py'
 EXE_NAME = 'FoxPath.exe'            # version.json 里写的就是这个名字
 
 VER_FILES = [
