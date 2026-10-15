@@ -16,7 +16,7 @@
 <a href="https://github.com/kele551/FoxPath/network/members"><img alt="GitHub Fork" src="https://img.shields.io/github/forks/kele551/FoxPath?style=flat-square&label=GitHub%20Fork&color=blue"></a>
 <a href="https://github.com/kele551"><img alt="Follow Author" src="https://img.shields.io/github/followers/kele551?style=flat-square&logo=github&label=follow%20author&color=blue"></a>
 
-<img alt="Category" src="https://img.shields.io/badge/分类-网络工具-blue?style=flat-square">
+<img alt="Category" src="https://img.shields.io/badge/分类-应用软件-blue?style=flat-square">
 <img alt="No Admin" src="https://img.shields.io/badge/管理员权限-不需要-brightgreen?style=flat-square">
 <img alt="No Hosts DNS" src="https://img.shields.io/badge/hosts·DNS-不改-brightgreen?style=flat-square">
 <img alt="Zero Deps" src="https://img.shields.io/badge/第三方依赖-零-green?style=flat-square">
