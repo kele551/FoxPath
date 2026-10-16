@@ -1,0 +1,28 @@
+# 行尾策略（2026-10-16 新增）：入库与检出**一律 LF**
+# ------------------------------------------------------------------
+# 目的：让 Gitee / GitHub / AtomGit 三个平台的同一文件**逐字节一致**。
+# 背景：本仓库此前没有 .gitattributes 而 core.autocrlf=true，工作区是 CRLF；
+#       GitHub 侧是用纯 REST 工具按「磁盘原始字节」推上去的，于是 GitHub 上
+#       一批文件是 CRLF、而 Gitee / AtomGit（走 git push，存的是 LF）是 LF ——
+#       内容完全相同，但字节不同，看起来像"三个平台不同步"。
+# 现在把策略写进仓库本身（不再依赖每台机器的 core.autocrlf）：
+#   · 入库 blob 一律 LF；检出到工作区也一律 LF；
+#   · 于是任何一次 REST 推送推的也是 LF，三平台从此逐字节一致。
+* text=auto eol=lf
+
+# 二进制文件不做任何行尾/编码转换
+*.exe   binary
+*.dll   binary
+*.pyd   binary
+*.ico   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.zip   binary
+*.mp4   binary
+
+# 打包产物 / 中间目录：只用于显式标注，不参与 diff 统计
+build/** linguist-generated=true
+dist/**  linguist-generated=true
