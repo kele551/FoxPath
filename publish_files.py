@@ -35,8 +35,6 @@ FILES = [
     'app.ico',
     '使用说明.txt',
     'docs/release-notes.md',
-    'tools/Fix-GitHub.ps1',
-    'tools/Run-GitHubFix.bat',
 ]
 
 VERSION = 'v1.1.1'      # 提交信息里的版本号, 改版本时同步改这里(已并入 tools/publish.py 的自动改版)

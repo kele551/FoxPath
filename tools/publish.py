@@ -44,21 +44,50 @@ OWNER, REPO = 'kele551', 'FoxPath'
 BRANCH = 'main'
 GITEE_API = 'https://gitee.com/api/v5'
 GITEE_WEB = 'https://gitee.com'
-TOKEN_CANDIDATES = ([
-os.environ['GITEE_TOKEN_FILE']] if os.environ.get('GITEE_TOKEN_FILE') else []) + [
-    r'F:\Harness\secrets\raw\workbuddy-secrets\gitee_token',
-    r'C:\Users\kele551\.workbuddy\secrets\gitee_token',
-]
-# 2026-10-10: 打包用的解释器必须能覆盖 —— 这个 PY 既用来跑 build_exe.py（打包），
-# 也用来跑发版前自检。**打包绝不能用 envs\default**：那是「3.13.12 的 DLL + venv 的库」
-# 混搭环境，打出来的 exe 一启动就弹
+# ---- 本机私有配置（可选，永不进仓库）----------------------------------------
+# 公开仓库里不写任何维护者本机路径。本机要用的解释器 / git / 推送脚本 / 令牌位置，
+# 一律按：① 环境变量 → ② 本机私有配置 ~/.foxpath-publish.json → ③ 与机器无关的默认值。
+# 私有配置文件示例（放在用户主目录，文件名前面有个点）：
+#   {"python": "C:\\\\Python313\\\\python.exe", "git_dir": "C:\\\\Program Files\\\\Git\\\\mingw64\\\\bin",
+#    "gh_push": "D:\\\\tools\\\\github_push.py", "token_file": "D:\\\\private\\\\gitee_token"}
+_CFG_PATH = Path.home() / '.foxpath-publish.json'
+_CFG = {}
+if _CFG_PATH.is_file():
+    try:
+        _CFG = json.loads(_CFG_PATH.read_text(encoding='utf-8'))
+    except Exception as _e:
+        print('警告: %s 解析失败(%s)，按"没有本机配置"继续' % (_CFG_PATH, _e), file=sys.stderr)
+
+_ENV_TOKEN_FILE = os.environ.get('GITEE_TOKEN_FILE') or _CFG.get('token_file')
+# 都没给就落到仓库内的 .gitee_token（已 gitignore）；也可以直接用环境变量 GITEE_TOKEN 传令牌本身
+TOKEN_CANDIDATES = [_ENV_TOKEN_FILE] if _ENV_TOKEN_FILE else [str(REPO_DIR / '.gitee_token')]
+# 2026-10-10 记下的坑（务必保留这条知识）：打包用的解释器必须能覆盖 —— 这个 PY 既用来跑
+# build_exe.py（打包），也用来跑发版前自检。**打包绝不能用 venv 混搭环境**：那种「独立
+# 3.13 的 DLL + 另一个 venv 的库」组合打出来的 exe 一启动就弹
 #   Security validation failure: unexpected name of application's home directory!
-# （真机复现过，见 logs\待发版-积压事项.md 第八节第 2 条）。桌面壁纸那边的 publish.py
-# 早就改成读环境变量了，这里是补上同样的一条。默认值保持原样（不改既有行为）。
-PY = os.environ.get('FOXPATH_PY') or r'F:\Harness\toolchain\python\envs\default\Scripts\python.exe'
-GIT_EXEC_PATH = os.environ.get('FOXPATH_GIT') or r'F:/Harness/toolchain/PortableGit/versions/1.2.0/mingw64/bin'
-GIT_EXE = GIT_EXEC_PATH + '/git.exe'        # 绝对路径: 有的执行环境按名字找不到 git(WinError 2)
-GH_PUSH = os.environ.get('FOXPATH_GH_PUSH') or r'F:\Harness\tools\github_push.py'
+# （真机复现过，见维护者工作区的发布记录）。所以要打包时请用环境变量 FOXPATH_PY 或
+# ~/.foxpath-publish.json 里的 python 明确指定一个独立的 Python 3.13。
+PY = os.environ.get('FOXPATH_PY') or _CFG.get('python') or sys.executable
+
+
+def _find_git_dir():
+    """找 git.exe 所在目录：环境变量 → 本机配置 → PATH → 常见安装位置；找不到返回空串。"""
+    for _c in (os.environ.get('FOXPATH_GIT'), _CFG.get('git_dir')):
+        if _c and Path(_c, 'git.exe').is_file():
+            return str(_c).replace('\\', '/')
+    _w = shutil.which('git')
+    if _w:
+        return str(Path(_w).parent).replace('\\', '/')
+    for _c in (r'C:\Program Files\Git\cmd', r'C:\Program Files (x86)\Git\cmd'):
+        if Path(_c, 'git.exe').is_file():
+            return _c.replace('\\', '/')
+    return ''
+
+
+GIT_EXEC_PATH = _find_git_dir()
+# 有绝对路径就用绝对路径: 有的执行环境按名字找不到 git(WinError 2)
+GIT_EXE = (GIT_EXEC_PATH + '/git.exe') if GIT_EXEC_PATH else 'git'
+GH_PUSH = os.environ.get('FOXPATH_GH_PUSH') or _CFG.get('gh_push') or str(REPO_DIR / 'tools' / 'github_push.py')
 EXE_NAME = 'FoxPath.exe'            # version.json 里写的就是这个名字
 
 VER_FILES = [
@@ -123,8 +152,9 @@ def make_version_json(notes=''):
 
 def run(cmd, cwd=REPO_DIR, check=True):
     e = os.environ.copy()
-    e['GIT_EXEC_PATH'] = GIT_EXEC_PATH
-    e['PATH'] = GIT_EXEC_PATH.replace('/', os.sep) + os.pathsep + e.get('PATH', '')
+    if GIT_EXEC_PATH:                       # 没找到 git 目录就交给 PATH 上那个 git
+        e['GIT_EXEC_PATH'] = GIT_EXEC_PATH
+        e['PATH'] = GIT_EXEC_PATH.replace('/', os.sep) + os.pathsep + e.get('PATH', '')
     cmd = list(cmd)
     if cmd and cmd[0] == 'git':             # 不靠 PATH 找, 直接用绝对路径
         cmd[0] = GIT_EXE.replace('/', os.sep)

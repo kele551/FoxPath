@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>狐径 FoxPath · GitHub 访问优化助手</title>
+<style>
+  :root{--bg:#f6f8fa;--card:#fff;--text:#1f2328;--muted:#59636e;--accent:#0969da;--border:#d1d9e0}
+  @media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#151b23;--text:#f0f6fc;--muted:#9198a1;--accent:#4493f8;--border:#3d444d}}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+  .card{max-width:640px;width:100%;background:var(--card);border:1px solid var(--border);border-radius:16px;padding:40px;text-align:center}
+  .icon{width:88px;height:88px;border-radius:20px;margin:0 auto 20px;display:block}
+  h1{font-size:26px;margin-bottom:8px}
+  .tagline{color:var(--muted);font-size:15.5px;line-height:1.7;margin-bottom:22px}
+  ul{list-style:none;text-align:left;max-width:430px;margin:0 auto 24px;color:var(--muted);font-size:14.5px;line-height:2}
+  .btn{display:inline-block;background:var(--accent);color:#fff;text-decoration:none;padding:11px 20px;border-radius:9px;font-weight:600;font-size:15px;margin:4px}
+  .btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--border)}
+  .foot{margin-top:22px;color:var(--muted);font-size:13px;line-height:1.9}
+  .foot a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="card">
+  <img class="icon" src="icon.png" alt="狐径 FoxPath">
+  <h1>狐径 FoxPath</h1>
+  <p class="tagline">GitHub 访问优化助手 —— 只在本机做网络分流，退出即还原</p>
+  <ul>
+    <li>不依赖域名解析：直接连当前实测可用的官方 IP</li>
+    <li>按实测吞吐挑线路，IPv4 / IPv6 双池</li>
+    <li>不改 hosts、不改系统 DNS，不需要管理员权限</li>
+    <li>绿色单文件，退出时还原系统设置</li>
+  </ul>
+  <a class="btn" href="https://gitee.com/kele551/FoxPath/releases/latest">⬇ 下载最新版（Gitee 主源）</a>
+  <a class="btn ghost" href="https://github.com/kele551/FoxPath">GitHub 仓库</a>
+  <a class="btn ghost" href="demo/">演示视频</a>
+  <div class="foot">MIT License · 作者：海风（kele551）<br>
+    <a href="https://gitee.com/kele551/FoxPath">Gitee（主）</a> ·
+    <a href="https://github.com/kele551/FoxPath">GitHub（镜像）</a></div>
+</div>
+</body>
+</html>

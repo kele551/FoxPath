@@ -135,8 +135,7 @@ fix: 升级源缺少 sha256 时拒绝升级，不再直接放行
 | 文件 | 说明 |
 | --- | --- |
 | `github_direct.py` | 主程序：代理、PAC、体检、控制面板（推荐用这个） |
-| `tools/Fix-GitHub.ps1` | **历史脚本，仓库里只有它会改 `hosts`**：往 `hosts` 里钉 IP + 装计划任务定时换；**需要管理员权限**，与主程序二选一（主程序不碰 `hosts`） |
-| `tools/Run-GitHubFix.bat` | 以管理员身份拉起 `tools/Fix-GitHub.ps1`（会弹 UAC） |
+| （已移除）`Fix-GitHub.ps1` / `Run-GitHubFix.bat` | 上一代做法的历史脚本：改 `hosts` + 装计划任务 + 需要管理员权限。**2026-10-16 已从仓库移除**，以符合「不改 `hosts`、不改系统 DNS、不需要管理员权限」的承诺；以前跑过它的用户请见 `使用说明.txt` 第 8 节的收尾办法 |
 | `build_exe.py` | PyInstaller 打包脚本 |
 | `make_version_json.py` | 生成升级源 `version.json`（版本号 + exe 指纹 + 字节数） |
 | `tools/preflight_release.py` | **发版前自检闸门**（发布前必须全绿），见下方「发版前自检」 |
