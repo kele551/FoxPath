@@ -52,7 +52,7 @@ def sign_file(raw, out_path, key_path):
     sig = ed.signature(raw, load_seed(key_path)).hex()
     if not re.fullmatch(r'[0-9a-f]{128}', sig):
         raise SystemExit('签出来的东西长度不对（预期 128 个十六进制字符），拒绝写出: %d' % len(sig))
-    with io.open(out_path, 'w', encoding='utf-8', newline='') as f:
+    with io.open(out_path + '.sig', 'w', encoding='utf-8', newline='') as f:
         f.write(sig)
     return sig
 
