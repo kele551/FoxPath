@@ -93,7 +93,13 @@ EXE_NAME = 'FoxPath.exe'            # version.json 里写的就是这个名字
 VER_FILES = [
     ('github_direct.py', re.compile(r"(APP_VERSION\s*=\s*')[0-9.]+(')"),
      lambda v: r"\g<1>%s\g<2>" % v),
-    ('README.md', re.compile(r'(version-v)[0-9.]+(-blue)'),
+    # README 早已不用静态版本徽章（改用 shields.io 动态徽章 img.shields.io/github/v/release），
+    # 所以不能再匹配 version-vX.Y.Z-blue —— 那条规则早就一条都命中不了（死配置）。
+    # 现在要改的是「版本记录」一节里那句当前版本文字。
+    ('README.md', re.compile(r'(当前对外发布版本 \*\*v)[0-9.]+(\*\*)'),
+     lambda v: r"\g<1>%s\g<2>" % v),
+    # 安全政策里也写着「最新发布版（当前 **vX.Y.Z**）」，发版同样要改。
+    ('docs/SECURITY.md', re.compile(r'(当前 \*\*v)[0-9.]+(\*\*)'),
      lambda v: r"\g<1>%s\g<2>" % v),
     ('publish_files.py', re.compile(r"^(VERSION\s*=\s*'v)[0-9.]+(')", re.M),
      lambda v: r"\g<1>%s\g<2>" % v),
