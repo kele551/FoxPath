@@ -519,6 +519,22 @@ def _sign_drill_source(feedp):
         return False
 
 
+_HTTP_SERVERS = []
+
+
+def _start_local_http(root_dir):
+    """给升级演练起一个**只监听 127.0.0.1** 的临时 http 服务，把 root_dir 当文档根。
+    客户端下载 exe 只认 https / 回环 http，所以演练源必须走 http 而不是 file://。"""
+    import functools
+    import http.server
+    import threading
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=root_dir)
+    srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    _HTTP_SERVERS.append(srv)
+    return srv, 'http://127.0.0.1:%d' % srv.server_address[1]
+
+
 def check_update_signature():
     """①-e：.sig 存在且格式对 → 用客户端内置公钥验签必须过 → 两个负例必须验不过。"""
     print()
@@ -749,14 +765,17 @@ try:
             new_sha = sha(NEW999)
             check_warn('升级演练的"旧版"与"新版"指纹不同（比 sha256 才有意义）',
                        sha(old) != new_sha, 'old=%s new999=%s' % (sha(old)[:12], new_sha[:12]))
+        _new_name = os.path.basename(NEW999) or 'FoxPath-9.9.9-test.exe'
+        shutil.copy2(NEW999, os.path.join(os.path.dirname(old), _new_name))
+        _srv, _base = _start_local_http(os.path.dirname(old))
         feed = {'version': '9.9.9', 'notes': 'preflight',
-                'exe': {'sha256': new_sha, 'url': 'file:///' + NEW999.replace('\\', '/'),
+                'exe': {'sha256': new_sha, 'url': '%s/%s' % (_base, _new_name),
                         'size': os.path.getsize(NEW999) if os.path.exists(NEW999) else 0}}
         feedp = os.path.join(TMP, 'upgrade', 'version.json')
         io.open(feedp, 'w', encoding='utf-8', newline='\n').write(
             json.dumps(feed, ensure_ascii=False))
         _sign_drill_source(feedp)
-        io.open(url_txt, 'w', encoding='utf-8').write(feedp)
+        io.open(url_txt, 'w', encoding='utf-8').write('%s/version.json' % _base)
         tmp_files.append(url_txt)
         for f in (cache, os.path.join(DATA, 'update.log')):
             try:
@@ -855,13 +874,14 @@ try:
     bad_sha = 'F' * 64
     # 2026-10-09：这里必须用**比当前(9.9.9)更高**的版本号 —— 否则会被"拒绝降级"的新护栏
     # 挡在下载之前，压根走不到"校验不过"那条路（那次演练报的就是这个假红）。
+    _srv2, _base2 = _start_local_http(os.path.dirname(bad))
     feed2 = {'version': '9.9.10', 'notes': 'preflight-bad',
-             'exe': {'sha256': bad_sha, 'url': 'file:///' + CAND.replace('\\', '/'),
+             'exe': {'sha256': bad_sha, 'url': '%s/FoxPath.exe' % _base2,
                      'size': os.path.getsize(CAND)}}
     feedp2 = os.path.join(TMP, 'bad', 'version.json')
     io.open(feedp2, 'w', encoding='utf-8', newline='\n').write(json.dumps(feed2, ensure_ascii=False))
     _sign_drill_source(feedp2)
-    io.open(url_txt, 'w', encoding='utf-8').write(feedp2)
+    io.open(url_txt, 'w', encoding='utf-8').write('%s/version.json' % _base2)
     try:
         os.remove(cache)
     except OSError:
@@ -896,6 +916,12 @@ finally:
         pass
     time.sleep(6)
     kill_app()
+    for _s in _HTTP_SERVERS:
+        try:
+            _s.shutdown()
+            _s.server_close()
+        except Exception:
+            pass
     # 2026-10-09：把演练碰过的真实文件原样放回去（用户面板不该看到演练的假记录）
     for _bak, _dst in _restore:
         try:
