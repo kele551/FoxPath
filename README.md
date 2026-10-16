@@ -80,7 +80,8 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 **上手与用法**：[三步上手](#三步上手) · [解决什么问题](#解决什么问题) · [用法](#用法)
 **原理与边界**：[原理](#原理) · [核心机制](#核心机制) · [升级时请注意](#升级时请注意) · [已知边界](#已知边界)
 **版本与构建**：[版本记录](#版本记录) · [从源码构建与发版自检](#从源码构建与发版自检) · [路线图（Roadmap）](#路线图roadmap)
-**治理文档**：[贡献指南](docs/CONTRIBUTING.md) · [安全政策](docs/SECURITY.md) · [代码签名政策](docs/CODE_SIGNING_POLICY.md) · [参与贡献与治理](#参与贡献与治理) · [联系与反馈](#联系与反馈) · [许可](#许可)
+**治理文档**：[贡献指南](docs/CONTRIBUTING.md) · [安全政策](docs/SECURITY.md) · [代码签名政策](docs/CODE_SIGNING_POLICY.md) · [参与贡献与治理](#参与贡献与治理) · [联系与反馈](#联系与反馈) · [许可](#许可) · [第三方组件与许可](#第三方组件与许可)
+**上手代码**：[项目结构与上手路线](docs/ARCHITECTURE.md) —— 15 分钟看懂从哪进、改哪儿、改完怎么验
 
 ---
 
@@ -247,6 +248,24 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 ## 许可
 
 MIT
+
+---
+
+## 第三方组件与许可
+
+**主程序零第三方依赖**：`github_direct.py` 只用 Python 标准库（socket / ssl / http.server / winreg / json …），
+所以发布的 `FoxPath.exe`、或直接 `python github_direct.py` 运行，都**不需要装任何第三方包**。
+
+只有"开发 / 发布用"的脚本依赖下面两个包（不参与程序运行、也不进 exe）：
+
+| 组件 | 用途 | 许可 |
+|---|---|---|
+| PyInstaller | 把主程序打包成单文件 exe（`build_exe.py`） | GPLv2-or-later **+ 官方特殊例外**（允许把用它打包的程序按自身许可分发） |
+| requests | 发布流水线（`tools/publish.py` 调 Gitee API、下载回验） | Apache-2.0 |
+
+- 版本口径写在 [requirements.txt](requirements.txt)，打包版本固定，便于复现；
+- 打包进 exe 的 Python 运行时是 Python 3.13（PSF 许可）；
+- 本项目**不随发行版分发任何第三方素材**（图标为自绘，见 [COMPLIANCE.md](docs/COMPLIANCE.md)）。
 
 ---
 
