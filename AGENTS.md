@@ -46,3 +46,25 @@ python tools/preflight_release.py  # 发版前自检（发布前必须全绿）
 ## 任务从哪来
 
 GitHub Issues 里带 `good first issue` / `help wanted` 标签的条目，每条都写了**验收标准**。
+仓库里还有一份机器可读的任务清单 [TASKS.md](TASKS.md)。
+
+---
+
+## English summary (for AI agents)
+
+- **What it is**: a **single-file** Windows app — `github_direct.py` (~4700 lines) packaged as `FoxPath.exe`.
+  It runs a small local proxy for GitHub-related domains only, connects to GitHub IPs verified by a real TLS
+  handshake plus a throughput measurement, and restores system settings on exit.
+- **Run / verify**: `python github_direct.py` (use `--restore` to undo) · `python -m py_compile github_direct.py` ·
+  `python tools/preflight_release.py` (the release gate — must be all green before publishing).
+- **Never**:
+  - add anything that modifies `hosts` / system DNS or requires admin rights — that contradicts the project's
+    compliance statement (a legacy script doing exactly that was removed in Oct 2026);
+  - add a system setting without a matching restore path;
+  - rewrite line endings wholesale (this repo stores **CRLF**); new `.ps1` files must be **UTF-8 with BOM**;
+  - introduce local machine paths, private emails or tokens into the repo;
+  - banned wording anywhere: 绕过 / 翻墙 / 梯子 / 科学上网 / 墙 / 破解 / 屏蔽 (Gitee once flagged the repo over this);
+  - don't change the author strings (`海风（kele551）` / `HaiFeng (kele551)`).
+- **Commits**: one change per commit, Chinese conventional prefixes (`fix:` / `feat:` / `docs:` / `chore:`),
+  and state how you verified it (which network, which domains, whether the system proxy was restored).
+- **Backlog**: [TASKS.md](TASKS.md) and issues labelled `good first issue`.

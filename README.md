@@ -29,7 +29,7 @@
 
 <p>🦊 <b>GitHub 访问优化助手</b>　·　只在本机做网络分流，退出即还原</p>
 
-<p>作者 <b>海风（kele551）</b>　·　<a href="https://gitee.com/kele551/FoxPath">Gitee（主）</a>　·　<a href="https://github.com/kele551/FoxPath">GitHub（镜像）</a></p>
+<p>作者 <b>海风（kele551）</b>　·　<a href="https://gitee.com/kele551/FoxPath">Gitee（主）</a>　·　<a href="https://github.com/kele551/FoxPath">GitHub（镜像）</a>　·　<a href="docs/README_EN.md">English</a></p>
 </div>
 
 <details>
