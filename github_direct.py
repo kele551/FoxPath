@@ -68,7 +68,7 @@ except Exception:
     UPDATE_SIG_AVAILABLE = False
 
 APP_NAME = '狐径'
-APP_VERSION = '1.1.1'
+APP_VERSION = '1.2.0'
 # 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
 AUTHOR = '海风（kele551）'
 AUTHOR_ASCII = 'HaiFeng (kele551)'
@@ -3726,7 +3726,12 @@ def apply_update_async(auto=False):
     # 只认 https(与升级源同一口径); 首个成功即采用, 全失败时把"试过哪几家"写清楚 ——
     # 不再一句"下载失败"让人猜。mirrors 对老版本无害: 1.0.x 只读 url, 多出来的字段忽略。
     urls = [str(node.get('url') or '')] + [str(u) for u in (node.get('mirrors') or [])]
-    urls = [u for u in urls if u.lower().startswith('https://')]
+    # 生产只认 https；**例外**：本机回环 http（127.0.0.1 / localhost）放行 —— 仅供
+    # 发版前升级演练用（演练在本地起 http 服务当"升级源"），回环地址拿不到也被远程攻击者利用不了。
+    urls = [u for u in urls
+            if u.lower().startswith('https://')
+            or u.lower().startswith('http://127.0.0.1')
+            or u.lower().startswith('http://localhost')]
     sha, err, tried = '', '', []
     for idx, u in enumerate(urls):
         sha, err = _download_to(new, u, int(node.get('size') or 0))
