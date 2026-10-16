@@ -1,0 +1,48 @@
+# AGENTS.md —— 给 AI 编程助手的协作说明（狐径 FoxPath）
+
+> 这份文件面向用 AI 助手（Claude Code / Codex / Cursor / DSH 等）改这个仓库的人。
+> **动手前先读 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**（结构、改哪儿、怎么验）；人类贡献流程见 [CONTRIBUTING.md](docs/CONTRIBUTING.md)。
+
+## 这是什么
+
+**单文件程序**：`github_direct.py`（约 4700 行）打包成 `FoxPath.exe`。
+在本机开一个小代理，只接管 GitHub 相关域名并直连"实测可用"的官方 IP；退出时还原系统设置。
+
+**功能边界（合规底线，改代码也不能越过）**：不改 `hosts`、不改系统 DNS、不需要管理员权限、
+不提供通用代理服务、不转发他人流量。
+
+## 环境与命令
+
+```powershell
+python github_direct.py            # 跑起来（会改系统代理，退出时自动还原）
+python github_direct.py --restore  # 只做还原
+python -m py_compile github_direct.py
+python build_exe.py                # 打包（产物固定 FoxPath.exe）
+python tools/preflight_release.py  # 发版前自检（发布前必须全绿）
+```
+
+⚠ `tools/preflight_release.py` 的完整模式会**结束正在运行的 FoxPath.exe** 并改系统代理/注册表；
+请在自己机器上、心里有数时跑，跑完确认系统代理与注册表已还原。
+
+## 禁区（先看这里，再改）
+
+- **不要引入任何"改 hosts / 改系统 DNS / 要管理员权限"的功能或脚本文案** —— 这是与本项目承诺冲突的红线
+  （2026-10 就因此把仓库里的历史 hosts 脚本移除了）。
+- **所有写进系统的设置都必须有退出还原路径**；新增任何注册表/代理写入，先想清楚怎么还原、怎么验证。
+- **对外文案红线词**：绕过 / 翻墙 / 梯子 / 科学上网 / 墙 / 破解 / 屏蔽 —— 一个都不要出现
+  （Gitee 曾因这类措辞把仓库判为违规）。
+- **行尾**：本仓库入库/检出**一律 CRLF**；不要整文件重写行尾。
+- **`.ps1` 若新增，必须 UTF-8 带 BOM**。
+- **署名不要改**：`海风（kele551）` / `HaiFeng (kele551)` / `Copyright (C) 2026 HaiFeng (kele551)`。
+- **仓库里不许出现本机路径、私人邮箱、令牌**（自检会拦，改动前先自查）。
+
+## 提交与验收
+
+- 提交信息：中文，`类型: 说明`（`fix:` / `feat:` / `docs:` / `chore:`），**一次一件事**；
+- **版本号只在发版时改**（`tools/publish.py release <版本> --github`）；
+- PR / 回复里写清**你怎么验证的**：什么网络环境、测了哪些域名、退出后系统代理与注册表是否还原；
+- 涉及挑线路/体检逻辑的改动，请附上实测数据（连通率、吞吐），别只讲原理。
+
+## 任务从哪来
+
+GitHub Issues 里带 `good first issue` / `help wanted` 标签的条目，每条都写了**验收标准**。
