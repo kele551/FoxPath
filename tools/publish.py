@@ -21,16 +21,20 @@ release 依次做:
     ① 改版本号 (github_direct.py 的 APP_VERSION + README 徽章)
     ② 打包 (build_exe.py) -> FoxPath.exe（文件名不带版本号）
     ③ 生成升级源 version.json（必须与本次 exe 同一份）
-    ④ 提交 + 打 tag + 推 Gitee
-    ⑤ Gitee 建发行版 + 上传 FoxPath.exe / version.json
+    ③+ 用 Ed25519 私钥给 version.json 的**原始字节**签名 -> version.json.sig（2026-10-16 起）
+       私钥位置：环境变量 FOXPATH_ED25519_KEY → ~/.foxpath-publish.json 的 "ed25519_key" → 找不到就中止
+    ④ 提交 + 打 tag + 推 Gitee（含 version.json.sig）
+    ⑤ Gitee 建发行版 + 上传 FoxPath.exe / version.json / version.json.sig
     ⑥ 同步 GitHub（代码 + tag + Release + 附件）
-    ⑦ 验真：两个平台各下载回来比对 SHA256
+    ⑦ 验真：两个平台各下载回来比对 SHA256；并**回读线上 version.json + .sig**，
+       用客户端内置公钥真验一遍（验不过就算发布失败 —— 别让用户先发现升级通道是断的）
 """
 import hashlib
 import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -89,6 +93,31 @@ GIT_EXEC_PATH = _find_git_dir()
 GIT_EXE = (GIT_EXEC_PATH + '/git.exe') if GIT_EXEC_PATH else 'git'
 GH_PUSH = os.environ.get('FOXPATH_GH_PUSH') or _CFG.get('gh_push') or str(REPO_DIR / 'tools' / 'github_push.py')
 EXE_NAME = 'FoxPath.exe'            # version.json 里写的就是这个名字
+
+# ---- Ed25519 签名私钥（升级通道加固，2026-10-16）------------------------------
+# 取值顺序与上面那套完全一致：① 环境变量 FOXPATH_ED25519_KEY →
+# ② 本机私有配置 ~/.foxpath-publish.json 的 "ed25519_key" → ③ 找不到就**明确报错**。
+# 私钥内容只在签名那一刻读一次；本文件里既不打印它、也不把路径写死成维护者机器上的样子。
+ED25519_KEY = os.environ.get('FOXPATH_ED25519_KEY') or _CFG.get('ed25519_key') or ''
+
+
+def resolve_sign_key():
+    """确定本次发版用哪把私钥；拿不到就报清楚"该怎么办"，绝不静默跳过签名。
+
+    为什么宁可不发版：客户端**只认验过签的升级源**。要是这次漏了签名，线上就会多出
+    一份"新版本号但签名为空/不匹配"的 version.json —— 已装用户一律被拒绝，等于升级通道断掉。
+    """
+    if ED25519_KEY:
+        p = Path(ED25519_KEY)
+        if p.is_file():
+            return p
+        sys.exit('配置里的 Ed25519 私钥文件不存在: %s\n'
+                 '（环境变量 FOXPATH_ED25519_KEY，或 ~/.foxpath-publish.json 的 "ed25519_key"）' % p)
+    sys.exit('找不到 Ed25519 签名私钥 —— 拒绝发布（客户端只认验过签的升级源）。\n'
+             '任选一种方式告诉本脚本私钥在哪（私钥本身**不要**放进仓库）：\n'
+             '  ① 环境变量:  set FOXPATH_ED25519_KEY=<私钥文件路径>\n'
+             '  ② 本机私有配置 ~/.foxpath-publish.json 里加一行:  "ed25519_key": "<私钥文件路径>"\n'
+             '私钥文件的内容是 64 个十六进制字符（32 字节种子）。')
 
 VER_FILES = [
     ('github_direct.py', re.compile(r"(APP_VERSION\s*=\s*')[0-9.]+(')"),
@@ -150,10 +179,23 @@ def bump_version(ver):
     return changed
 
 
-def make_version_json(notes=''):
-    out = run([PY, 'make_version_json.py', '--notes', notes or ''])
+def make_version_json(notes='', sign_key=None):
+    """生成升级源 version.json；给了私钥就同时生成 version.json.sig（签名同一批字节）。"""
+    cmd = [PY, 'make_version_json.py', '--notes', notes or '']
+    if sign_key:
+        cmd += ['--sign-key', str(sign_key)]
+    out = run(cmd)
     print('③ 升级源 version.json:', out.strip().splitlines()[-1] if out.strip() else '')
-    return REPO_DIR / 'version.json'
+    vj = REPO_DIR / 'version.json'
+    sig = Path(str(vj) + '.sig')
+    if sign_key:
+        txt = sig.read_text(encoding='utf-8').strip() if sig.is_file() else ''
+        if not re.fullmatch(r'[0-9a-fA-F]{128}', txt):
+            sys.exit('version.json.sig 没生成或格式不对（应为 128 个十六进制字符，实际 %d 个）—— 拒绝发布。\n'
+                     '客户端只认验过签的升级源，发一份没签名的出去会让已装用户一律被拒绝。' % len(txt))
+        print('③+ Ed25519 签名: %s（%d 个十六进制字符，前 16 位 %s…）'
+              % (sig.name, len(txt), txt[:16]))
+    return vj, sig
 
 
 def run(cmd, cwd=REPO_DIR, check=True):
@@ -273,6 +315,65 @@ def verify(ver, assets):
     return ok
 
 
+def _client_pubkey():
+    """从**客户端源码** github_direct.py 里解析出内置公钥。
+
+    故意解析源码、而不是在这里另写一份常量：签名的公钥和客户端内置的那把必须是同一把，
+    解析得到就天然一致；哪天换了钥匙却忘了改客户端，这里当场就对不上。
+    """
+    src = (REPO_DIR / 'github_direct.py').read_text(encoding='utf-8')
+    m = re.search(r"""UPDATE_PUBKEY\s*=\s*['"]([0-9a-fA-F]{64})['"]""", src)
+    if not m:
+        sys.exit('从 github_direct.py 里解析不到内置公钥 UPDATE_PUBKEY —— 拒绝发布')
+    return m.group(1)
+
+
+def verify_signature(vj, vsig):
+    """回读两平台线上的 version.json + version.json.sig，用客户端内置公钥**真验一遍**。
+
+    这一步验的是"用户点检查更新时到底能不能过"：
+      · 线上 version.json 的原始字节 → 与本地发布的那份一致；
+      · 同目录的 version.json.sig 拿得到、且用客户端内置公钥验得过。
+    任何一条不过就返回 False（发版算失败，别让用户自己发现升级通道是断的）。
+    """
+    import urllib.request
+    print('⑦+ 线上升级源验签（用客户端内置公钥，两个平台各一次）:')
+    if str(REPO_DIR) not in sys.path:
+        sys.path.insert(0, str(REPO_DIR))
+    try:
+        import _ed25519
+    except Exception as e:
+        sys.exit('加载 _ed25519.py 失败(%s) —— 拒绝发布（没法自证签名可用）' % type(e).__name__)
+    pub = bytes.fromhex(_client_pubkey())
+    local_raw = open(str(vj), 'rb').read()
+    ok = True
+    for label, base in (
+            ('Gitee ', '%s/%s/%s/raw/%s' % (GITEE_WEB, OWNER, REPO, BRANCH)),
+            ('GitHub', 'https://raw.githubusercontent.com/%s/%s/%s'
+             % (OWNER, REPO, BRANCH))):
+        try:
+            raw = _download(base + '/version.json')
+            sig_raw = _download(base + '/version.json.sig')
+        except Exception as e:
+            raw = sig_raw = None
+        if raw is None or sig_raw is None:
+            print('  [FAIL] %s 线上 version.json / .sig 取不到（Gitee 与 GitHub 都必须能取到）' % label)
+            ok = False
+            continue
+        same_bytes = raw == local_raw
+        sig_txt = sig_raw.decode('utf-8', 'replace').strip()
+        sig_ok = False
+        if re.fullmatch(r'[0-9a-fA-F]{128}', sig_txt):
+            try:
+                sig_ok = bool(_ed25519.checkvalid(bytes.fromhex(sig_txt), raw, pub))
+            except Exception:
+                sig_ok = False
+        ok = ok and same_bytes and sig_ok
+        print('  [%s] %s 线上 version.json 与本地一致=%s，Ed25519 验签=%s（公钥 %s…）'
+              % ('PASS' if (same_bytes and sig_ok) else 'FAIL', label, same_bytes, sig_ok, pub[:16]))
+    return ok
+
+
 def load_notes(ver, notes_file=None):
     """取本次的发布说明。
 
@@ -327,7 +428,9 @@ def cmd_release(ver, skip_build=False, notes_file=None, with_github=False):
         sys.exit('找不到 %s, 打包可能失败了' % exe)
     print('   exe =', exe, exe.stat().st_size, 'B')
 
-    vj = make_version_json('')
+    # 私钥在这一步就定下来（找不到直接中止，不会走到"已经打包/已改版本号"才发现发不了）
+    sign_key = resolve_sign_key()
+    vj, vsig = make_version_json('', sign_key)
 
     # ── 发版铁律：先自检、后发布（2026-10-08 用户要求「以后都这样」）──────
     # 起因：v1.0.6 发布后才发现"升级后程序可能起不来"(杀软拦第一次启动)。
@@ -345,7 +448,10 @@ def cmd_release(ver, skip_build=False, notes_file=None, with_github=False):
             sys.exit('❌ 发版前自检未通过，已中止发布。修好再发（或 --skip-preflight 紧急跳过）')
         print('   ✅ 自检全绿，继续发布')
 
-    assets = [exe, vj]
+    # ⚠ version.json.sig 必须与 version.json **一起**发出去：客户端拿到 version.json
+    # 会立刻去取同目录的 .sig 验签，取不到就拒绝这次升级（fail-closed）。
+    # 老客户端只读 version.json（多一个附件对它无害）—— 这就是"兼容老版本"的做法。
+    assets = [exe, vj, vsig]
 
     git_commit_push(ver)
     gitee_release(ver, token, assets, notes)
@@ -361,6 +467,7 @@ def cmd_release(ver, skip_build=False, notes_file=None, with_github=False):
         print('⑥ 跳过 GitHub (加 --github 才同步)')
     print('⑦ 验真:')
     ok = verify(ver, assets)
+    ok = verify_signature(vj, vsig) and ok
     print('全部完成, 用时 %.0f 秒, 验真=%s' % (time.time() - t0, ok))
     return 0 if ok else 1
 

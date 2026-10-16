@@ -30,9 +30,11 @@ FoxPath.exe (github_direct.py)
 | 文件 | 职责 | 改它的场景 |
 |---|---|---|
 | `github_direct.py` | **全部功能**：代理、PAC、IP 体检与挑线路、控制面板、还原 | 几乎所有功能改动 |
+| `_ed25519.py` | **升级源验签**用的纯 Python Ed25519 实现（签名 + 验签），零第三方依赖；发布端签名、客户端验签都用它 | 升级验签相关（一般不用改；改动前先跑 RFC 8032 向量） |
 | `version.json` | **升级源**：版本号 + `exe` 的 sha256 + 下载地址 + 字节数 | 发版脚本自动生成，**不要手改** |
+| `version.json.sig` | **升级源的 Ed25519 签名**（128 个十六进制字符 = 64 字节）；与 `version.json` 同目录同名，客户端据此验签 | 发版时自动生成，**不要手改、不要入库**（每次改 version.json 都会过期） |
 | `build_exe.py` | PyInstaller 打包 → `FoxPath.exe`（文件名不带版本号，版本写进 exe 属性） | 改打包参数 |
-| `make_version_json.py` | 生成 `version.json` | 发版链路 |
+| `make_version_json.py` | 生成 `version.json`，并按 `--sign-key` 同时生成 `version.json.sig` | 发版链路 |
 | `publish_files.py` | 往 Gitee 仓库推送/更新的文件清单 | 增删随仓库发布的文件 |
 | `tools/publish.py` | 一键发布：改版本号 → 打包 → 升级源 → 双平台提交/发行版 → 验真 | 发版链路 |
 | `tools/preflight_release.py` | **发版前自检闸门**（版本一致性、冷启动、完整升级演练、失败分支、还原） | 发版前必跑；新增检查项 |
@@ -55,6 +57,7 @@ FoxPath.exe (github_direct.py)
 | 改控制面板的显示 | 面板构建与刷新段（状态、开关、日志入口） |
 | 改"退出还原"的范围 | 备份/还原注册表那几段（新写任何系统设置前，先想清楚怎么还原） |
 | 改升级/发布流程 | `tools/publish.py`、`make_version_json.py` |
+| 改升级**校验**逻辑（验签 / sha256 / 拒降级） | `github_direct.py` 的 `read_update_info` / `_verify_update_sig` / `_verify_download`；改完请跑 `tools/preflight_release.py`（①-e 节含"改一个字节必须验不过"的负例断言） |
 
 ---
 
