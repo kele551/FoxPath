@@ -55,7 +55,7 @@ except Exception:
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = _HERE if os.path.exists(os.path.join(_HERE, 'github_direct.py')) \
     else os.path.join(_HERE, 'repo')
-DATA = os.path.join(os.environ['LOCALAPPDATA'], 'FoxPath')
+DATA = os.environ.get('FOXPATH_DATA') or os.path.join(os.environ['LOCALAPPDATA'], 'FoxPath')
 PANEL = 'http://127.0.0.1:8788'
 REG = r'Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 HID = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden']
