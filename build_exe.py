@@ -4,8 +4,9 @@
 用法:  python build_exe.py
 
 版本号只有一个来源: github_direct.py 里的 APP_VERSION。
-产物名一律 ASCII(FoxPath-v<版本>.exe) —— 中文文件名在上传到 GitHub / Gitee 时
-会被破坏(实测 狐径-v1.0.0.exe 传上去变成了 -v1.0.0.exe), 所以对外只用 ASCII 名。
+产物固定为 ASCII 文件名 FoxPath.exe，文件名不带版本号；版本号写入 exe 的
+FileVersion / ProductVersion 资源属性。中文文件名曾在上传到 GitHub / Gitee 时
+被破坏(实测 狐径-v1.0.0.exe 传上去变成了 -v1.0.0.exe)，所以对外只用 ASCII 名。
 """
 import os
 import re
