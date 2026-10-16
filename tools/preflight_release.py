@@ -486,6 +486,39 @@ PUBKEY_RE = re.compile(r"""UPDATE_PUBKEY\s*=\s*['"]([0-9a-fA-F]+)['"]""")
 _HEX128 = re.compile(r'[0-9a-fA-F]{128}')
 
 
+def _sign_drill_source(feedp):
+    """给演练的本地升级源签名：客户端现在强制验签，不签的话完整升级演练会因
+    「拿不到签名」整段红。私钥只从环境变量 / 本机私有配置读，绝不许硬编码路径。"""
+    key = os.environ.get('FOXPATH_ED25519_KEY')
+    if not key:
+        try:
+            _cfgp = os.path.join(os.path.expanduser('~'), '.foxpath-publish.json')
+            if os.path.exists(_cfgp):
+                key = json.load(io.open(_cfgp, encoding='utf-8')).get('ed25519_key') or ''
+        except Exception:
+            key = ''
+    if not key or not os.path.isfile(key):
+        check('演练需要签名私钥（设 FOXPATH_ED25519_KEY，或 ~/.foxpath-publish.json 的 ed25519_key）',
+              False, key or '(空)')
+        return False
+    try:
+        if REPO not in sys.path:
+            sys.path.insert(0, REPO)
+        import _ed25519 as _ed
+    except Exception as _e:
+        check('演练签名：加载 _ed25519', False, type(_e).__name__)
+        return False
+    try:
+        sk = bytes.fromhex(io.open(key, encoding='utf-8').read().strip())
+        raw = open(feedp, 'rb').read()
+        sig = _ed.signature(raw, sk).hex()
+        io.open(feedp + '.sig', 'w', encoding='utf-8', newline='\n').write(sig)
+        return True
+    except Exception as _e:
+        check('演练签名：生成 %s' % SIG_NAME, False, type(_e).__name__)
+        return False
+
+
 def check_update_signature():
     """①-e：.sig 存在且格式对 → 用客户端内置公钥验签必须过 → 两个负例必须验不过。"""
     print()
@@ -722,6 +755,7 @@ try:
         feedp = os.path.join(TMP, 'upgrade', 'version.json')
         io.open(feedp, 'w', encoding='utf-8', newline='\n').write(
             json.dumps(feed, ensure_ascii=False))
+        _sign_drill_source(feedp)
         io.open(url_txt, 'w', encoding='utf-8').write(feedp)
         tmp_files.append(url_txt)
         for f in (cache, os.path.join(DATA, 'update.log')):
@@ -826,6 +860,7 @@ try:
                      'size': os.path.getsize(CAND)}}
     feedp2 = os.path.join(TMP, 'bad', 'version.json')
     io.open(feedp2, 'w', encoding='utf-8', newline='\n').write(json.dumps(feed2, ensure_ascii=False))
+    _sign_drill_source(feedp2)
     io.open(url_txt, 'w', encoding='utf-8').write(feedp2)
     try:
         os.remove(cache)
