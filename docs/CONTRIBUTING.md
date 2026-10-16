@@ -109,8 +109,9 @@ pip install pyinstaller
 python build_exe.py        # 产出 FoxPath.exe（版本号取自 github_direct.py 的 APP_VERSION）
 ```
 
-> 仓库里的 `create_icon*.py` / `make_icon_from_user_image.py` 是当初做图标用的一次性脚本，
-> 里面的路径写死在作者本机，**在别的机器上跑不通**，正常构建不需要它们。
+> 构建直接使用仓库内的自绘图标 `app.ico`，无需运行图标生成脚本。
+> 历史一次性脚本 `create_icon*.py` / `make_icon_from_user_image.py` 自 v1.0.8 起已移除；
+> 当前图标的来源与知识产权说明见 [COMPLIANCE.md](COMPLIANCE.md) 第二节。
 
 ### 自查（改完自己先过一遍）
 
@@ -173,14 +174,13 @@ fix: 升级源缺少 sha256 时拒绝升级，不再直接放行
 打包注意：
 
 - PyInstaller 的 `--clean` 参数在某些受限环境下会因批量删缓存被拦，脚本里已去掉。
-- 产物名与版本号都从 `github_direct.py` 的 `APP_VERSION` 推导，只有一个来源，不用改两处。
+- 产物文件名固定为 `FoxPath.exe`；exe 资源属性里的版本号取自 `github_direct.py` 的 `APP_VERSION`，不用改两处。
 - **`.ps1` 文件必须保存为「UTF-8 带 BOM」**。PowerShell 5.1 对没有 BOM 的文件按 ANSI 读，
   中文会变乱码，字符串/花括号被破坏后直接 ParserError —— `tools/Fix-GitHub.ps1` 在 v1.0.1 之前
   就是这样：文件本身完整，但因为没有 BOM 而**从未成功运行过**。
 
-> 图标不用管：`app.ico` 已经入库，且为**自绘**（不含任何第三方吉祥物或标志，见 `COMPLIANCE.md`）。
-> 当初做图标用的那几个一次性脚本（`create_icon*.py` / `make_icon_from_user_image.py`）已从仓库
-> 移除：它们把输入输出路径写死在作者本机，在别的机器上跑不通，正常构建也不需要它们。
+> 图标：正常构建使用已入库的自绘 `app.ico`；历史脚本的移除说明见上方「构建」，
+> 知识产权口径见 [COMPLIANCE.md](COMPLIANCE.md) 第二节。
 
 ---
 
