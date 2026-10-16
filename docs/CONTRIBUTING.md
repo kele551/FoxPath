@@ -109,8 +109,10 @@ pip install pyinstaller
 python build_exe.py        # 产出 FoxPath.exe（版本号取自 github_direct.py 的 APP_VERSION）
 ```
 
-> 仓库里的 `create_icon*.py` / `make_icon_from_user_image.py` 是当初做图标用的一次性脚本，
-> 里面的路径写死在作者本机，**在别的机器上跑不通**，正常构建不需要它们。
+> 以前仓库里有过 `create_icon*.py` / `make_icon_from_user_image.py` 这类做图标的一次性脚本，
+> 因为把输入输出路径写在作者本机、**在别的机器上跑不通**，**已于 v1.0.8 从仓库移除**
+> （原因见 [COMPLIANCE.md](COMPLIANCE.md)：图标为自绘，不该留会引入第三方素材的脚本）；
+> 正常构建不需要它们，`app.ico` 已经入库。
 
 ### 自查（改完自己先过一遍）
 

@@ -8,6 +8,8 @@
 
 检查项：
   1. 版本一致性：exe 文件版本 / 源码 APP_VERSION / version.json 三者一致
+  1-d. 文档版本一致性：README / docs/SECURITY.md 里写的「当前版本」== 源码 APP_VERSION
+     （防止 publish.py 的替换正则悄悄失效后，版本号靠手改、留旧号）
   2. 冷启动演练：把候选 exe 复制成"刚下载落地"的样子，**立刻用隐藏 PowerShell 启动**
      （复刻升级小助手的动作）—— 必须能起来。这是上一版漏掉的那一步。
   3. 完整升级演练：旧版跑起来 -> 本地升级源 -> 检查更新 -> 立即升级 ->
@@ -76,7 +78,7 @@ USAGE = """狐径发版前自检 —— 用法
 
 开关:
   -h, --help         只打印这段说明就退出（不写注册表、不结束/启动任何进程）
-      --dry-run      只跑静态检查：版本一致性 + 两份脚本是否漂移 +（可选）远端附件比对。
+      --dry-run      只跑静态检查：版本一致性 + 文档版本一致性 + 两份脚本是否漂移 +（可选）远端附件比对。
                      不写注册表、不结束/启动任何进程、不动系统代理 —— 只想确认脚本没坏时用这个
       --skip-remote  跳过"两平台远端附件比对"（离线、或平台抽风时用）
 
@@ -249,6 +251,38 @@ def check_version(cand):
           'json=%s cand=%s' % (vj['exe']['sha256'][:12], csha[:12]))
     check('version.json 的 size == 候选 exe 大小', vj['exe']['size'] == os.path.getsize(cand))
     return app_ver, csha, vj_sha
+
+
+# ── ①-d 文档里的「当前版本」== 源码 APP_VERSION（防"发版漏改文档"）──────
+# 为什么加这条：改版本号的规则写在 tools/publish.py 的 VER_FILES 里，但那是**替换**规则 ——
+# 文档措辞一变，正则就悄悄不命中，版本号从此靠手改，迟早留旧号（README 那条匹配静态徽章
+# version-vX.Y.Z-blue 的规则就是这么失效的：徽章换成 shields.io 动态徽章后，它一条都命中不了）。
+# 所以这里把它变成一条**会红**的断言：漏改红在发布之前，而不是发布之后。
+# ⚠ 这两条正则必须与 tools/publish.py 的 VER_FILES 保持一致（改了那两处就同步改这里）。
+DOC_VERSION_PATTERNS = (
+    ('README.md', r'当前对外发布版本 \*\*v([0-9][0-9.]*)\*\*'),
+    ('docs/SECURITY.md', r'当前 \*\*v([0-9][0-9.]*)\*\*'),
+)
+
+
+def check_doc_versions(app_ver):
+    print()
+    print('①-d 文档里的「当前版本」== 源码 APP_VERSION')
+    for rel, pat in DOC_VERSION_PATTERNS:
+        p = os.path.join(REPO, rel)
+        if not os.path.exists(p):
+            check('%s 存在' % rel, False, '找不到文件: %s' % p)
+            continue
+        txt = io.open(p, encoding='utf-8').read()
+        m = re.search(pat, txt)
+        if not m:
+            # 匹配不到比"版本号对不上"更危险：说明文档措辞变了、这条规则（以及 publish.py 里
+            # 对应的替换规则）又成了死配置 —— 谁都不会再被提醒。
+            check('%s 里找得到「当前版本」字样（规则没失效）' % rel, False,
+                  '正则未命中，文档写法可能变了，请同步更新这里与 tools/publish.py 的 VER_FILES')
+            continue
+        check('%s 的当前版本 == 源码 APP_VERSION' % rel, m.group(1) == app_ver,
+              '%s / %s' % (m.group(1), app_ver))
 
 
 # ── ①-b 自检脚本两份副本一致（M-10：防止"仓库里写的检查项其实没跑"）──────
@@ -470,9 +504,10 @@ print('  候选 exe: %s' % CAND)
 print('  数据目录: %s' % DATA)
 print()
 
-# ── ① 版本一致性；①-b 脚本副本一致；①-c 远端附件比对 ────────────────────
-# 这三项都是"纯读"（只读文件/接口、只下载），所以 --dry-run 也照跑。
+# ── ① 版本一致性；①-d 文档版本一致；①-b 脚本副本一致；①-c 远端附件比对 ──
+# 这几项都是"纯读"（只读文件/接口、只下载），所以 --dry-run 也照跑。
 ver, csha, vj_sha = check_version(CAND)
+check_doc_versions(ver)
 check_script_sync()
 if SKIP_REMOTE:
     print()

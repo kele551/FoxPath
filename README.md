@@ -73,6 +73,9 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 
 绿色单文件、无需安装、不要管理员权限；以后升级就在面板里点「检查更新 → 立即升级」。
 
+> 想先看它长什么样：仓库里有一页[演示页](docs/demo/index.html)，内嵌 2 分 30 秒的演示视频
+> （**录制于 v1.0.7**，界面以实际版本为准；最新变化见 [release-notes.md](docs/release-notes.md)），点开即播。
+
 > **三个平台代码一致**：[Gitee](https://gitee.com/kele551/FoxPath)（主源）· [GitHub](https://github.com/kele551/FoxPath)（镜像）· [AtomGit](https://atomgit.com/kele551/FoxPath)（代码镜像，只提供源码归档）。
 > **二进制发行包请从 Gitee（主）或 GitHub（镜像）下载**；三个平台都收 Issue / PR。
 
@@ -236,8 +239,6 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 
 > **v1.0.0 ～ v1.0.7 其余各版的详细说明**（原文一字未改）见 [CONTRIBUTING.md](docs/CONTRIBUTING.md) 第十一节；一行摘要见 [CHANGELOG.md](docs/CHANGELOG.md)。
 
-**CHANGELOG 尚未收录的三个版本**（保留在这里，别丢）：**v1.0.4**（2026-09-22，加作者署名 —— 源码文件头、控制面板底部、日志、exe 属性、README 统一为「海风（kele551）」；README 里的私人邮箱换成 Issues 链接）· **v1.0.3**（2026-09-22，重做图标；产物改名 `FoxPath.exe` 不带版本号，版本号写进 exe 属性）· **v1.0.2**（2026-09-22，修「双击没反应」：程序已在后台时，第二次双击改为**直接打开正在运行的控制面板**再退出）。
-
 ---
 
 ## 联系与反馈
@@ -296,6 +297,7 @@ MIT
 | 维护者 | [@kele551](https://github.com/kele551)（海风），一人维护，同时担任提交者、审查者与发布批准者 |
 | 响应预期 | Issue / PR 一般 **7 天内**给第一次答复；安全类问题按 [SECURITY.md](docs/SECURITY.md) 私下走，**3 天内**响应 |
 | 参与方式 | 参与方式、Issue 模板、PR 流程、代码风格、本地构建与自查、提交信息规范见 [CONTRIBUTING.md](docs/CONTRIBUTING.md) |
+| 行为准则 | 参与讨论与协作的底线（基于 Contributor Covenant 2.1），见 [CODE_OF_CONDUCT.md](docs/CODE_OF_CONDUCT.md) |
 | 许可与合规 | MIT（见 [LICENSE](LICENSE)），提交贡献即表示同意按同一许可发布；法律与知识产权边界见 [COMPLIANCE.md](docs/COMPLIANCE.md) |
 | 发布纪律 | 主程序零第三方依赖；每次发布都要先跑发版前自检 `tools/preflight_release.py`（版本一致性、冷启动演练、升级演练、失败分支、退出还原）全绿，才允许上传附件 |
 

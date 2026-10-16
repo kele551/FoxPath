@@ -1,5 +1,7 @@
 # Contributor Covenant Code of Conduct
 
+> 狐径 FoxPath —— 作者：**海风（kele551）** · <https://github.com/kele551/FoxPath>
+
 ## Our Pledge
 
 We as members, contributors, and leaders pledge to make participation in our
