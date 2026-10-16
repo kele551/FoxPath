@@ -31,7 +31,7 @@ python tools/preflight_release.py  # 发版前自检（发布前必须全绿）
 - **所有写进系统的设置都必须有退出还原路径**；新增任何注册表/代理写入，先想清楚怎么还原、怎么验证。
 - **对外文案红线词**：绕过 / 翻墙 / 梯子 / 科学上网 / 墙 / 破解 / 屏蔽 —— 一个都不要出现
   （Gitee 曾因这类措辞把仓库判为违规）。
-- **行尾**：本仓库入库/检出**一律 CRLF**；不要整文件重写行尾。
+- **行尾**：本仓库入库/检出**一律 LF**（`.gitattributes` 固定 `* text=auto eol=lf`，2026-10-16 归一）；不要整文件重写行尾。
 - **`.ps1` 若新增，必须 UTF-8 带 BOM**。
 - **署名不要改**：`海风（kele551）` / `HaiFeng (kele551)` / `Copyright (C) 2026 HaiFeng (kele551)`。
 - **仓库里不许出现本机路径、私人邮箱、令牌**（自检会拦，改动前先自查）。
@@ -74,7 +74,7 @@ GitHub Issues 里带 `good first issue` / `help wanted` 标签的条目，每条
   - add anything that modifies `hosts` / system DNS or requires admin rights — that contradicts the project's
     compliance statement (a legacy script doing exactly that was removed in Oct 2026);
   - add a system setting without a matching restore path;
-  - rewrite line endings wholesale (this repo stores **CRLF**); new `.ps1` files must be **UTF-8 with BOM**;
+  - rewrite line endings wholesale (this repo stores **LF**, pinned by `.gitattributes`); new `.ps1` files must be **UTF-8 with BOM**;
   - introduce local machine paths, private emails or tokens into the repo;
   - banned wording anywhere: 绕过 / 翻墙 / 梯子 / 科学上网 / 墙 / 破解 / 屏蔽 (Gitee once flagged the repo over this);
   - don't change the author strings (`海风（kele551）` / `HaiFeng (kele551)`).
