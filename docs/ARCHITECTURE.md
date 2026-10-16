@@ -76,7 +76,7 @@ python tools/preflight_release.py
 **改完请照着这几条自查**：对外文案不要出现"绕过 / 翻墙 / 梯子 / 科学上网 / 墙 / 破解 / 屏蔽"
 （**这条踩过坑**：Gitee 曾因 README 里的措辞把仓库判为违规）；
 所有涉及系统设置的新代码，都必须有对应的退出还原路径；
-行尾保持仓库现状（**CRLF**）；`.ps1` 若新增，存成 **UTF-8 带 BOM**。
+行尾保持 **LF**（`.gitattributes` 已固定 `* text=auto eol=lf`）；`.ps1` 若新增，存成 **UTF-8 带 BOM**。
 
 ---
 

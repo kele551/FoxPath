@@ -19,6 +19,6 @@
 
 - **不要引入任何"改 hosts / 改系统 DNS / 要管理员权限"的功能**（与项目承诺冲突，2026-10 已因此移除历史脚本）；
 - 所有写进系统的设置都必须有**退出还原**路径；
-- 行尾保持 **CRLF**；`.ps1` 若新增必须 **UTF-8 带 BOM**；
+- 行尾保持 **LF**（`.gitattributes` 已固定）；`.ps1` 若新增必须 **UTF-8 带 BOM**；
 - 对外文案不许出现 绕过 / 翻墙 / 梯子 / 科学上网 / 墙 / 破解 / 屏蔽；
 - 详细约定见 [AGENTS.md](AGENTS.md)（AI 助手）/ [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md)（人类贡献者）。
