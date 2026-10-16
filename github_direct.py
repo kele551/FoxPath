@@ -1147,9 +1147,14 @@ def _data_dir():
     Program Files 下 —— 备份写失败时旧代码是静默 continue, 于是退出时
     还原不了系统代理, 注册表里就留下一个指向死端口的 PAC。
     (2026-09-22 实测: 程序已删除, AutoConfigURL 仍指向 127.0.0.1:8788/pac)
+
+    发版前升级演练（§4.16）必须用**独立数据目录**：设环境变量 `FOXPATH_DATA`
+    指向一个临时目录即可，本函数优先用它，演练完清场，绝不污染用户真实数据。
     """
-    base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
-    d = os.path.join(base, 'FoxPath')
+    d = os.environ.get('FOXPATH_DATA')
+    if not d:
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        d = os.path.join(base, 'FoxPath')
     try:
         os.makedirs(d, exist_ok=True)
         return d
