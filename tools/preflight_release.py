@@ -474,6 +474,95 @@ def check_remote_assets(ver, cand_sha, vj_sha):
               '平台自动生成的源码包不计入比较；核心附件两平台一致才算过）')
 
 
+# ── ①-e 升级源的 Ed25519 验签（2026-10-16 升级通道加固）────────────────
+# 背景：在这之前，狐径的升级只要"sha256 对得上"就采用，而 sha256 与被校验的 exe 放在
+# **同一个升级源**里 —— 源被整体替换（账号被盗、仓库被改）时，sha256 会跟着一起改，
+# 等于没验。现在升级源 version.json 必须带一份同目录的 version.json.sig，客户端用
+# **内置公钥**验签，验不过一律拒绝（fail-closed）。
+# 这一节要保证的是：换钥匙却忘改客户端 / 签名文件坏了 / 内容被改过一个字节 —— 都在
+# **发布之前**变红，而不是等用户点「检查更新」才发现。
+SIG_NAME = 'version.json.sig'
+PUBKEY_RE = re.compile(r"""UPDATE_PUBKEY\s*=\s*['"]([0-9a-fA-F]+)['"]""")
+_HEX128 = re.compile(r'[0-9a-fA-F]{128}')
+
+
+def check_update_signature():
+    """①-e：.sig 存在且格式对 → 用客户端内置公钥验签必须过 → 两个负例必须验不过。"""
+    print()
+    print('①-e 升级源 Ed25519 验签（用客户端源码里内置的公钥）')
+    _src_p = os.path.join(REPO, 'github_direct.py')
+    _src = io.open(_src_p, encoding='utf-8').read() if os.path.exists(_src_p) else ''
+    _pm = PUBKEY_RE.search(_src)
+    if not _pm:
+        # 公钥解析不到：这条比"验签不过"更严重 —— 说明客户端里那把钥匙没了/改名了，
+        # 这里必须红，否则整节会变成"跳过的摆设"。
+        check('从 github_direct.py 里解析得到内置公钥 UPDATE_PUBKEY', False,
+              '正则未命中：客户端源码里可能改了常量名或删了公钥')
+        return ''
+    _pub = _pm.group(1)
+    check('从 github_direct.py 里解析得到内置公钥 UPDATE_PUBKEY',
+          len(_pub) == 64, '公钥 %s…（%d 个十六进制字符）' % (_pub[:16], len(_pub)))
+
+    _ed_p = os.path.join(REPO, '_ed25519.py')
+    if not os.path.exists(_ed_p):
+        check('仓库里有 _ed25519.py（纯 Python 验签实现）', False, '找不到 %s' % _ed_p)
+        return _pub
+    try:
+        if REPO not in sys.path:
+            sys.path.insert(0, REPO)
+        import _ed25519
+    except Exception as _e:
+        check('_ed25519.py 能加载起来', False, type(_e).__name__)
+        return _pub
+    check('_ed25519.py 能加载起来', True)
+
+    _vjp = os.path.join(REPO, 'version.json')
+    _sigp = os.path.join(REPO, SIG_NAME)
+    if not os.path.exists(_sigp):
+        # 本地还没有签名文件：**不算通过**，也**不算红** —— 发版时由
+        # tools/publish.py（→ make_version_json.py --sign-key）现场生成，
+        # 发布后 publish.py 会回读线上 .sig 用同一把内置公钥真验一遍。
+        # 之所以不判红：仓库里若真入库一份 .sig，它每次改 version.json 都会过期，
+        # 变成"天天假红"、最后被人无脑跳过。
+        print('  [SKIP] 本地 %s 还不存在 —— 发版时由 make_version_json.py --sign-key 生成；'
+              '这一节的"正验 + 两个负例"这次没跑（换钥匙忘改客户端这类问题仍由上面那条公钥解析拦住）'
+              % SIG_NAME)
+        return _pub
+    _sigtxt = io.open(_sigp, encoding='utf-8').read()
+    check('%s 是 128 个十六进制字符（一个 64 字节签名的十六进制）' % SIG_NAME,
+          bool(_HEX128.fullmatch(_sigtxt.strip())),
+          '实长 %d 字符' % len(_sigtxt.strip()))
+    _raw = open(_vjp, 'rb').read()
+    try:
+        _pk = bytes.fromhex(_pub)
+        _sg = bytes.fromhex(_sigtxt.strip())
+    except Exception as _e:
+        check('公钥与签名都是合法十六进制', False, type(_e).__name__)
+        return _pub
+    _ok = bool(_ed25519.checkvalid(_sg, _raw, _pk))
+    check('用内置公钥验 version.json 的签名 == 通过', _ok,
+          '（不过 = 签名与线上 version.json 不是同一批字节，或私钥与内置公钥不是一对）')
+    # ── 负例（证明闸门不是摆设）────────────────────────────────────────
+    # ① version.json 改一个字节：验签**必须**失败。
+    _bad = bytearray(_raw)
+    if _bad:
+        _bad[len(_bad) // 2] ^= 0x01        # 只翻中间一个字节的 1 位（不增不删，长度也不变）
+    _neg1 = not _ed25519.checkvalid(_sg, bytes(_bad), _pk)
+    check('负例：version.json 改一个字节后验签必须失败', _neg1,
+          '（这条绿 = 闸门真在看内容）')
+    # ② .sig 改一个字符：验签**必须**失败。
+    _st = _sigtxt.strip()
+    _neg2 = False
+    if len(_st) == 128:
+        _flip = ('0' if _st[0].lower() != '0' else '1') + _st[1:]
+        try:
+            _neg2 = not _ed25519.checkvalid(bytes.fromhex(_flip), _raw, _pk)
+        except Exception:
+            _neg2 = False
+    check('负例：.sig 改一个字符后验签必须失败', _neg2)
+    return _pub
+
+
 # ── 命令行开关 ────────────────────────────────────────────────────────
 TMP = os.path.join(tempfile.gettempdir(), 'foxpath_preflight')
 KNOWN_ARGS = ('-h', '--help', '--dry-run', '--skip-remote')
@@ -509,6 +598,8 @@ print()
 ver, csha, vj_sha = check_version(CAND)
 check_doc_versions(ver)
 check_script_sync()
+# ①-e 升级源的 Ed25519 验签（纯读文件 + 纯计算，--dry-run 也跑）
+check_update_signature()
 if SKIP_REMOTE:
     print()
     print('①-c 远端附件比对：已按 --skip-remote 跳过')

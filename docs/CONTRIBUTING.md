@@ -163,10 +163,11 @@ fix: 升级源缺少 sha256 时拒绝升级，不再直接放行
 | `github_direct.py` | 主程序：代理、PAC、体检、控制面板（推荐用这个） |
 | （已移除）`Fix-GitHub.ps1` / `Run-GitHubFix.bat` | 上一代做法的历史脚本：改 `hosts` + 装计划任务 + 需要管理员权限。**2026-10-16 已从仓库移除**，以符合「不改 `hosts`、不改系统 DNS、不需要管理员权限」的承诺；以前跑过它的用户请见 `使用说明.txt` 第 8 节的收尾办法 |
 | `build_exe.py` | PyInstaller 打包脚本 |
-| `make_version_json.py` | 生成升级源 `version.json`（版本号 + exe 指纹 + 字节数） |
+| `make_version_json.py` | 生成升级源 `version.json`（版本号 + exe 指纹 + 字节数）；带 `--sign-key` 时同时生成 `version.json.sig` |
+| `_ed25519.py` | 纯 Python Ed25519 实现（升级源验签用，零第三方依赖）；发布端签名与客户端验签共用同一份 |
 | `tools/preflight_release.py` | **发版前自检闸门**（发布前必须全绿），见下方「发版前自检」 |
 | `tools/compare_ips.py` | 把内置候选 IP 与 GitHub 官方 `meta` 网段对照（排查用） |
-| `tools/publish.py` | 一键发布流水线（Gitee 主 + GitHub 镜像），内置自检闸门 |
+| `tools/publish.py` | 一键发布流水线（Gitee 主 + GitHub 镜像），内置自检闸门；发版时顺带生成并上传升级源签名 `version.json.sig` |
 | `requirements.txt` | 依赖口径：主程序零第三方依赖，只有发布脚本需要 `requests` |
 | `app.ico` | 程序图标（自绘，不含第三方吉祥物或标志） |
 | `docs/release-notes.md` | 发行说明 |
@@ -202,9 +203,10 @@ python tools/preflight_release.py --dry-run    # 只跑静态项：不写注册�
 | 类别 | 检查什么 |
 | --- | --- |
 | 版本一致性 | exe 文件版本 = 源码 `APP_VERSION` = `version.json` 版本，且 `version.json` 的 `sha256` / `size` 与候选 exe 对上 |
+| 升级源验签（2026-10-16 加） | 从 `github_direct.py` **解析出内置公钥**，用它验 `version.json.sig`；`version.json.sig` 必须是 128 个十六进制字符；并有两条**负例**断言：把 `version.json` 改一个字节、把 `.sig` 改一个字符，验签都必须**失败**（证明闸门不是摆设）。本地还没有 `.sig` 时这一节报 `[SKIP]`（发版时现场生成）；「换了钥匙却忘了改客户端」由公钥解析那条拦住 |
 | 冷启动演练 | 把候选 exe 复制成「刚下载落地」的样子，立刻用隐藏 PowerShell 启动，必须在限定时间内起来 |
 | 完整升级演练 | 旧版 → 本地升级源 → 检查更新 → 立即升级 → 必须自己起来（起不来则必须「重试过 + 明确提示用户」），并核对换上去的文件**指纹**等于候选 |
-| 失败分支 | 升级源里的 `sha256` 故意写错 → 必须拒绝并保留旧版 |
+| 失败分支 | 升级源里的 `sha256` 故意写错 → 必须拒绝并保留旧版；**签名对不上/缺失 `.sig` → 同样必须拒绝并保留旧版**（2026-10-16 起升级源先验签、后校验指纹） |
 | 接口与还原 | `/pac` 纯 ASCII、`/api/diag` 正常、非法 IP 被拒、连点两次启用不污染系统代理备份、退出后注册表还原、不留垃圾 |
 | 一致性警告（WARN） | ① 工作区副本与仓库副本 `tools/preflight_release.py` 的 **sha256 是否一致**（两份漂移了就警告）；② **两平台发行版附件 SHA256 是否一致**（Gitee 请求间隔 ≥3 秒限速；网络或平台异常只警告，不判红） |
 
@@ -212,6 +214,14 @@ python tools/preflight_release.py --dry-run    # 只跑静态项：不写注册�
 > 只想确认脚本自己没坏，用 `--dry-run`（只做静态检查）。
 > 警告级（WARN）不阻断发布，但会在结尾单独列出来，发布前应当看一眼。
 > `tools/publish.py release` 已内置这道闸门：自检不全绿直接中止发布（`--skip-preflight` 只留给线上事故回滚，且要在 `logs\` 写明原因）。
+
+**发版还需要一把 Ed25519 签名私钥**（2026-10-16 起）：`release` 会用它对**要发布的 `version.json` 原始字节**
+签名，产出同目录的 `version.json.sig`，并和 `version.json` 一起提交、一起传两个平台的发行版；收尾还会
+回读线上 `version.json` + `.sig`，用客户端内置公钥真验一遍。私钥位置按
+「环境变量 `FOXPATH_ED25519_KEY` → 本机私有配置 `~/.foxpath-publish.json` 的 `ed25519_key`」找，
+**找不到就拒绝发布**。私钥**只在维护者机器上**、绝不入库；如果你只是在自己机器上验证升级链路，
+可以用 `python make_version_json.py --sign-key <私钥>` 手动生成一对 `version.json` / `version.json.sig`。
+公钥内置在 `github_direct.py` 的 `UPDATE_PUBKEY`（公开无妨）。
 
 ---
 

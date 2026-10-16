@@ -57,6 +57,16 @@ from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes          # 升级结果气泡要用(Shell_NotifyIcon 的结构体)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# Ed25519 验签（升级通道加固，2026-10-16）：同目录的 _ed25519.py（纯 Python、零第三方依赖）。
+# 用 try/except 包住是**故意**的：以后万一打包漏了它，程序照样能跑，只是升级这条路
+# 一律拒绝（fail-closed，见 update_sig_available / _verify_update_sig）—— 绝不放行没验签的升级。
+try:
+    import _ed25519
+    UPDATE_SIG_AVAILABLE = True
+except Exception:
+    _ed25519 = None
+    UPDATE_SIG_AVAILABLE = False
+
 APP_NAME = '狐径'
 APP_VERSION = '1.1.1'
 # 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
@@ -2294,8 +2304,9 @@ def autostart_on():
 # ------------------------------------------------------------------ 在线升级
 # 用户 2026-09-22 要求:「第二个程序做升级功能」。
 # 狐径跟壁纸助手不一样: 它没有"脚本层", 程序就是一个 exe —— 升级就是换 exe。
-# 做法: 下载到 <exe>.new -> 校验 sha256 -> 交给一个独立小助手
-#       (先让旧程序自己退出并还原代理 -> 覆盖 -> 再启动新的)。
+# 做法: 升级源 version.json 先过 **Ed25519 验签** -> 下载到 <exe>.new -> 校验 sha256 ->
+#       交给一个独立小助手 (先让旧程序自己退出并还原代理 -> 覆盖 -> 再启动新的)。
+#       验签不过、没有 .sig、sha256 不符 —— 一律拒绝并保留旧版本, 绝不"先替换再校验"。
 # 不需要管理员权限: D:\Program Files 的 ACL 允许普通用户写(实测过)。
 # 升级源: 仓库里的 version.json, Gitee raw 优先、GitHub 兜底;
 #         测试时可在数据目录放一个 update_url.txt 指到本地文件。
@@ -2303,6 +2314,15 @@ UPDATE_URLS = (
     'https://gitee.com/kele551/FoxPath/raw/main/version.json',
     'https://raw.githubusercontent.com/kele551/FoxPath/main/version.json',
 )
+
+# 【2026-10-16 升级通道加固】内置的 Ed25519 **公钥**（离线生成，公开无妨、本来就要随程序分发）。
+# 升级源 version.json 必须带一份同目录的 `version.json.sig`（128 个十六进制字符 = 64 字节签名），
+# 用这把公钥验过才认；验不过 / 没签名 / 签名格式不对，一律**拒绝这条候选**（详见 _verify_update_sig）。
+# 没有私钥就签不出合法签名，所以即便 Gitee / GitHub 账号被盗、有人推了恶意 version.json + 恶意 exe，
+# 客户端也不会装。私钥只在维护者机器上、绝不入库（见 docs/SECURITY.md）。
+# 能力边界（别夸大）：这挡的是"升级源被篡改"；挡不住维护者机器上的私钥本身被偷，
+# 也不等于 Windows 代码签名证书。
+UPDATE_PUBKEY = 'a29ea38e6313de486303f6ce0703adc5c7f28fbda9d444523c40d33982ec6082'
 UPDATE_CACHE = os.path.join(DATA_DIR, 'update.json')
 UPDATE_URL_TXT = os.path.join(DATA_DIR, 'update_url.txt')
 UPDATE_LOCK = threading.Lock()
@@ -2327,6 +2347,8 @@ _last_auto_check = [0.0]
 #       全程不打断用户; 面板上只留一行「已自动升级到 vX.Y.Z」; 日志写清每一步。
 # 开关：设置里的 auto_update, **默认开**; 关掉就回到「发现新版只提示」的老行为。
 # 安全底线（与 H-1 一致, 不许破）:
+#   ⓪ 升级源必须过 **Ed25519 验签**（2026-10-16 加；见 UPDATE_PUBKEY / _verify_update_sig）,
+#      验不过/没签名一律拒绝并保留旧版本 —— 这是"升级源被篡改"的唯一防线;
 #   ① sha256 缺失/不符一律拒绝并保留旧版本(_verify_download);
 #   ② 覆盖前先把旧 exe 备份成 FoxPath.exe.old(小助手脚本里做);
 #   ③ 替换失败仍走原来的递增重试, 最终失败才弹窗提示, 不会把用户搞成没程序可用。
@@ -3098,6 +3120,91 @@ load_settings()          # 启动即生效: 默认 auto_update=True, notify_bubb
 load_update_result()     # 上次升级结果(面板那一行要用; 读不到就算了, 不挡启动)
 
 
+def _read_text_from(u, timeout=20):
+    """读一个升级源地址的**原始字节**（http(s) 或本地文件）。返回 (bytes, None) 或 (None, 原因)。
+
+    返回 bytes 而不是 str 是必须的：Ed25519 签名是对 `version.json` 的**原始字节**做的，
+    解析成字符串再编码回去（换行、BOM、编码任何一个环节变了）就验不过了。
+    """
+    if u.startswith(('http://', 'https://')):
+        req = urllib.request.Request(u, headers={'User-Agent': 'FoxPath'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(), None
+    with open(u, 'rb') as f:
+        return f.read(), None
+
+
+def _sig_url_of(u):
+    """签名文件与 version.json **同目录同名**：<...>/version.json -> <...>/version.json.sig。
+
+    线上就是这么放的（`…/raw/main/version.json.sig`）；本地路径（update_url.txt 指到文件，
+    演练用）同样按"名字后面加 .sig"找。
+    """
+    return u + '.sig'
+
+
+def _verify_update_sig(u, raw):
+    """用内置公钥验签升级源。返回 (ok, 原因)。
+
+    fail-closed 的四条：
+      · 内置的 _ed25519.py 没加载起来        -> 拒绝（宁可不让升级，也绝不放行没验签的更新）；
+      · 拿不到同目录的 .sig（404/网络/文件没了）-> 拒绝；
+      · .sig 不是 128 个十六进制字符          -> 拒绝（格式不对一律拒绝，不"猜"）；
+      · checkvalid 不过                       -> 拒绝（内容被改过，或签名不是这把私钥做的）。
+    """
+    if not UPDATE_SIG_AVAILABLE:
+        return False, '验签模块缺失(_ed25519.py)'
+    try:
+        pub = bytes.fromhex(UPDATE_PUBKEY)
+    except Exception:
+        return False, '内置公钥不是合法的十六进制'
+    sig_u = _sig_url_of(u)
+    try:
+        sig_raw, _ = _read_text_from(sig_u, timeout=20)
+    except Exception as e:
+        return False, '拿不到签名(%s)' % type(e).__name__
+    try:
+        txt = sig_raw.decode('utf-8', 'replace').strip()
+    except Exception:
+        return False, '签名文件不是文本'
+    if not re.fullmatch(r'[0-9a-fA-F]{128}', txt):
+        # 注意措辞：长度对但不是十六进制也走这里（"128 个字符"与"128 个十六进制字符"是两回事）
+        return False, '签名格式不对(应为 128 个十六进制字符, 实际 %d 个字符)' % len(txt)
+    try:
+        if _ed25519.checkvalid(bytes.fromhex(txt), raw, pub):
+            return True, ''
+    except Exception as e:
+        return False, '验签出错(%s)' % type(e).__name__
+    return False, '签名不匹配'
+
+
+# 候选全都不行时留给调用方的一句人话（面板/气泡用），原因原文进日志。
+SIG_FAIL_MSG = '更新源校验未通过，已保留当前版本'
+# 最近一次"读升级源"失败的原文原因（如"签名不匹配"/"拿不到签名(HTTPError)"）。
+# 【为什么要分两栏】"校验未通过"和"连不上源"要给用户**不一样**的话：
+# 前者是我们主动拒绝（源被改过 / 签名缺失），后者才是网络问题 —— 混在一起会让人白折腾网络。
+_LAST_READ_WHY = ['']       # 本次联网失败的原文原因
+_LAST_READ_SIG = [False]    # 原因属不属于"验签这条线"（True 才提示"校验未通过"）
+
+
+def _update_cache_read():
+    """读升级缓存；**只认验过签的那一份**，其余当没缓存。
+
+    【2026-10-16】缓存里存的是"验过签的升级信息"，所以缓存命中就等于这次也验过签。
+    但要是缓存是**老版本**（还不认识签名这件事）写下的，就只能当它不可信、重新联网验
+    一遍 —— 否则"删掉 update.json / 读一份旧缓存"就成了跳过验签的后门。
+    """
+    try:
+        with open(UPDATE_CACHE, encoding='utf-8') as f:
+            c = json.load(f)
+    except Exception:
+        return None
+    if not c.get('_sig_ok'):
+        log('升级缓存不是验签得来的（可能是旧版写的），忽略它、重新联网验签')
+        return None
+    return c
+
+
 def read_update_info(use_cache=True, stale_fallback=False):
     """读升级信息; use_cache=True 时 6 小时内不重复联网。
 
@@ -3107,15 +3214,15 @@ def read_update_info(use_cache=True, stale_fallback=False):
     升级前那份旧缓存, 面板直接误报"本地版本比线上新"。手动检查必须联网;
     stale_fallback: 联网全失败时回读缓存并标 _stale —— 宁可明说"显示的是上次结果",
     也不静默把过期结论当现状。
+
+    【2026-10-16 升级通道加固】每个候选都要 **Ed25519 验签通过**才采用：
+    version.json 与它同目录的 version.json.sig 一起取，先验签、后解析 ——
+    绝不存在"先替换再验签"的顺序（这里连 exe 都还没碰）。
     """
-    if use_cache and os.path.isfile(UPDATE_CACHE):
-        try:
-            with open(UPDATE_CACHE, encoding='utf-8') as f:
-                c = json.load(f)
-            if time.time() - float(c.get('_checked', 0)) < 6 * 3600:
-                return c
-        except Exception:
-            pass
+    if use_cache:
+        c = _update_cache_read()
+        if c and time.time() - float(c.get('_checked', 0)) < 6 * 3600:
+            return c
     urls = list(UPDATE_URLS)
     try:
         if os.path.isfile(UPDATE_URL_TXT):
@@ -3125,20 +3232,32 @@ def read_update_info(use_cache=True, stale_fallback=False):
                 urls = [u]
     except Exception:
         pass
+    # 每个候选都要求「取得到 + Ed25519 验签通过」才采用；验不过就换下一个（见 _verify_update_sig）。
+    # 全部不行就把离用户最近的那条原因留给面板与日志 —— 不再只有一句"连不上升级源"。
+    last_why = ''
+    last_is_sig = False          # 这条原因是不是"验签这条线"上的（决定面板给哪句话）
     for u in urls:
         try:
-            if u.startswith(('http://', 'https://')):
-                req = urllib.request.Request(u, headers={'User-Agent': 'FoxPath'})
-                with urllib.request.urlopen(req, timeout=20) as r:
-                    raw = r.read().decode('utf-8', 'replace')
-            else:
-                with open(u, encoding='utf-8') as f:
-                    raw = f.read()
-            info = json.loads(raw)
+            raw_b, _ = _read_text_from(u)
+        except Exception as e:
+            last_why, last_is_sig = '读不到升级源(%s)' % type(e).__name__, False
+            log('升级检查失败(%s): %s' % (u, e))
+            continue
+        ok, why = _verify_update_sig(u, raw_b)
+        if not ok:
+            # ★ 验签不过 = 这条候选作废：**绝不解析、绝不采用、更不会去动 exe**。
+            last_why, last_is_sig = why, True
+            log('升级源校验未通过(%s): %s —— 已拒绝这条候选，继续试下一个' % (u, why))
+            continue
+        try:
+            info = json.loads(raw_b.decode('utf-8', 'replace'))
             if not info.get('version'):
+                last_why, last_is_sig = '升级源里没有版本号', True
                 continue
             info['_checked'] = time.time()
             info['_source'] = u
+            info['_sig_ok'] = True      # 标记"这份结果是验过签的"（缓存里也留着，便于排查）
+            _LAST_READ_WHY[0], _LAST_READ_SIG[0] = '', False
             try:
                 with open(UPDATE_CACHE, 'w', encoding='utf-8') as f:
                     json.dump(info, f, ensure_ascii=False)
@@ -3146,17 +3265,20 @@ def read_update_info(use_cache=True, stale_fallback=False):
                 pass
             return info
         except Exception as e:
+            last_why, last_is_sig = '升级源不是合法 JSON(%s)' % type(e).__name__, True
             log('升级检查失败(%s): %s' % (u, e))
             continue
-    if stale_fallback and os.path.isfile(UPDATE_CACHE):
-        # 联网全挂: 回读缓存, 但打上 _stale 标记, 由调用方在面板上明说
-        try:
-            with open(UPDATE_CACHE, encoding='utf-8') as f:
-                c = json.load(f)
+    if last_why:
+        _LAST_READ_WHY[0], _LAST_READ_SIG[0] = last_why, last_is_sig
+        log('升级检查: 所有候选取不到或验签不通过 —— %s' % last_why)
+    if stale_fallback:
+        # 联网全挂: 回读缓存, 但打上 _stale 标记, 由调用方在面板上明说。
+        # 缓存本身必须是**验过签的那一份**（_update_cache_read 会把没验签的挡掉）——
+        # 回退只是"显示上次结果"，不是"放松验签"。
+        c = _update_cache_read()
+        if c:
             c['_stale'] = True
             return c
-        except Exception:
-            pass
     return None
 
 
@@ -3176,9 +3298,16 @@ def do_update_check():
         return _update_get()
     _update_set(phase='checking', msg='正在检查升级源…', error='')
     # 用户明确按下"检查更新" = 必须联网(2026-10-12 修): 不许被 6 小时缓存挡过去
-    info = read_update_info(use_cache=False, stale_fallback=True)
+    info = read_update_info(use_cache=False, stale_fallback=False)
     if not info:
-        _update_set(phase='failed', error='net', msg='连不上升级源(或还没发布升级信息)')
+        # 2026-10-16：区分"连不上"和"验签不过"——后者要给用户一句明确的话
+        # （更新源校验未通过，已保留当前版本），别让人以为是自己网络的问题。
+        _why = (_LAST_READ_WHY[0] or '').strip()
+        if _why and _LAST_READ_SIG[0]:
+            _update_set(phase='failed', error='sig',
+                        msg='%s（%s）' % (SIG_FAIL_MSG, _why))
+        else:
+            _update_set(phase='failed', error='net', msg='连不上升级源(或还没发布升级信息)')
         return _update_get()
     node = update_exe_node(info) or {}
     remote = str(info.get('version') or '')
@@ -3518,8 +3647,10 @@ def _spawn_helper(exe, new, ver, silent=False):
 def _verify_download(path, node, sha):
     """升级包完整性校验(审查 H-1)。返回 (ok, err, msg)。
 
-    sha256 是这条升级链上唯一的完整性凭证(HTTPS 之外没有签名), 所以升级源里
-    没有 sha256 时必须拒绝 —— 不能像以前那样"want 为空就放行", 那会让漏写或
+    sha256 是**升级包本身**的完整性凭证(下载有没有坏、是不是同一份); 它和 exe 放在
+    同一个升级源里, 所以光有它挡不住"源被整体替换"—— 那道闸是升级源的 Ed25519 验签
+    (_verify_update_sig, 2026-10-16 加), 两道都过才采用。
+    升级源里没有 sha256 时必须拒绝 —— 不能像以前那样"want 为空就放行", 那会让漏写或
     被改写过的 exe 未经任何校验就覆盖到用户机器上。size 只要声明了也一并核对。
     """
     want = str(node.get('sha256') or '').upper().strip()
@@ -3547,6 +3678,15 @@ def apply_update_async(auto=False):
     校验不过就**静默保留旧版本**; 安全底线与手动升级完全一样。
     """
     info = read_update_info()
+    # 【2026-10-16 纵深防御】只认**验过签**的升级信息：read_update_info 只会把验签通过的
+    # 结果写进缓存，这里再认一次 _sig_ok —— 万一以后有人加了新入口、或塞进一份老版本写的
+    # 缓存，也不会拿着没验签的 version.json 去换 exe（fail-closed，宁可让用户重点一次）。
+    if not (info or {}).get('_sig_ok'):
+        why = SIG_FAIL_MSG + '（升级信息未经验签，请重新点一次「检查更新」）'
+        _update_set(phase='failed', error='sig', msg=why)
+        log('升级: 拒绝执行 —— 手上的升级信息没有通过 Ed25519 验签')
+        report_update_result(False, auto=auto, from_ver=APP_VERSION, why='sig')
+        return
     node = update_exe_node(info)
     if not node:
         _update_set(phase='failed', error='no_info', msg='升级信息里没有下载地址')
