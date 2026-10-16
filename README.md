@@ -29,7 +29,7 @@
 
 <p>🦊 <b>GitHub 访问优化助手</b>　·　只在本机做网络分流，退出即还原</p>
 
-<p>作者 <b>海风（kele551）</b>　·　<a href="https://gitee.com/kele551/FoxPath">Gitee（主）</a>　·　<a href="https://github.com/kele551/FoxPath">GitHub（镜像）</a>　·　<a href="docs/README_EN.md">English</a></p>
+<p>作者 <b>海风（kele551）</b>　·　<a href="https://gitee.com/kele551/FoxPath">Gitee（主）</a>　·　<a href="https://github.com/kele551/FoxPath">GitHub（镜像）</a>　·　<a href="https://atomgit.com/kele551/FoxPath">AtomGit（镜像）</a>　·　<a href="docs/README_EN.md">English</a></p>
 </div>
 
 <details>
@@ -67,11 +67,14 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 
 | 步骤 | 做什么 |
 |---|---|
-| **① 下载** | [Gitee 发行页](https://gitee.com/kele551/FoxPath/releases)（国内主源、直连快）或 [GitHub Releases](https://github.com/kele551/FoxPath/releases)，拿 `FoxPath.exe` |
+| **① 下载** | [Gitee 发行页](https://gitee.com/kele551/FoxPath/releases)（国内主源、直连快）或 [GitHub Releases](https://github.com/kele551/FoxPath/releases)，拿 `FoxPath.exe`。代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像 |
 | **② 运行** | 双击 `FoxPath.exe` → 浏览器自动弹出控制面板（首次启动等 15～20 秒，它在并发体检 IP） |
 | **③ 启用** | 面板点「启用加速」完事；不用了点「退出并还原」，系统设置恢复原样 |
 
 绿色单文件、无需安装、不要管理员权限；以后升级就在面板里点「检查更新 → 立即升级」。
+
+> **三个平台代码一致**：[Gitee](https://gitee.com/kele551/FoxPath)（主源）· [GitHub](https://github.com/kele551/FoxPath)（镜像）· [AtomGit](https://atomgit.com/kele551/FoxPath)（代码镜像，只提供源码归档）。
+> **二进制发行包请从 Gitee（主）或 GitHub（镜像）下载**；三个平台都收 Issue / PR。
 
 ---
 
@@ -222,7 +225,7 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 
 ## 版本记录
 
-> 当前对外发布版本 **v1.1.1**（2026-10-12，Gitee 与 GitHub 同步）。完整逐版说明见 [CHANGELOG.md](docs/CHANGELOG.md) 与 [release-notes.md](docs/release-notes.md)。
+> 当前对外发布版本 **v1.1.1**（2026-10-12）。发行版在 **Gitee（主源）** 与 **GitHub（镜像）**；自 2026-10-16 起代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像。完整逐版说明见 [CHANGELOG.md](docs/CHANGELOG.md) 与 [release-notes.md](docs/release-notes.md)。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |

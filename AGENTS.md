@@ -43,6 +43,19 @@ python tools/preflight_release.py  # 发版前自检（发布前必须全绿）
 - PR / 回复里写清**你怎么验证的**：什么网络环境、测了哪些域名、退出后系统代理与注册表是否还原；
 - 涉及挑线路/体检逻辑的改动，请附上实测数据（连通率、吞吐），别只讲原理。
 
+## 平台（三个，代码一致）
+
+代码同时镜像到三处：**Gitee（主源）** / **GitHub（镜像）** / **AtomGit（代码镜像）**。
+**二进制发行包只发 Gitee 与 GitHub** —— AtomGit 目前没有附件上传接口（它的 Release 只提供源码归档）。
+
+```powershell
+git push origin main --tags                     # Gitee（本仓库 origin 就是 Gitee）
+git push atomgit main --tags                    # AtomGit（令牌走 GIT_ASKPASS，不会出现在命令行）
+# GitHub 侧走工作区的纯 REST 工具（见维护者工作区工具说明）
+```
+
+三个平台改完都要推，**内容必须逐字节一致**（判定方法：`git diff atomgit/main origin/main` 应为空）。
+
 ## 任务从哪来
 
 GitHub Issues 里带 `good first issue` / `help wanted` 标签的条目，每条都写了**验收标准**。
