@@ -14,6 +14,29 @@
 
 ---
 
+## 〇、最短路径：提交一个改动（三步走）
+
+> 这条链就是"做完"的定义：**认领 → 改并自证 → 提交时贴出验收输出**。
+> 维护者侧怎么复核见 [REVIEWING.md](REVIEWING.md)。
+
+1. **认领**：在 [TASKS.md](../TASKS.md) 里挑一条（每行都带 issue 号与**验收命令**），或先开 Issue 说清方案；
+2. **改 + 自证**：一次只做一件事；改完**必须真的跑**：
+
+   ```powershell
+   python -m py_compile github_direct.py      # 语法
+   python github_direct.py                    # 真跑一次（会改系统代理）
+   python github_direct.py --restore          # 退出/还原链路要能走通
+   python tools/preflight_release.py          # 行为类改动尽量全绿
+   ```
+
+3. **提交**：中文提交信息（`fix:` / `feat:` / `docs:` / `chore:`），并在 PR / Issue 里**贴出上面命令的输出** ——
+   涉及注册表/系统代理的改动，还要贴出**"启用 → 退出 → 已还原"的前后对比**；写"应该没问题"的会被要求补验证。
+
+**不需要任何令牌或私有凭据**：自检里需要凭据的检查会自动 `[SKIP]` 并打印原因，别人克隆下来就能跑。
+用 AI 助手一起改也可以：先让它读 [../AGENTS.md](../AGENTS.md)（禁区清单）与 [ARCHITECTURE.md](ARCHITECTURE.md)（结构）。
+
+---
+
 ## 一、怎么提 Issue
 
 走 [Issues](https://github.com/kele551/FoxPath/issues)，有两个模板：
