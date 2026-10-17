@@ -12,7 +12,6 @@
 <img alt="Last Commit" src="https://img.shields.io/github/last-commit/kele551/FoxPath?style=flat-square&label=last%20commit&color=blue">
 
 <a href="https://github.com/kele551/FoxPath/stargazers"><img alt="GitHub Star" src="https://img.shields.io/github/stars/kele551/FoxPath?style=flat-square&logo=github&label=GitHub%20Star&color=gold"></a>
-<a href="https://gitee.com/kele551/FoxPath"><img alt="Gitee Star" src="https://gitee.com/kele551/FoxPath/badge/star.svg"></a>
 <a href="https://github.com/kele551/FoxPath/network/members"><img alt="GitHub Fork" src="https://img.shields.io/github/forks/kele551/FoxPath?style=flat-square&label=GitHub%20Fork&color=blue"></a>
 <a href="https://github.com/kele551"><img alt="Follow Author" src="https://img.shields.io/github/followers/kele551?style=flat-square&logo=github&label=follow%20author&color=blue"></a>
 
@@ -22,7 +21,7 @@
 
 <img alt="Zero Deps" src="https://img.shields.io/badge/第三方依赖-零-green?style=flat-square">
 
-<a href="https://gitee.com/kele551/FoxPath/releases"><img alt="Download from Gitee" src="https://img.shields.io/badge/%F0%9F%93%A5_%E4%B8%8B%E8%BD%BD-Gitee%E4%B8%BB%E6%BA%90-c71d24?style=flat-square&logo=gitee&logoColor=white&labelColor=3d4552"></a>
+<a href="https://gitcode.com/kele551/FoxPath/releases"><img alt="Download from GitCode" src="https://img.shields.io/badge/%F0%9F%93%A5_%E4%B8%8B%E8%BD%BD-GitCode%E4%B8%BB%E6%BA%90-c71d24?style=flat-square&logo=gitee&logoColor=white&labelColor=3d4552"></a>
 <a href="https://github.com/kele551/FoxPath"><img alt="GitHub mirror" src="https://img.shields.io/badge/%F0%9F%90%99_%E6%BA%90%E7%A0%81-GitHub%E9%95%9C%E5%83%8F-24292f?style=flat-square&logo=github&logoColor=white&labelColor=3d4552"></a>
 <a href="https://www.bilibili.com/video/BV1tupx6kEPt"><img alt="Bilibili demo" src="https://img.shields.io/badge/%F0%9F%93%BA_%E6%BC%94%E7%A4%BA-B%E7%AB%99%E8%A7%86%E9%A2%91-00a1d6?style=flat-square&logo=bilibili&logoColor=white&labelColor=3d4552"></a>
 <a href="https://github.com/kele551/FoxPath/issues"><img alt="Issues" src="https://img.shields.io/badge/%F0%9F%90%9E_%E5%8F%8D%E9%A6%88-%E6%8F%90Issue-0969da?style=flat-square&labelColor=3d4552"></a>
@@ -30,7 +29,7 @@
 
 <p>🦊 <b>GitHub 访问优化助手</b>　·　只在本机做网络分流，退出即还原</p>
 
-<p>作者 <b>海风（kele551）</b>　·　<a href="https://gitee.com/kele551/FoxPath">Gitee（主）</a>　·　<a href="https://github.com/kele551/FoxPath">GitHub（镜像）</a>　·　<a href="https://atomgit.com/kele551/FoxPath">AtomGit（镜像）</a>　·　<a href="docs/README_EN.md">English</a></p>
+<p>作者 <b>海风（kele551）</b>　·　<a href="https://gitcode.com/kele551/FoxPath">GitCode（主）</a>　·　<a href="https://github.com/kele551/FoxPath">GitHub（镜像）</a>　·　<a href="https://atomgit.com/kele551/FoxPath">AtomGit（镜像）</a>　·　<a href="docs/README_EN.md">English</a></p>
 </div>
 
 <details>
@@ -42,7 +41,6 @@
 <img alt="Contributors" src="https://img.shields.io/github/contributors/kele551/FoxPath?style=flat-square&label=contributors">
 <a href="https://github.com/kele551/FoxPath/issues"><img alt="Issues" src="https://img.shields.io/github/issues/kele551/FoxPath?style=flat-square&label=issues"></a>
 <img alt="Resolved" src="https://img.shields.io/github/issues-closed/kele551/FoxPath?style=flat-square&label=resolved">
-<img alt="Gitee Fork" src="https://gitee.com/kele551/FoxPath/badge/fork.svg">
 <img alt="Language" src="https://img.shields.io/github/languages/top/kele551/FoxPath?style=flat-square">
 <img alt="Code Size" src="https://img.shields.io/github/languages/code-size/kele551/FoxPath?style=flat-square&label=code%20size">
 <a href="https://github.com/kele551/FoxPath/blob/main/docs/CONTRIBUTING.md"><img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square"></a>
@@ -68,7 +66,7 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 
 | 步骤 | 做什么 |
 |---|---|
-| **① 下载** | [GitCode 发行页](https://gitcode.com/kele551/FoxPath/releases)（国内主源、直连快）或 [Gitee](https://gitee.com/kele551/FoxPath/releases) / [GitHub Releases](https://github.com/kele551/FoxPath/releases)，拿 `FoxPath.exe`。代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像 |
+| **① 下载** | [GitCode 发行页](https://gitcode.com/kele551/FoxPath/releases)（国内主源、直连快）或 [Gitee](https://gitcode.com/kele551/FoxPath/releases) / [GitHub Releases](https://github.com/kele551/FoxPath/releases)，拿 `FoxPath.exe`。代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像 |
 | **② 运行** | 双击 `FoxPath.exe` → 浏览器自动弹出控制面板（首次启动等 15～20 秒，它在并发体检 IP） |
 | **③ 启用** | 面板点「启用加速」完事；不用了点「退出并还原」，系统设置恢复原样 |
 
@@ -134,14 +132,14 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 <summary><b>用法</b>（点击展开）</summary>
 
 
-1. 从 [Gitee Releases](https://gitee.com/kele551/FoxPath/releases)（国内主源，直连快）或 [GitHub Releases](https://github.com/kele551/FoxPath/releases) 下载 `FoxPath.exe`
+1. 从 [Gitee Releases](https://gitcode.com/kele551/FoxPath/releases)（国内主源，直连快）或 [GitHub Releases](https://github.com/kele551/FoxPath/releases) 下载 `FoxPath.exe`
 2. 双击运行 → 浏览器自动打开控制面板 `http://127.0.0.1:8788/ui`
 3. 勾选「开机自启」即可后台常驻
 
 **首次启动请等 15～20 秒**：程序要并发体检 49 个候选 IP，体检完成前代理还没完全生效。
 
 > 升级最简单的方式是面板里的「检查更新 → 立即升级」（v1.1.1 起手动检查强制联网，不再被缓存挡住）。
-> 万一升级源也连不上，到 [Gitee 发行页](https://gitee.com/kele551/FoxPath/releases) 下载最新 `FoxPath.exe`
+> 万一升级源也连不上，到 [Gitee 发行页](https://gitcode.com/kele551/FoxPath/releases) 下载最新 `FoxPath.exe`
 > 覆盖安装即可，配置与收藏全部保留、无需卸载。
 
 ### 控制面板上有什么
@@ -219,7 +217,7 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 - **不会把「降级」当「升级」**：按版本号语义比较（`1.0.10 > 1.0.9` 这种也算得对），线上不比本地新时按钮置灰、服务端也拒绝执行。
 - **升级失败会自动回滚**：新版连续起不来时，小助手把旧版本放回去并重新启动它。
 - **升级完成后程序会自动重新打开**；万一它没出现，双击 `FoxPath.exe` 就能正常使用 —— 升级本身是完成的，系统代理已还原，不会影响上网。
-- **升级源不通时（2026-10-12 补）**：点「检查更新」长时间连不上源，不必干等 —— 到 [Gitee 发行页](https://gitee.com/kele551/FoxPath/releases) 下载最新 `FoxPath.exe`，关掉旧程序后双击覆盖即可，配置全部保留。
+- **升级源不通时（2026-10-12 补）**：点「检查更新」长时间连不上源，不必干等 —— 到 [Gitee 发行页](https://gitcode.com/kele551/FoxPath/releases) 下载最新 `FoxPath.exe`，关掉旧程序后双击覆盖即可，配置全部保留。
 
 > 升级细节与历史说明更正（`_PYI_*` 环境变量真因、v1.0.6→v1.0.7 那一跳、各版本护栏边界）见 [CONTRIBUTING.md](docs/CONTRIBUTING.md) 第九节。
 
@@ -334,4 +332,4 @@ MIT
 
 ---
 
-<p align="center"><sub>© 2026 海风（kele551） · MIT License · <a href="https://gitee.com/kele551/FoxPath">Gitee 主仓库</a> · <a href="https://github.com/kele551/FoxPath">GitHub 镜像</a></sub></p>
+<p align="center"><sub>© 2026 海风（kele551） · MIT License · <a href="https://gitcode.com/kele551/FoxPath">GitCode 主仓库</a> · <a href="https://github.com/kele551/FoxPath">GitHub 镜像</a></sub></p>
