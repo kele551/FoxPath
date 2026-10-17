@@ -19,6 +19,14 @@
 <img alt="Category" src="https://img.shields.io/badge/分类-应用软件-blue?style=flat-square">
 <img alt="No Admin" src="https://img.shields.io/badge/管理员权限-不需要-brightgreen?style=flat-square">
 <img alt="No Hosts DNS" src="https://img.shields.io/badge/hosts·DNS-不改-brightgreen?style=flat-square">
+
+> **📦 主源已迁移到 GitCode（2026-10-17）**
+>
+> 本仓库（Gitee）继续保留历史与旧版入口；**最新版下载 / 主源请走 [GitCode](https://gitcode.com/kele551/FoxPath/releases)**（国内、快、带准确下载统计）。GitHub 保留镜像。
+>
+> - **为什么迁**：Gitee 不公开发行版附件的下载数，统计不到真实下载量；GitCode（=AtomGit）能放 exe 附件、有准确的下载数接口，API 也更全。
+> - **老用户怎么过渡**：照常从本仓库升级即可，升到 **v1.2.1** 后客户端会自动切到 GitCode，**不用重装、不用改配置**；原有升级链继续有效。
+> - **三平台关系**：GitCode（主源）· Gitee（历史 + 旧入口）· GitHub（镜像），代码逐字节一致。
 <img alt="Zero Deps" src="https://img.shields.io/badge/第三方依赖-零-green?style=flat-square">
 
 <a href="https://gitee.com/kele551/FoxPath/releases"><img alt="Download from Gitee" src="https://img.shields.io/badge/%F0%9F%93%A5_%E4%B8%8B%E8%BD%BD-Gitee%E4%B8%BB%E6%BA%90-c71d24?style=flat-square&logo=gitee&logoColor=white&labelColor=3d4552"></a>
@@ -67,7 +75,7 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 
 | 步骤 | 做什么 |
 |---|---|
-| **① 下载** | [Gitee 发行页](https://gitee.com/kele551/FoxPath/releases)（国内主源、直连快）或 [GitHub Releases](https://github.com/kele551/FoxPath/releases)，拿 `FoxPath.exe`。代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像 |
+| **① 下载** | [GitCode 发行页](https://gitcode.com/kele551/FoxPath/releases)（国内主源、直连快）或 [Gitee](https://gitee.com/kele551/FoxPath/releases) / [GitHub Releases](https://github.com/kele551/FoxPath/releases)，拿 `FoxPath.exe`。代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像 |
 | **② 运行** | 双击 `FoxPath.exe` → 浏览器自动弹出控制面板（首次启动等 15～20 秒，它在并发体检 IP） |
 | **③ 启用** | 面板点「启用加速」完事；不用了点「退出并还原」，系统设置恢复原样 |
 
@@ -77,7 +85,7 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 > （**录制于 v1.0.7**，界面以实际版本为准；最新变化见 [release-notes.md](docs/release-notes.md)），点开即播。
 
 > **三个平台代码一致**：[Gitee](https://gitee.com/kele551/FoxPath)（主源）· [GitHub](https://github.com/kele551/FoxPath)（镜像）· [AtomGit](https://atomgit.com/kele551/FoxPath)（代码镜像，只提供源码归档）。
-> **二进制发行包请从 Gitee（主）或 GitHub（镜像）下载**；三个平台都收 Issue / PR。
+> **二进制发行包请从 GitCode（主）或 Gitee / GitHub（镜像）下载**；三个平台都收 Issue / PR。
 
 ---
 
@@ -239,7 +247,7 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 
 ## 版本记录
 
-> 当前对外发布版本 **v1.2.1**（2026-10-12）。发行版在 **Gitee（主源）** 与 **GitHub（镜像）**；自 2026-10-16 起代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像。完整逐版说明见 [CHANGELOG.md](docs/CHANGELOG.md) 与 [release-notes.md](docs/release-notes.md)。
+> 当前对外发布版本 **v1.2.1**（2026-10-17）。主源 **GitCode** · 历史 **Gitee** · 镜像 **GitHub**；自 2026-10-16 起代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像。完整逐版说明见 [CHANGELOG.md](docs/CHANGELOG.md) 与 [release-notes.md](docs/release-notes.md)。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
