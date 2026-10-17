@@ -1,7 +1,7 @@
-name: downloads-badge
+name: badges
 
-# 每天自动把「真实下载数 = GitHub + GitCode」写进 docs/downloads.json，
-# README 的下载徽章用 shields.io endpoint 读它。
+# 每天自动更新「真实下载数（GitHub + GitCode）」与「浏览量（Gitee + GitCode）」的徽章数据，
+# README 里两枚徽章用 shields.io endpoint 读 docs/downloads.json / docs/views.json。
 
 on:
   schedule:
@@ -21,20 +21,21 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 更新下载数
+      - name: 更新徽章数据
         run: |
           python tools/downloads_badge.py \
             --repo "${{ github.event.repository.name }}" \
-            --out docs/downloads.json
+            --out docs/downloads.json \
+            --views-out docs/views.json
 
       - name: 提交（有变化才提交）
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/downloads.json
+          git add docs/downloads.json docs/views.json
           if git diff --staged --quiet; then
-            echo "下载数没变，跳过提交"
+            echo "数字没变，跳过提交"
           else
-            git commit -m "chore: 更新下载数徽章"
+            git commit -m "chore: 更新下载数 / 浏览量徽章"
             git push
           fi
