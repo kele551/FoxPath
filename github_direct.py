@@ -68,7 +68,7 @@ except Exception:
     UPDATE_SIG_AVAILABLE = False
 
 APP_NAME = '狐径'
-APP_VERSION = '1.2.0'
+APP_VERSION = '1.2.1'
 # 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
 AUTHOR = '海风（kele551）'
 AUTHOR_ASCII = 'HaiFeng (kele551)'
@@ -2316,6 +2316,9 @@ def autostart_on():
 # 升级源: 仓库里的 version.json, Gitee raw 优先、GitHub 兜底;
 #         测试时可在数据目录放一个 update_url.txt 指到本地文件。
 UPDATE_URLS = (
+    # 2026-10-17: 主源切到 GitCode（国内、快、下载数可统计）；Gitee / GitHub 保留兜底。
+    # GitCode 没有 Gitee 那种 raw 直链，用它的 API raw：/raw/version.json?ref=main
+    'https://gitcode.com/api/v5/repos/kele551/FoxPath/raw/version.json?ref=main',
     'https://gitee.com/kele551/FoxPath/raw/main/version.json',
     'https://raw.githubusercontent.com/kele551/FoxPath/main/version.json',
 )
@@ -3142,9 +3145,14 @@ def _read_text_from(u, timeout=20):
 def _sig_url_of(u):
     """签名文件与 version.json **同目录同名**：<...>/version.json -> <...>/version.json.sig。
 
-    线上就是这么放的（`…/raw/main/version.json.sig`）；本地路径（update_url.txt 指到文件，
-    演练用）同样按"名字后面加 .sig"找。
+    线上就是这么放的（`…/raw/main/version.json.sig`；GitCode 是 `…/raw/version.json?ref=main`）；
+    本地路径（update_url.txt 指到文件，演练用）同样按"名字后面加 .sig"找。
+    2026-10-17: 升级源现在可能带查询串（GitCode 的 ?ref=main），`.sig` 要插在 `?` 之前，
+    不能直接拼在末尾。
     """
+    if '?' in u:
+        p, q = u.split('?', 1)
+        return p + '.sig?' + q
     return u + '.sig'
 
 

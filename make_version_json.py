@@ -78,10 +78,13 @@ def main():
     ver = m.group(1)
     out = {'version': ver, 'notes': a.notes,
            'exe': {'sha256': sha256(a.exe),
-                   'url': 'https://gitee.com/kele551/FoxPath/releases/download/v%s/FoxPath.exe' % ver,
+                   'url': 'https://gitcode.com/kele551/FoxPath/releases/download/v%s/FoxPath.exe' % ver,
                    'size': os.path.getsize(a.exe)}}
-    if a.mirror:
-        out['exe']['mirrors'] = a.mirror
+    # 2026-10-17: 主下载源切到 GitCode（国内、快、下载数可统计）；Gitee / GitHub 作回退镜像。
+    out['exe']['mirrors'] = list(a.mirror) if a.mirror else [
+        'https://gitee.com/kele551/FoxPath/releases/download/v%s/FoxPath.exe' % ver,
+        'https://github.com/kele551/FoxPath/releases/download/v%s/FoxPath.exe' % ver,
+    ]
     # ① 先写 version.json（签名对象是这份文件的**原始字节**，所以必须先落盘、再签名）
     raw = json.dumps(out, ensure_ascii=False, indent=2).encode('utf-8') + b'\n'
     with open(a.out, 'wb') as f:
