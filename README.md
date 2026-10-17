@@ -3,7 +3,7 @@
 
 <h1>狐径 FoxPath</h1>
 
-<a href="https://gitcode.com/kele551/FoxPath/releases" title="点击去下载（GitHub + GitCode 合计，每天自动更新）"><img alt="Downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fkele551%2FFoxPath%2Fmain%2Fdocs%2Fdownloads.json&style=flat-square" height="30"></a>
+<a href="https://gitcode.com/kele551/FoxPath/releases" title="点击去下载（GitHub + GitCode 合计 · 实时）"><img alt="Downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DFoxPath%26kind%3Ddownloads&style=flat-square" height="30"></a>
 <a href="https://gitcode.com/kele551/FoxPath" title="浏览量 · Gitee + GitCode 合计 · 实时"><img alt="浏览量" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DFoxPath%26kind%3Dviews&style=flat-square" height="30"></a>
 
 <a href="https://github.com/kele551/FoxPath/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
