@@ -20,9 +20,9 @@
 <img alt="No Admin" src="https://img.shields.io/badge/管理员权限-不需要-brightgreen?style=flat-square">
 <img alt="No Hosts DNS" src="https://img.shields.io/badge/hosts·DNS-不改-brightgreen?style=flat-square">
 
-> **📦 主源已迁移到 GitCode（2026-10-17）**
+> **📦 已迁移到 GitCode，本仓库（Gitee）停止更新（2026-10-17）**
 >
-> 本仓库（Gitee）继续保留历史与旧版入口；**最新版下载 / 主源请走 [GitCode](https://gitcode.com/kele551/FoxPath/releases)**（国内、快、带准确下载统计）。GitHub 保留镜像。
+> **Gitee 最后一版是 v1.2.1（2026-10-17）**；以后的更新只在 [GitCode](https://gitcode.com/kele551/FoxPath/releases)（主源）与 [GitHub](https://github.com/kele551/FoxPath)（镜像）发布。
 >
 > - **为什么迁**：Gitee 不公开发行版附件的下载数，统计不到真实下载量；GitCode（=AtomGit）能放 exe 附件、有准确的下载数接口，API 也更全。
 > - **老用户怎么过渡**：照常从本仓库升级即可，升到 **v1.2.1** 后客户端会自动切到 GitCode，**不用重装、不用改配置**；原有升级链继续有效。
