@@ -1,0 +1,40 @@
+name: downloads-badge
+
+# 每天自动把「真实下载数 = GitHub + GitCode」写进 docs/downloads.json，
+# README 的下载徽章用 shields.io endpoint 读它。
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # 每天 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 更新下载数
+        run: |
+          python tools/downloads_badge.py \
+            --repo "${{ github.event.repository.name }}" \
+            --out docs/downloads.json
+
+      - name: 提交（有变化才提交）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/downloads.json
+          if git diff --staged --quiet; then
+            echo "下载数没变，跳过提交"
+          else
+            git commit -m "chore: 更新下载数徽章"
+            git push
+          fi
