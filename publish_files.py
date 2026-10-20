@@ -37,7 +37,7 @@ FILES = [
     'docs/release-notes.md',
 ]
 
-VERSION = 'v1.2.1'      # 提交信息里的版本号, 改版本时同步改这里(已并入 tools/publish.py 的自动改版)
+VERSION = 'v1.2.2'      # 提交信息里的版本号, 改版本时同步改这里(已并入 tools/publish.py 的自动改版)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
