@@ -68,11 +68,11 @@ except Exception:
     UPDATE_SIG_AVAILABLE = False
 
 APP_NAME = '狐径'
-APP_VERSION = '1.2.1'
+APP_VERSION = '1.2.2'
 # 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
 AUTHOR = '海风（kele551）'
 AUTHOR_ASCII = 'HaiFeng (kele551)'
-HOMEPAGE = 'gitee.com/kele551/FoxPath'
+HOMEPAGE = 'github.com/kele551/FoxPath'
 PROXY_PORT = 8787
 PANEL_PORT = 8788
 CHECK_INTERVAL = 300          # 5 分钟重测一轮
@@ -4191,7 +4191,7 @@ refresh(); var _refreshTimer = setInterval(refresh,3000);
   // 「发现新版本」或者「本地版本比线上新（预发布/开发版本）」(2026-10-09 加)。
   setInterval(tick, 15000);
 })();
-</script><div style="margin:16px 0 6px;text-align:center;font-size:12px;color:#8a8a8f">狐径 FoxPath · 作者 __AUTHOR__ · __HOMEPAGE__</div>
+</script><div style="margin:16px 0 6px;text-align:center;font-size:12px;color:#8a8a8f">狐径 FoxPath · 作者 __AUTHOR__ · <a href="https://__HOMEPAGE__" target="_blank" rel="noopener" style="color:#8a8a8f;text-decoration:none">__HOMEPAGE__</a></div>
 </body></html>
 """
 
