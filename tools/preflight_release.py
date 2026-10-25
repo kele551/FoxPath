@@ -960,4 +960,47 @@ finally:
         time.sleep(10)
         print('  已把你的狐径重新启动（面板可用: %s）' % up())
 
+# ══════════════════════════════════════════════════════════════════════════
+# 老仓库（Gitee）地址清扫（章程 4.19.5，2026-10-23 用户要求）
+#   发布文件里一律不许再出现老仓库（Gitee）域名；历史的 CHANGELOG 除外。
+#   version.json 是带签名的线上升级源，这里只警告（改了必须重新签名并发版）。
+# ══════════════════════════════════════════════════════════════════════════
+say()
+say('老仓库地址清扫：发布文件里不含 Gitee 域名')
+# 关键字拆开拼：不然"禁止清单"自己会被扫成命中（2026-10-19 邮箱那次就是这么翻车的）
+_NEEDLE = 'gitee' + '.com/kele551'
+_NEEDLE2 = 'raw.gitee' + 'usercontent'
+_bad_gitee = []
+_scan_ext = ('.md', '.txt', '.py', '.ps1', '.json', '.html', '.yml', '.yaml')
+_skip_names = {'CHANGELOG.md', 'version.json'}
+for _dp, _dn, _fn in os.walk(REPO):
+    if os.sep + '.git' in _dp:
+        continue
+    _dn[:] = [d for d in _dn if d not in ('.git', 'node_modules', 'build_tmp')]
+    for _f in _fn:
+        if not _f.lower().endswith(_scan_ext) or _f in _skip_names:
+            continue
+        _p = os.path.join(_dp, _f)
+        try:
+            _t = io.open(_p, encoding='utf-8-sig', errors='replace').read()
+        except Exception:
+            continue
+        for _i, _ln in enumerate(_t.splitlines(), 1):
+            if _NEEDLE in _ln or _NEEDLE2 in _ln:
+                _bad_gitee.append('%s:%d' % (os.path.relpath(_p, REPO), _i))
+check('发布文件里没有老仓库（Gitee）地址', not _bad_gitee,
+      '；'.join(_bad_gitee[:5]) + (' 等 %d 处' % len(_bad_gitee) if len(_bad_gitee) > 5 else ''))
+
+_vj_gitee = []
+try:
+    _vjt = io.open(os.path.join(REPO, 'version.json'), encoding='utf-8-sig').read()
+    for _ln in _vjt.splitlines():
+        if _NEEDLE in _ln:
+            _vj_gitee.append(_ln.strip()[:80])
+except Exception:
+    pass
+check_warn('version.json（线上升级源）里也不含 Gitee 地址', not _vj_gitee,
+           '；'.join(_vj_gitee[:2]) + '（改了要重新签名并发版）' if _vj_gitee else '')
+
+
 finish()

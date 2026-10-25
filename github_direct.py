@@ -2,7 +2,7 @@
 """
 GitHub 直连助手 —— 绿色单文件版
 
-作者:  海风（kele551）    https://gitee.com/kele551/FoxPath
+作者:  海风（kele551）    https://gitcode.com/kele551/FoxPath
 协作:  小腾（只在源码里留档，不出现在界面上）
 
 干什么
@@ -39,6 +39,7 @@ import ctypes
 import ipaddress
 import json
 import os
+import platform          # 一键反馈包: 系统版本要写清楚(2026-10-24)
 import collections
 import queue
 import re
@@ -79,10 +80,22 @@ CHECK_INTERVAL = 300          # 5 分钟重测一轮
 # 转发通道的"空闲上限": 只要两端还有数据流动就一直续期, 不是总时长上限(审查 H-4)。
 RELAY_IDLE_TIMEOUT = 600
 
-# PAC 只代理这两个主机；代理内部也用同一份名单，保证"PAC 会送来的"和
-# "代理愿意走 IP 池的"完全一致。githubassets/githubusercontent/api.github.com
-# 一律 DIRECT —— 它们直连本来就通，走代理反而会坏（见 README 已知边界）。
-PROXY_HOSTS = ('github.com', 'www.github.com')
+# PAC 只代理这几台主机；代理内部也用同一份名单，保证"PAC 会送来的"和
+# "代理愿意走 IP 池的"完全一致。githubassets / api.github.com 一律 DIRECT ——
+# 它们直连本来就通，走代理反而会坏（见 README 已知边界）。
+#
+# 【2026-10-24 接管范围核实（UI 整改顺带做）—— 实测证据在 logs\UI整改-20261024\】
+#   · codeload.github.com —— **纳入**。它跟 github.com 是同一批官方 web 服务器：
+#     用候选池 IP + SNI=codeload.github.com 实测，证书覆盖 *.github.com、HTTP 301
+#     （正常行为）。所以它走 HEALTH 池，**没有新增任何 IP**。
+#   · gist.github.com —— **暂不纳入，列 TODO**。本机 DNS 被污染（解析出 2001::1 /
+#     78.16.49.15），改用 6 个官方 IP、每个试 2 次，SNI=gist.github.com 一律在
+#     握手阶段 ConnectionResetError；而同一批 IP 用 SNI=github.com 全部 200。
+#     换 IP 解决不了这一层，接管过去也白搭 —— 不写占位 IP、也不假装能加速。
+#   · githubassets.com —— **保持 DIRECT，列 TODO**。它解析到 185.199.108.215
+#     （在官方 web 段 185.199.108.0/22 内），但证书是 *.githubassets.com，与 raw 池
+#     校验的 githubusercontent 证书不同；本机实测 TLS 194ms、本来就快，没必要动。
+PROXY_HOSTS = ('github.com', 'www.github.com', 'codeload.github.com')
 
 # 2026-10-09 用户要求：把 GitHub Pages 也纳入接管范围。
 # 页面挂在 *.github.io 上（用户名.github.io），用的还是 185.199.108.0/22 那一段，
@@ -253,6 +266,64 @@ def _note_route(key, ip, sys_ips):
     return src
 
 
+# ------------------------------------------------------- 连续全灭 = 别再傻等
+# 【2026-10-24 新增·快速失败(用户批准的改法②)】
+# 用户的原始痛点: "国外仓库一直打不开", 而每发请求都要走完
+#   抢连 4 秒 + 兜底系统解析 10 秒 ≈ 14 秒才拿到一个"连不上"。
+# 一次就算了, 可浏览器打开 github 会并发十几条请求, 每条都这么等, 体感就是
+# 整个站点卡死。这里记"全灭"的次数: 上一条请求池子和兜底一起死了, 说明
+# **这条链路此刻根本不通**, 下一条兜底时没必要再等满 10 秒 —— 压到 3 秒,
+# 让请求快速失败、让浏览器自己重试; 一旦连上就立刻恢复原来的宽松预算。
+_SYS_FAIL = {}              # key -> (连续全灭次数, 上次全灭的时刻)
+_SYS_FAIL_LOCK = threading.Lock()
+_SHORT_BUDGET_GAP = 30.0    # 上次全灭距今超过这个秒数, 就不算"连续"
+_SYS_FAIL_SHORT_TIMEOUT = 3.0
+_SYS_FAIL_FULL_TIMEOUT = 10.0
+
+
+def _sys_fail_bump(key):
+    now = time.time()
+    with _SYS_FAIL_LOCK:
+        n, ts = _SYS_FAIL.get(key, (0, 0.0))
+        if now - ts > 180:
+            n = 0          # 隔了太久没动静(用户合盖/换网), 别拿旧账吓自己
+        _SYS_FAIL[key] = (n + 1, now)
+        return n + 1
+
+
+def _sys_fail_reset(key):
+    with _SYS_FAIL_LOCK:
+        _SYS_FAIL[key] = (0, time.time())
+
+
+def _sys_fail_budget(key):
+    """退回系统解析时最多等多久: 上一条请求已经全灭过了就压短。
+
+    门槛为什么定"上一次失败过"而不是"连着两次": 记的本来就是**整条链路全灭**
+    (池子抢连 + 系统解析一起死)，一次就说明这条路径此刻不通，第二次再去等满
+    10 秒纯属重复交学费。任何一次连上就 `_sys_fail_reset` 恢复宽松预算。
+    """
+    with _SYS_FAIL_LOCK:
+        n, ts = _SYS_FAIL.get(key, (0, 0.0))
+    if n >= 1 and time.time() - ts <= _SHORT_BUDGET_GAP:
+        return _SYS_FAIL_SHORT_TIMEOUT
+    return _SYS_FAIL_FULL_TIMEOUT
+
+
+# 轻探日志的节流: 页面一开就是十几条请求, 每条都记一行会把有用日志冲掉。
+_FAST_LOG = {}
+_FAST_LOG_LOCK = threading.Lock()
+
+
+def _fast_log_ok(key, gap=30.0):
+    now = time.time()
+    with _FAST_LOG_LOCK:
+        if now - _FAST_LOG.get(key, 0.0) < gap:
+            return False
+        _FAST_LOG[key] = now
+    return True
+
+
 # --------------------------------------------------------------- IP 寿命台账
 # 【2026-10-11 修·"多久会被锁死、在锁死之前就换掉"】
 # 用户的核心诉求不是"死了能救回来"，而是**别让它死在手上**：救回来要等超时
@@ -290,6 +361,70 @@ _KBPS_LOCK = threading.Lock()
 _KBPS_TTL = 150.0          # 吞吐会随时间变, 超过这个时间没重测就不作数
 _KBPS_DIRECT_MIN = 60      # 低于这个速度谈不上"快", 不值得绕开抢连
 _KBPS_WIN_RATIO = 1.15     # 池内取最快时要领先次快 15%, 否则可能是测量噪声
+
+# 【2026-10-24 新增】"实测成过"的新鲜窗口。定 90 秒的依据是这台机器的实测:
+# IP 寿命台账跑出来 148~227 秒(面板"IP 寿命基准"那一行), 而体检周期最长 5 分钟 ——
+# 窗口取到寿命的一半以内, 才不会把"上一轮活着、这一轮早死了"的 IP 算成能打开页面。
+_FRESH_WINDOW = 90.0
+
+# 【2026-10-24 新增·"证书对、页面不给你"的那类 IP，实测拉黑】
+# 起因：装机版跑起来后 github.com 满屏 400（"Bad request · GitHub"），可狐径自己一路绿灯。
+# 实测（本地复现脚本 fx_probe_replica，一次性探针、不入库，连打 8 发）抓到两个这样的 IP：
+#   20.200.245.244 → 8/8 次 400（握手最快，体检报 256ms）
+#   20.205.243.161 → 8/8 次 400（体检报 281ms）
+#   20.200.245.247 / 140.82.113.4 / 20.29.134.23 / 4.249.131.164 / 20.205.243.166 → 8/8 次 200
+# 它们是 Azure 前门里**不负责 github.com 页面**的节点：TCP 通、TLS 通、证书里也确实有
+# github.com，所以体检只要有一发把它放过去，抢连（只比握手快慢）就会反复选中它。
+# 而转发是加密隧道，里面那个 400 我们根本看不见 —— 日志一切正常，用户却打不开仓库。
+_BAD_EDGE = {}             # ip -> (拉黑到期时刻, 实测到的状态码)
+_BAD_EDGE_TTL = 900.0      # 15 分钟后放它重新参加体检（这类节点会换人）
+_BAD_EDGE_LOCK = threading.Lock()
+
+
+def _bad_edge_note(ip, status=''):
+    """实测回 4xx/5xx 的 IP 记进黑名单，带上状态码好从日志里看出为什么被拉黑。"""
+    if not ip:
+        return
+    with _BAD_EDGE_LOCK:
+        _BAD_EDGE[ip] = (time.time() + _BAD_EDGE_TTL, status)
+
+
+def _bad_edge(ip):
+    """这个 IP 还在黑名单里吗？过期就顺手清掉。"""
+    with _BAD_EDGE_LOCK:
+        exp = _BAD_EDGE.get(ip)
+        if not exp:
+            return False
+        if time.time() >= exp[0]:
+            _BAD_EDGE.pop(ip, None)
+            return False
+        return True
+
+
+# 【2026-10-24 三修·④b 探针要有全局闸门】
+# ④b 那轮"先发 GET / 问谁真答话"是**每条转发请求各自起一个并发 3~4 的批次**。
+# 单看一条请求没错，可浏览器打开一个 GitHub 页面就是十几条并发请求：池子刚好
+# 处于 fast(90 秒没 HTTP 证据)时，就是十几个批次同时探同一批 IP —— 探测自己把
+# 国际链路挤拥塞，fast 就更解不开，单请求从 ~12 秒涨到 ~16 秒以上。
+# 这和 10-11 记过的"并发 14 个探测互相拖慢"是同一个坑，只是这次规模由浏览器决定。
+# 全局只放一轮在跑：抢不到闸门的那些请求**直接跳过实测**、按老路做 TCP 抢连，
+# 不多等一秒(实测批次本身要 1.5~3.5 秒，串行排队只会更糟)。
+_PRESCAN_LOCK = threading.Lock()
+_PRESCAN_BUSY = [False]
+
+
+def _prescan_take():
+    """占④b 探针的坑；已经有人在测就返回 False(调用方跳过实测，别排队等)。"""
+    with _PRESCAN_LOCK:
+        if _PRESCAN_BUSY[0]:
+            return False
+        _PRESCAN_BUSY[0] = True
+        return True
+
+
+def _prescan_release():
+    with _PRESCAN_LOCK:
+        _PRESCAN_BUSY[0] = False
 
 
 def _kbps_set(ip, kbps):
@@ -439,6 +574,14 @@ def _hot_drop(key, ip):
         _HOT[key] = [(i, t) for i, t in _HOT.get(key, []) if i != ip]
 
 
+# 【2026-10-25 新增】转发"全灭"后临时补热备的闸门: 同一池 30 秒内只补一次。
+# 每条失败请求各起一个并发 4 的探针批次, 在链路本来就拥塞的时候等于自己给自己添堵
+# (本机日志 19:47:27~30 一秒内 raw 连吃 7 条全灭 → 7 个批次 28 个探测同时上路)。
+# 30 秒 = 热备复检(20 秒)一轮半, 足够让上一批探针跑完再决定要不要补第二批。
+_HOT_REFILL_COOLDOWN = 30.0
+_HOT_REFILL_TS = {}
+
+
 def hot_refresh(key, pool, want=4):
     """复检热备池: 只盯少数候选(并发 4, 不惊动整条链路), 补满 want 个待命 IP。
 
@@ -457,6 +600,17 @@ def hot_refresh(key, pool, want=4):
         if _kbps_of(oldest) is None or time.time() - _kbps_ts(oldest) > _KBPS_TTL * 0.6:
             _measure_hot([oldest], 'github.com')
     if len(fresh) >= want:
+        # 【2026-10-24 修·够数不等于证据新鲜】
+        # 热备条目 120 秒内都算"热", 所以够数时这里原来直接 return —— 于是每个
+        # 热备 IP 实际 2~3 分钟才被复验一次, 而"实测成过"的窗口只有 90 秒。
+        # 隔离实测(18:50:48)复现到的现象: 一切正常、页面 200, 面板却写"实测成过 0"
+        # —— 那是另一种说假话。够数的时候也复验**证据最旧**的那 1 个,
+        # 成本 1 次探测 / 20 秒(远低于一轮全池体检), 换来"实测成过"始终有个下限。
+        if pool.checks_http and fresh:
+            _old = min(fresh, key=lambda i: pool.tier_of(i)[1])
+            _ot, _ots = pool.tier_of(_old)
+            if _ot != 'http' or time.time() - _ots > _FRESH_WINDOW * 0.6:
+                pool._probe(_old, timeout=3.0)
         return fresh
     # 从体检名次里跨网段取样, 优先补"没在热备里"的, 一段全死还有别的段
     spread = _pick_spread(pool.candidates()[:20], per_group=1, limit=8)
@@ -730,7 +884,8 @@ _SYS_WIN_RATIO = 1.25  # 直连要快过候选池 25% 才值得换, 否则两边
 _SYS_MIN_KBPS = 60     # 直连自己低于这个速度就没必要绕开池子(60KB/s 约等于能开但会转圈)
 
 
-def _cap_test(host, ip, window=2.5, max_bytes=262144, min_ok=8192, deadline=8.0):
+def _cap_test(host, ip, window=2.5, max_bytes=262144, min_ok=8192, deadline=8.0,
+              connect_timeout=6.0):
     """测某个 IP 到底能不能真的把数据传下来, 而不是只握得上。
 
     【2026-10-11 再修·测持续吞吐, 别测"凑够字节的时间"】
@@ -739,9 +894,14 @@ def _cap_test(host, ip, window=2.5, max_bytes=262144, min_ok=8192, deadline=8.0)
     **低估**快 IP: 同一个 20.205.243.166, 体检测出 48 KB/s, 实际跑 161 KB/s。
     低估直连 = 永远轮不到它上位。
     现在改成**固定读满 window 秒**, 到点或读够上限才收, 得到的是真实吞吐。
+
+    【2026-10-24 三修·把连接超时也交出来】原来 connect 硬编码 6 秒、不跟 window 走，
+    通道重匹配一轮 8 个样本最坏能磨到 ~56 秒(一池)、三池串起来 ~3 分钟，
+    名义"每 10 分钟"实际变成 13 分钟，而且这 3 分钟一直在抢转发带宽。
+    默认值维持 6.0(不改既有调用点的行为)，只让通道轮自己压到 2.5 秒。
     """
     try:
-        raw = socket.create_connection((ip, 443), timeout=6.0)
+        raw = socket.create_connection((ip, 443), timeout=connect_timeout)
     except OSError:
         return None
     try:
@@ -839,15 +999,18 @@ def sys_cap_loop():
                 host,
                 (s or {}).get('ip', '-'), _t(s),
                 (p or {}).get('ip', '-'), _t(p),
-                ('直连' if _sys_wins(host) else '候选池')))
+                _cap_verdict(s, p)))
         except Exception as e:
             log('吞吐对比异常: %s' % e)
         time.sleep(60)
 
 
-def _cap_of(host, tbl):
-    """取一份还新鲜的体检证据; 过期或无效返回 None。"""
-    r = tbl.get(host)
+def _cap_fresh(r):
+    """一份体检证据还作数吗（无效/没 IP/过了 TTL 都算没有，返回 None）。
+
+    从 `_cap_of` 里拆出来：`_cap_of` 是"按 host 去表里查"，这一层是"手里这份还新不新"。
+    日志那半份要把**刚才比的那两份**原样判一遍，不能再去查一次表。
+    """
     if not r or not r.get('ok') or not r.get('ip'):
         return None
     if time.time() - (r.get('ts') or 0) >= _SYS_CAP_TTL:
@@ -855,13 +1018,17 @@ def _cap_of(host, tbl):
     return r
 
 
-def _sys_wins(host):
-    """直连是不是**明显**快过候选池 —— 是就让它上位。
+def _cap_of(host, tbl):
+    """取一份还新鲜的体检证据; 过期或无效返回 None。"""
+    return _cap_fresh(tbl.get(host))
+
+
+def _wins_by_evidence(s, p):
+    """判据本体：拿着两份证据判"直连是不是**明显**快过候选池"。
 
     必须留余量(_SYS_WIN_RATIO): 两边速度本来就在抖, 谁高一点就切谁会导致
     来回横跳, 反而更不稳定。要快出一截才值得换。
     """
-    s, p = _cap_of(host, _SYS_CAP), _cap_of(host, _POOL_CAP)
     if not s:
         return False
     if not p:
@@ -872,6 +1039,280 @@ def _sys_wins(host):
     if sp < _SYS_MIN_KBPS:
         return False                     # 直连自己也不快, 没必要绕开池子
     return sp >= pp * _SYS_WIN_RATIO
+
+
+def _sys_wins(host):
+    """直连是不是**明显**快过候选池 —— 是就让它上位（判据见 `_wins_by_evidence`）。"""
+    return _wins_by_evidence(_cap_of(host, _SYS_CAP), _cap_of(host, _POOL_CAP))
+
+
+def _cap_verdict(s, p):
+    """把这一轮吞吐对比说成一句人话（2026-10-25 待办 #64）。
+
+    `s`/`p` 就是日志前半句里那两份证据（可能为 None），传进来而不是再查一遍表：
+    印出来的结论必须和旁边的数字是同一次测量的，隔几秒重查表可能对不上。
+
+    为什么要有"不作数"这两档：以前结尾无条件按 `_sys_wins()` 印，于是两边都没证据的
+    那一轮也会印成「-> 选 候选池」—— 可这一轮什么都没比出来（判据走的是
+    "直连没证据"那支返回 False），线路也根本没动。用户拿这句日志排查时就被带偏了。
+    """
+    if not s and not p:
+        return '两边都没测到，本轮不作数'
+    s, p = _cap_fresh(s), _cap_fresh(p)
+    if not s and not p:
+        return '两边都没测到，本轮不作数'
+    if s and p and s.get('ip') == p.get('ip'):
+        return '两边是同一个 IP，本轮不作数'
+    return '直连' if _wins_by_evidence(s, p) else '候选池'
+
+
+# ------------------------------------------------- 每 10 分钟重匹配"跑得通的通道"
+# 【2026-10-24 新增·改法⑤】用户的要求很具体: "最好每隔 10 分钟自动刷新, 匹配可以跑通的 IP 通道"。
+# 先把"为什么这不是重复造轮子"说清楚 —— 现有三套后台循环各管一层, 谁都不干这件事:
+#   · 体检 health_loop(5 分钟): 排的是"延迟 + 证书对不对", 全程只 recv 64 字节看状态行,
+#     一个 IP 有没有正文可传, 它不知道;
+#   · 热备 hot_loop(20 秒): 只复检**已经在名单里**的那 4 个, 不会去池子里发现新通道;
+#   · 吞吐对比 sys_cap_loop(60 秒): 一次只量 2 个 IP(系统解析 1 个 + 池内首选 1 个),
+#     它是"直连要不要切边"的裁决器, 不是"池里谁最能跑"的普查。
+# 也就是说: **没有任何一处**会把一批 IP 放到同一把尺子下真下载一遍、再按谁传得动换岗。
+# 今晚的日志正好把这个缺口照出来了(21:47~22:05): 池子 20 来个 IP 全是 'tls' 证据、
+# 真能吐正文的一个没有, 满屏"候选 IP 全军覆没"; 到 22:20 同一份代码 200 只要 2~6 秒。
+# IP 会换人、通道会一段段死掉, 所以匹配必须**周期性重做**, 而不是等用户点开页面挨一次超时。
+#
+# 成本红线(每一条都是踩过坑才写死的, 见 _measure_hot / hot_refresh 的注释):
+#   并发压到 2、单窗 2 秒、每池每轮最多 8 个样本、三个池错开 3 秒 ——
+#   实测并发 14 个探测会自己把国际链路挤拥塞(转发退化到 7~10 秒), 那样就本末倒置了。
+_CHAN_INTERVAL = 600.0    # 用户要的 10 分钟一轮
+_CHAN_MIN_KBPS = 40       # 低于这个速度谈不上"跑得通": 首页勉强刷出来、图片开始转圈的分界
+_CHAN_FALLBACK_KBPS = 8   # 全线拥塞时的底线: 至少真传得到字节, 才值得为它换岗
+_CHAN_SAMPLES = 8         # 每池每轮最多真下载几个 IP(再多就是自己挤自己)
+_CHAN_HYSTERESIS = 1.6    # 最佳要快过在用 60% 才值得换岗, 否则两边抖动会来回横跳
+
+
+def _chan_skeleton(key, host):
+    """一个池"还没测过"的初始快照。
+
+    【2026-10-24 三修·键先占好】原来 `_CHAN = {}` 由通道线程第一轮时才插键,
+    而面板那条 `/api/status` 正在迭代 `_CHAN.items()` —— 字典在迭代中变大是
+    `RuntimeError: dictionary changed size during iteration`, 那一发刷新直接 500。
+    键一开始就摆满三个, 之后只覆盖同键的值(CPython 里同键赋值不改大小), 这条
+    竞态就不存在了; 顺带让面板/接口在没有数据时也有明确的"还没跑过"可显示。
+    """
+    return {'key': key, 'host': host, 'ts': 0, 'sampled': 0, 'pass': 0, 'weak': 0,
+            'ip_best': '', 'kbps_best': 0, 'in_use': '', 'swapped': '', 'list': [],
+            'note': '还没跑过第一轮(启动约 1 分钟后开测)', 'running': 0}
+
+
+_CHAN = {k: _chan_skeleton(k, h) for k, h in (
+    ('github', 'github.com'), ('raw', 'raw.githubusercontent.com'),
+    ('pages', 'github.io'))}   # key -> 本轮结果快照(供 /api/status 与面板如实显示, 不粉饰)
+
+
+def _chan_public(snap):
+    """把内部快照转成给面板的副本: 列表要拷一份, 否则面板拿到的可能是正在被改的同一对象。"""
+    out = dict(snap or {})
+    out['samples'] = [dict(x) for x in (snap or {}).get('list') or []]
+    out.pop('list', None)
+    return out
+
+
+def channel_scan_once(key, pool, host):
+    """给一个池子做一轮"跑得通"重匹配: 跨网段取样 → 真下载 → 记台账 → 必要时主动换岗。
+
+    取样为什么用 _pick_spread 而不是直接取名次最前的 8 个:
+    候选是按延迟排的, 延迟低的往往扎堆在同一段(20.27.* 死的时候 140.82.* 还好好的),
+    只取"前 N 个"会正好全落在死的那一段里, 于是这一轮白测。
+    在用的那个 IP **一定要一起量**, 否则"最佳"是刚测的、"在用"是几分钟前的,
+    拿新旧不同的证据比高低 = 必然误判换岗。
+    """
+    started = time.time()
+    try:
+        cands = pool.candidates() or []       # candidates() 已经把实测 4xx 的假边缘剔掉了
+    except Exception:
+        cands = []
+    cur = _LAST_GOOD.get(key) or ''
+    spread = _pick_spread(cands[:24], per_group=2, limit=_CHAN_SAMPLES)
+    if cur and cur not in spread:
+        spread = ([cur] + spread)[:_CHAN_SAMPLES]
+    out = {'key': key, 'host': host, 'ts': started, 'sampled': len(spread),
+           'pass': 0, 'weak': 0, 'ip_best': '', 'kbps_best': 0, 'in_use': cur,
+           'swapped': '', 'list': [], 'note': '', 'running': 1}
+    _CHAN[key] = out
+    if not spread:
+        out['note'] = '候选池为空(或全被实测拉黑), 本轮没得测'
+        out['running'] = 0
+        log('通道重匹配 %s: 候选池为空, 跳过本轮' % host)
+        return out
+
+    if key == 'github':
+        def _one(ip):
+            try:
+                r = _cap_test(host, ip, window=2.0, max_bytes=196608,
+                              min_ok=8192, deadline=6.0, connect_timeout=2.5)
+            except Exception:
+                r = None
+            if r and r.get('ok'):
+                _kbps_set(ip, r.get('kbps', 0))
+                _ip_born(ip)                  # 热备/寿命台账也要收下这个样本
+                return (ip, int(r.get('kbps', 0)))
+            return (ip, 0)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                rows = list(ex.map(_one, spread))
+        except Exception as e:
+            log('通道重匹配 %s 异常: %s' % (host, e))
+            rows = [(ip, 0) for ip in spread]
+        ok_rows = sorted([r for r in rows if r[1] > 0], key=lambda r: -r[1])
+        good_rows = [r for r in ok_rows if r[1] >= _CHAN_MIN_KBPS]
+        out['pass'] = len(good_rows)
+        out['weak'] = len(ok_rows) - len(good_rows)
+        if good_rows:
+            out['ip_best'], out['kbps_best'] = good_rows[0][0], good_rows[0][1]
+        elif ok_rows:
+            out['ip_best'], out['kbps_best'] = ok_rows[0][0], ok_rows[0][1]
+        out['list'] = [{'ip': i, 'kbps': k} for i, k in ok_rows[:6]]
+        # 【2026-10-24 三修·全轮零通过时不摘台账】原来每个"这一轮没传动"的样本都
+        # 当场 _kbps_forget。可"8 个全传不动"最常见的解释是这条宽带整段在抽风
+        # (装机版 22:59 与 23:0x 两轮实测就是 pass=0)，而不是 8 个 IP 恰好同时坏死。
+        # 一把清干吞吐台账，等于连 2620 行那条"实测判直连更快"的快路一起废掉，
+        # 接下来 10 分钟每条转发都要重新挨一轮 TCP 抢连 —— 越拥塞越慢，本末倒置。
+        # 现在只在**本轮确实有人传得动**时才摘掉传不动的那些(有对照才谈得上淘汰)。
+        if ok_rows:
+            for _ip0, _k0 in rows:
+                if _k0 <= 0:
+                    _kbps_forget(_ip0)
+        else:
+            out['note'] = ('本轮 %d 个全传不动，判为链路拥塞，'
+                           '保留既有吞吐台账与在用 IP' % out['sampled'])
+        passers = [r[0] for r in good_rows]
+    else:
+        # raw / Pages 这两池按设计**不量吞吐**: 拿 IP 直接 GET 它们的根路径回的是 404、
+        # 拿不到可观的字节数, 硬套吞吐尺子会把好 IP 误判成"传不动"(10-11 记过的坑,
+        # sys_cap_loop 也因此只测主站)。这里退一步, 用体检同一把尺子复验
+        # TCP + TLS + 证书归属, 并在面板上如实写"只验连通", 不假装有吞吐证据。
+        def _one2(ip):
+            try:
+                m = pool._probe(ip, timeout=4.0)
+            except Exception:
+                m = None
+            if m:
+                _ip_born(ip)
+                return (ip, int(m[0]))
+            return (ip, -1)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                rows = list(ex.map(_one2, spread))
+        except Exception as e:
+            log('通道重匹配 %s 异常: %s' % (host, e))
+            rows = [(ip, -1) for ip in spread]
+        ok_rows = sorted([r for r in rows if r[1] >= 0], key=lambda r: r[1])
+        out['pass'] = len(ok_rows)
+        out['list'] = [{'ip': i, 'ms': m} for i, m in ok_rows[:6]]
+        out['note'] = '只验连通(TLS+证书): 这两池没有公开正文, 不量吞吐'
+        passers = [r[0] for r in ok_rows]
+        if ok_rows:
+            out['ip_best'] = ok_rows[0][0]
+
+    # 跑通过的 IP 交回热备池(带新鲜时间戳): 20 秒那一轮不用重新发现,
+    # 空闲期换岗也一开始就有米下锅 —— 这正是"用户隔半小时回来仍能秒开"的前提。
+    now = time.time()
+    if passers:
+        with _HOT_LOCK:
+            have = {i for i, _t in _HOT.get(key, [])}
+            for ip in passers[:4]:
+                if ip not in have:
+                    _HOT[key].append((ip, now))
+            _HOT[key] = [(i, t) for i, t in _HOT[key] if now - t <= 180][-8:]
+
+    # 主动换岗: 只在"有更好证据"时动手, 且留够余量, 免得两边抖一下就来回横跳。
+    cur_k = None
+    for r in rows:
+        if r[0] == cur:
+            cur_k = r[1] if key == 'github' else (0 if r[1] >= 0 else -1)
+            break
+    # 优先在"跑得通"(≥ _CHAN_MIN_KBPS)的里面挑。一个都没过线时 —— 今晚 22:28~22:32
+    # 实测就是这种全线拥塞的常态 —— 也允许在**确实传得到字节**的里面挑一个明显更快的:
+    # 0 KB/s 和 13 KB/s 不是同一回事, 这时候抱着老 IP 只会让每次转发都先挨一轮超时。
+    rank = list(passers)
+    if key == 'github' and not rank:
+        rank = [r[0] for r in ok_rows if r[1] >= _CHAN_FALLBACK_KBPS]
+    best_k = out['kbps_best']
+    new = ''
+    if rank and rank[0] != cur:
+        if key == 'github':
+            if cur_k is None or cur_k < best_k / _CHAN_HYSTERESIS:
+                new = rank[0]
+        elif cur_k is None or cur_k < 0:
+            new = rank[0]
+    if new and new != cur:
+        _LAST_GOOD[key] = new
+        _ip_born(new)
+        _fail_clear(new)
+        out['swapped'] = new
+        out['in_use'] = new
+    elif ok_rows and not rank and cur and cur_k is not None and cur_k <= 0:
+        # 一个都没跑通、而在用的这个**本轮亲口承认传不动** —— 别再把它当"上次成功的 IP"抱着。
+        # 清空后下次转发会重新并发抢连(而不是优先去撞这具尸体); 判据是这一轮的实测,
+        # 不是猜的: 没测到 cur(cur_k is None)时绝不清空, 免得把"没排上队"当成"死了"。
+        # 【2026-10-24 三修】多加一道 `ok_rows` 前提: 本轮**有人传得动**才谈得上"这个该下岗"。
+        # 8 个全传不动是链路在抽风, 此时清 _LAST_GOOD 只会让后面每条请求都多挨一轮抢连。
+        _LAST_GOOD[key] = ''
+        out['in_use'] = ''
+        out['note'] = (out['note'] + '; ' if out['note'] else '') + '在用 IP 本轮实测传不动, 已让位重新抢连'
+
+    out['running'] = 0        # 本轮实测结束: 面板可以按真实通过数说话了
+    cost = int(time.time() - started)
+    if key == 'github':
+        log('通道重匹配 %s: 真下载 %d 个 → 跑得通 %d 个(偏慢 %d) · 最佳 %s %d KB/s · '
+            '在用 %s%s (%ds)' % (
+                host, out['sampled'], out['pass'], out['weak'],
+                out['ip_best'] or '-', out['kbps_best'], cur or '-',
+                (('，换岗 →' + new) if new else
+                 ('' if cur_k is None else '，%d KB/s' % cur_k)), cost))
+    else:
+        log('通道重匹配 %s: 复验 %d 个 → 连通 %d 个 · 最快 %s · 在用 %s%s (%ds)' % (
+            host, out['sampled'], out['pass'], out['ip_best'] or '-', cur or '-',
+            (('，换岗 →' + new) if new else ''), cost))
+    return out
+
+
+def channel_loop():
+    """每 10 分钟把三个池各重匹配一轮"跑得通的通道"(用户 2026-10-24 提的要求)。
+
+    第一轮不等 10 分钟: 启动 45 秒后就跑 —— 因为启动后的头几分钟正是"候选池刚建好、
+    用户马上要开浏览器"的时刻, 让他在打开页面之前就有实测证据垫底。
+
+    【2026-10-24 装机版实测后补的一条】但第一轮要**等启动体检跑完**再开测:
+    启动预体检是 49 个 IP × 12 并发, 我那 8 发吞吐实测撞上去会互相挤(22:49 装机版
+    第一轮就是"测 8 通 0", 可同一时刻池子明明 24 个实测成过、真实请求 0.8 秒 200)。
+    探测自己把链路挤拥塞、然后得出"全都跑不通"的假结论 —— 这是 10-11 记过的老坑,
+    只不过这次是我和体检抢。所以: 体检出结果后再缓 20 秒开测, 最多等 3 分钟。
+    """
+    time.sleep(45)     # 别跟启动预体检抢带宽(那会儿正在并发探 49 个 IP)
+    _t0 = time.time()
+    while time.time() - _t0 < 180:                     # 最多再等 3 分钟
+        try:
+            _done = bool(HEALTH.snapshot()[1])         # 体检跑完一次才会有时间戳
+        except Exception:
+            _done = True
+        if _done:
+            break
+        time.sleep(5)
+    time.sleep(20)     # 体检刚跑完也缓一口, 让它派出去的探测先散场
+    while True:
+        empty = 0
+        for key, pool, host in (('github', HEALTH, 'github.com'),
+                                ('raw', HEALTH_RAW, 'raw.githubusercontent.com'),
+                                ('pages', HEALTH_PAGES, 'github.io')):
+            try:
+                r = channel_scan_once(key, pool, host)
+                if not (r or {}).get('sampled'):
+                    empty += 1
+            except Exception as e:
+                log('通道重匹配异常(%s): %s' % (key, e))
+            time.sleep(3)   # 三个池错开, 别让下载挤在同一秒互相拖慢
+        # 三个池都空手而归, 说明启动体检还没出名单 —— 别死等 10 分钟, 2 分钟后再试
+        time.sleep(120 if empty == 3 else _CHAN_INTERVAL)
 
 
 def dns_warm_loop():
@@ -1039,6 +1480,18 @@ def _mask_ip(ip):
     if len(parts) == 4:
         return '%s.%s.x.x' % (parts[0], parts[1])
     return ip
+
+
+def _query_int(query, name, default, lo, hi):
+    """从 "a=1&b=2" 里取一个整数并把范围夹住（面板传坏参数也不许把接口打成 500）。"""
+    val = default
+    for kv in (query or '').split('&'):
+        if kv.startswith(name + '='):
+            try:
+                val = int(urllib.parse.unquote(kv[len(name) + 1:]))
+            except (TypeError, ValueError):
+                val = default
+    return max(lo, min(hi, val))
 
 
 def diag_text(redact=True):
@@ -1236,6 +1689,310 @@ def log(msg, debug=False):
         pass
 
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# 仪表盘用的三样新东西（2026-10-24 UI 整改，**只新增、不改旧行为**）
+#   ① history_append / history_points —— 每轮体检落一行 JSON，画成延迟曲线
+#   ② hit_count / _HITS              —— 本次会话"PAC 命中 / 退回直连"各多少次
+#   ③ loss_probe_async / _LOSS       —— IP 表"丢包"列的真实抽样（只抽样，不选路）
+# ══════════════════════════════════════════════════════════════════════════
+
+# ① 延迟历史。口径: 每轮体检（每 5 分钟）追加一行; 保留 7 天，超过就裁掉;
+#    文件落在数据目录（FOXPATH_DATA 可覆盖），**不上传、不外发**。
+HISTORY_FILE = os.path.join(DATA_DIR, 'history.jsonl')
+HISTORY_KEEP_DAYS = 7
+HISTORY_STEP = 300            # 5 分钟一个点（与 CHECK_INTERVAL 一致）
+_HISTORY_LOCK = threading.Lock()
+_HISTORY_TRIM_TS = [0.0]
+
+
+def _history_trim(now):
+    """裁掉 7 天以前的采样。一小时最多裁一次，别每轮都重写文件。"""
+    if now - _HISTORY_TRIM_TS[0] < 3600:
+        return
+    _HISTORY_TRIM_TS[0] = now
+    keep_from = now - HISTORY_KEEP_DAYS * 86400
+    try:
+        if not os.path.isfile(HISTORY_FILE):
+            return
+        keep = []
+        with open(HISTORY_FILE, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                try:
+                    if float(rec.get('ts') or 0) >= keep_from:
+                        keep.append(line)
+                except (TypeError, ValueError):
+                    continue
+        tmp = HISTORY_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(keep) + ('\n' if keep else ''))
+        os.replace(tmp, HISTORY_FILE)
+    except Exception:
+        pass
+
+
+def history_append(good, good_raw=None, good_pages=None):
+    """把这一轮体检的结果追加进 history.jsonl（一次一行）。
+
+    ok 是这一轮的可用数量（**0 也照记** —— "全灭"本身就是最该看的那一格）；
+    latency 取本轮最快那个 IP 的握手毫秒数，没有可用 IP 时给 null（面板画成红点）。
+    """
+    now = time.time()
+    try:
+        best_ip, best_ms = '', None
+        if good:
+            best_ip, best_ms = good[0][0], int(good[0][1])
+        cand = [ip for ip in candidate_list() if ':' not in ip]
+        rec = {'ts': int(now), 'ip': best_ip, 'latency': best_ms,
+               'ok': len(good or []), 'total': len(cand),
+               'raw_ok': len(good_raw or []), 'pages_ok': len(good_pages or [])}
+        with _HISTORY_LOCK:
+            with open(HISTORY_FILE, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+            _history_trim(now)
+        return rec
+    except Exception as e:
+        log('延迟历史写入失败(不影响加速): %s' % e)
+        return None
+
+
+def history_points(hours=3):
+    """读最近 N 小时的采样（按时间正序）。坏行跳过，不因为一行坏了整条曲线就没了。"""
+    cutoff = time.time() - max(1, int(hours)) * 3600
+    out = []
+    try:
+        with open(HISTORY_FILE, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                try:
+                    ts = float(rec.get('ts') or 0)
+                except (TypeError, ValueError):
+                    continue
+                if ts >= cutoff:
+                    rec['ts'] = int(ts)
+                    out.append(rec)
+    except (IOError, OSError):
+        pass
+    out.sort(key=lambda r: r.get('ts') or 0)
+    return out
+
+
+def history_summary(points):
+    """最低 / 最高 / 中位延迟，还有"这轮全灭"的次数 —— 面板图例那一行用。"""
+    lat = sorted([int(p['latency']) for p in (points or [])
+                  if isinstance(p.get('latency'), (int, float))])
+    n = len(lat)
+    if not n:
+        return {'n': 0, 'min': None, 'max': None, 'median': None, 'down': 0}
+    median = lat[n // 2] if n % 2 else int((lat[n // 2 - 1] + lat[n // 2]) / 2)
+    down = len([p for p in (points or []) if p.get('ok') == 0])
+    return {'n': n, 'min': lat[0], 'max': lat[-1], 'median': median, 'down': down}
+
+
+# ② 本次会话命中计数。pool = PAC 命中后走了候选池 IP；sys = 退回系统解析（直连）。
+_HITS = {'pool': 0, 'sys': 0}
+_HITS_LOCK = threading.Lock()
+
+
+def hit_count(used_pool):
+    with _HITS_LOCK:
+        _HITS['pool' if used_pool else 'sys'] += 1
+
+
+def hits_snapshot():
+    with _HITS_LOCK:
+        return {'pool': _HITS['pool'], 'sys': _HITS['sys'],
+                'total': _HITS['pool'] + _HITS['sys']}
+
+
+# ③ 丢包抽样。对体检排前 10 的 IP 各发 3 次 TCP:443 连接，失败比例就是"丢包"。
+#    **只抽样、绝不参与选路** —— 不改任何体检结论（3 次握手的失败率 ≠ ICMP 丢包，
+#    面板上写的就是「丢包(3 次握手)」，口径老实标出来）。
+_LOSS = {}            # ip -> (丢包百分比, 采样时刻)
+_LOSS_LOCK = threading.Lock()
+_LOSS_BUSY = [False]
+_LOSS_ROUNDS = 3
+_LOSS_TOP = 10
+
+
+def loss_probe_async(good):
+    """后台抽一轮丢包样本（同一时刻只跑一轮，跑不完不排队）。"""
+    ips = [ip for ip, _ms in (good or [])][:_LOSS_TOP]
+    if not ips:
+        return
+    with _LOSS_LOCK:
+        if _LOSS_BUSY[0]:
+            return
+        _LOSS_BUSY[0] = True
+
+    def worker():
+        try:
+            def one(ip):
+                bad = 0
+                for _ in range(_LOSS_ROUNDS):
+                    try:
+                        s = socket.create_connection((ip, 443), timeout=2.0)
+                        s.close()
+                    except OSError:
+                        bad += 1
+                return ip, int(round(100.0 * bad / _LOSS_ROUNDS))
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                res = list(pool.map(one, ips))
+            now = time.time()
+            with _LOSS_LOCK:
+                for ip, pct in res:
+                    _LOSS[ip] = (pct, now)
+        except Exception:
+            pass
+        finally:
+            with _LOSS_LOCK:
+                _LOSS_BUSY[0] = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def loss_of(ip):
+    """这个 IP 的丢包抽样（百分比, 采样时刻）；没抽过返回 (None, 0)。"""
+    with _LOSS_LOCK:
+        hit = _LOSS.get(ip)
+    return hit if hit else (None, 0.0)
+
+
+# ── 面板「线路体检」每一行的数据（全部来自真实体检结果，不做任何估算）──
+def _line_row(host, note, good, total, status=None, strong=None):
+    n = len(good or [])
+    fastest = min([m for _i, m in good]) if good else None
+    # strong = 近 _FRESH_WINDOW 秒**真跑通过一次请求**的个数；None = 这一池不跑 HTTP
+    # (raw/pages 池拿 GET / 必然不是 2xx，按设计只验证书，所以不给这个口径)。
+    if status is None:
+        if n == 0:
+            status = 'bad'
+        elif strong is not None and strong == 0:
+            # 【2026-10-24】池子写着"可用 31 个"、可没有一个近期真答过话 ——
+            # 这种状态对用户就是"打不开"，绝不能显示成 ok(绿点)。
+            status = 'warn'
+        elif fastest is not None and int(fastest) > 900:
+            status = 'warn'
+        elif total and n * 2 < total:
+            status = 'warn'
+        else:
+            status = 'ok'
+    return {'host': host, 'note': note, 'n': n, 'total': total,
+            'strong': strong,
+            'fastest': (int(fastest) if fastest is not None else None),
+            'status': status}
+
+
+def lines_status():
+    """线路体检那 4 行：主站 / raw 那一组 / Pages / api（未接管，如实说明）。"""
+    good, _ts = HEALTH.snapshot()
+    raw_good, _ = HEALTH_RAW.snapshot()
+    pages_good, _ = HEALTH_PAGES.snapshot()
+    v4 = [ip for ip in candidate_list() if ':' not in ip]
+    return [
+        _line_row('github.com', '主站（codeload.github.com 同池）', good, len(v4),
+                  strong=len(HEALTH.strong())),
+        _line_row('raw / objects / avatars / camo', 'raw 文件、发布附件、头像',
+                  raw_good, len(CANDIDATE_IPS_RAW_ALL)),
+        _line_row('github.io', 'GitHub Pages（user.github.io）',
+                  pages_good, len(CANDIDATE_IPS_PAGES_ALL)),
+        _line_row('api.github.com', '未接管（保持直连）', [], 0, status='off'),
+    ]
+
+
+def ips_detail(good, limit=10, pool=None):
+    """面板 IP 表的真实数据：延迟 / 丢包抽样 / 连续失败次数 / 已存活秒数 / 证据强度。"""
+    now = time.time()
+    out = []
+    for ip, ms in (good or [])[:limit]:
+        loss, loss_ts = loss_of(ip)
+        age = _ip_age(ip)
+        tier, tier_ts = (pool or HEALTH).tier_of(ip)
+        out.append({'ip': ip, 'ms': int(ms),
+                    'loss': loss, 'loss_age': int(now - loss_ts) if loss_ts else None,
+                    'fails': int(_fail_rank(ip)),
+                    'age': int(age) if age else None,
+                    # 'http' = 真跑通过一次请求; 'tls' = 只验到证书; None = 证据已出窗
+                    'tier': tier if (tier and now - tier_ts <= _FRESH_WINDOW) else None,
+                    'tier_age': int(now - tier_ts) if tier_ts else None})
+    return out
+
+
+# ── 一键反馈包（2026-10-24 新增）：版本 + 系统 + 可用 IP + 日志尾部 50 行 ──
+# 只**复制到剪贴板**，不落共享文件、不上传任何地方；里面只有 GitHub 官方 IP
+# 和本机日志（不含用户自己的外网地址）。
+def feedback_text():
+    good, ts = HEALTH.snapshot()
+    raw_good, _ = HEALTH_RAW.snapshot()
+    pages_good, _ = HEALTH_PAGES.snapshot()
+    _strong_n = len(HEALTH.strong())        # 近 _FRESH_WINDOW 秒实测成过的个数
+    _detail10 = ips_detail(good)
+    up_min = int((time.time() - _START_TS[0]) / 60) if _START_TS[0] else 0
+    packed = '单文件 exe' if getattr(sys, 'frozen', False) else '源码运行'
+    os_txt = platform.platform()
+    py_txt = 'Python %s (%s 位)' % (platform.python_version(),
+                                    '64' if sys.maxsize > 2 ** 32 else '32')
+    lines = [
+        '狐径 FoxPath 反馈包（面板一键复制，不落文件、不上传）',
+        '=' * 52,
+        '版本: %s   形态: %s' % (APP_VERSION, packed),
+        '系统: %s' % os_txt,
+        '运行: %s' % py_txt,
+        '时间: %s' % time.strftime('%Y-%m-%d %H:%M:%S'),
+        '加速: %s' % ('已开启' if proxy_on() else '未开启'),
+        '系统代理: PAC %s' % ('已指向本程序' if proxy_on() else '未接管'),
+        '官方 IP 表: %s · 候选 %d 个（IPv4 %d / IPv6 %d）'
+        % (_META_SOURCE[0] or '未同步(用内置表)', len(CANDIDATE_IPS),
+           len([i for i in candidate_list() if ':' not in i]),
+           len([i for i in candidate_list() if ':' in i])),
+        '可用 IP: %d / %d · 最快 %s'
+        % (len(good), len([i for i in candidate_list() if ':' not in i]),
+           ('%s (%dms)' % (good[0][0], good[0][1])) if good else '无'),
+        # 【2026-10-24】上面那行是"活着"的口径(TLS 证书验过就算)。真正决定
+        # "页面能不能打开"的是这一行: 近 90 秒内真发过一次请求并拿到 2xx/3xx 的 IP。
+        # 本机实测过两者差到 31 vs 1 —— 只看上面那行会误判成"加速在干活"。
+        '实测成过(近 %d 秒真跑过一次请求): %d / %d%s'
+        % (int(_FRESH_WINDOW), _strong_n, len(good),
+           '' if _strong_n or not good
+           else '  ← 池子里没有一个近期答过话, 现在打开页面只能靠直连兜底'),
+        '可用清单(前 10): %s' % (', '.join(
+            '%s(%dms%s)' % (i, m, {'http': '', 'tls': ', 仅证书', None: ', 证据已出窗'}
+                            [d.get('tier')])
+            for (i, m), d in zip(good[:10], _detail10)) or '无'),
+        'raw 池: %d/%d · pages 池: %d/%d'
+        % (len(raw_good), len(CANDIDATE_IPS_RAW_ALL),
+           len(pages_good), len(CANDIDATE_IPS_PAGES_ALL)),
+        '直连对照: %s' % ('通' if _DIRECT_OK[0] is True else
+                          '不通' if _DIRECT_OK[0] is False else '还没探过'),
+        '手动 IP: %s' % (_MANUAL_IP[0] or '无'),
+        '上次体检: %s · 已运行 %d 分钟'
+        % (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts)) if ts else '还没体检过',
+           up_min),
+        '丢包抽样: %s' % ('; '.join(
+            '%s %s%%' % (d['ip'], d['loss']) for d in _detail10 if d['loss'] is not None
+        ) or '还没有样本'),
+        '本次会话: PAC 命中 %d · 退回直连 %d' % (hits_snapshot()['pool'],
+                                              hits_snapshot()['sys']),
+        '',
+        '--- 日志尾部 50 行 ---',
+    ]
+    lines.extend(recent_logs(50))
+    return '\n'.join(lines)
+
+
 _conn_lock = threading.Lock()
 _conn_total = [0]            # 累计转发次数, 只用于日志抽样
 _conn_window = [0.0, 0]      # [本窗口起点, 本窗口内的次数]
@@ -1405,6 +2162,22 @@ class Health(object):
         self._lock = threading.Lock()
         self._good = []
         self._last = 0.0
+        # 【2026-10-24 新增·"可用"必须分层】
+        # 原来 _good 里只有一个"可用/不可用"，可实测发现两种"可用"完全不是一回事:
+        #   · http —— 真发了一次 GET 并拿到 2xx/3xx/429，这个 IP 此刻**确实能做页面**;
+        #   · tls  —— 只有 TCP + TLS + 证书过了，HTTP 那一步超时或没读到状态码。
+        # 老写法把 tls 也当可用计数(见 _probe 里那句 except timeout: pass)，
+        # 高丢包时一轮下来面板写着"可用 31/50"，可同一时刻挨个真发请求，
+        # 十个里只剩一个答得出来(实测数据见 logs\UI整改-20261024\) ——
+        # 用户看到的数字和浏览器实际遭遇的完全对不上，才叫"加速开着却打不开"。
+        # 这里不改变"超时不判死"的原设计(那是 2026-10-11 换来的教训)，
+        # 只是把证据记下来，让面板、反馈包和转发挑线路都用**新鲜程度**说话。
+        # ip -> (层级 'http'/'tls', 验出的时刻)
+        self._tier = {}
+        # 这一池到底跑不跑 HTTP 预检。raw / Pages 池按设计不跑(拿 IP 直接 GET 根路径
+        # 必然不是 2xx，会误杀好 IP)，所以它们永远只有 'tls' 这一档 ——
+        # 转发的"快不过就撤"逻辑必须只对跑了预检的池子生效，否则 raw 下载每次都撤。
+        self.checks_http = http_path is not None
         # 2026-10-08: 不同主机群用不同的 SNI 与证书期望值 ——
         # github.com 池: SNI=github.com, 证书要含 github.com;
         # raw/附件池:    SNI=raw.githubusercontent.com, 证书要含 githubusercontent.com。
@@ -1445,6 +2218,7 @@ class Health(object):
                 # 直接访问 github.com 会返回 4xx, 这种不能要。
                 # 这里发一发 GET /; 如果 HTTP 测试自己超时(偶尔发生),
                 # 不因此判死, 毕竟 TLS 已经验证通过, 但返回 4xx/5xx 就判死。
+                tier = 'tls'          # 'tls' = 只验到证书; 'http' = 真跑通过一次请求
                 try:
                     if self.http_path is None:
                         raise _SkipHttp()
@@ -1463,12 +2237,23 @@ class Health(object):
                             # 2026-10-08 修：以前把它当死 IP，体检会莫名其妙地全灭。
                             if not (status.startswith(b'2') or status.startswith(b'3')
                                     or status == b'429'):
+                                # 【2026-10-24】证书对、页面回 4xx = 假边缘：
+                                # 除了本轮判死，再实测拉黑 15 分钟，免得下一轮体检
+                                # 或"上一轮活着先留着"那条规则把它捡回候选池。
+                                _bad_edge_note(ip, status.decode('latin-1', 'replace'))
+                                self.drop(ip)
                                 return None
+                            # 读到状态行**且**是 2xx/3xx/429 —— 这才算"实测成过"
+                            tier = 'http'
                 except _SkipHttp:
                     pass
                 except (socket.timeout, TimeoutError, OSError):
+                    # 超时维持"不判死"(见上面的历史教训)，但只给 'tls' 这一档:
+                    # 面板不再把它算进"实测成过"，转发时也排到后面。
                     pass
-            return _lat
+            with self._lock:
+                self._tier[ip] = (tier, time.time())
+            return _lat, tier
         except Exception:
             return None
         finally:
@@ -1485,26 +2270,70 @@ class Health(object):
             ips = [ip for ip in ips if ':' not in ip]
         with ThreadPoolExecutor(max_workers=12) as pool:
             res = list(pool.map(lambda ip: (ip, self._probe(ip, timeout)), ips))
-        good = sorted([(i, m) for i, m in res if m is not None], key=lambda x: x[1])
+        good = sorted([(i, m[0]) for i, m in res if m is not None
+                       and not _bad_edge(i)], key=lambda x: x[1])
         with self._lock:
             # 【2026-10-11 修·别让一次糟糕的体检清空候选池】
             # 高丢包时一轮探测会把大半 IP 判成超时(实测: 49 个只测出 4 个可用),
             # 候选池骤减就没得挑了。上一轮**证实可用**的先留着压在后面兜底 ——
             # 真死了也没关系: 转发有失败降权 + 并发抢连, 死 IP 会被自然跳过。
+            # 【2026-10-24 补一句】留过来的这些只作"备选"用，不再算"实测成过":
+            # 它们的证据是上一轮(最长 5 分钟前)的，而实测 IP 寿命只有 150~230 秒。
+            # 【2026-10-24 再补一句】实测拉黑的"假边缘"不许留过来 ——
+            # 今天装机版满屏 400，就是它带着 20.200.245.244 一路复活到转发名单最前面。
             if self._good and len(good) < len(self._good) // 2:
                 have = {i for i, _ in good}
-                good = good + [(i, m) for i, m in self._good if i not in have]
+                carried = [(i, m) for i, m in self._good
+                           if i not in have and not _bad_edge(i)]
+                for i, _m in carried:
+                    t = self._tier.get(i)
+                    if t:
+                        self._tier[i] = (t[0], min(t[1], time.time() - _FRESH_WINDOW))
+                good = good + carried
             self._good = good
             self._last = time.time()
+            # 已经被踢出池子的 IP, 证据也别留着(否则面板数字虚高)
+            live = {i for i, _m in good}
+            self._tier = {i: v for i, v in self._tier.items() if i in live}
         return good
+
+    def tier_of(self, ip):
+        """这个 IP 最新的证据: ('http'|'tls', 验出时刻)；没有则 (None, 0)。"""
+        with self._lock:
+            return self._tier.get(ip) or (None, 0.0)
+
+    def strong(self, window=None):
+        """近 `window` 秒内**真跑通过一次请求**(tier='http')的 IP —— 这才是
+        "此刻能打开页面"的口径。raw/pages 池不跑 HTTP, 它们的 http_path=None,
+        按设计只能验到证书, 所以那边继续用 len(good) 说话(面板另有说明)。"""
+        window = _FRESH_WINDOW if window is None else window
+        now = time.time()
+        with self._lock:
+            return [ip for ip, ms in self._good
+                    if self._tier.get(ip, (None, 0))[0] == 'http'
+                    and now - self._tier.get(ip, (None, 0))[1] <= window]
+
+    def tier_counts(self, window=None):
+        """面板/反馈包用：{'http': n, 'tls': n} —— 两个都是"活着"的 IP, 差别只在证据强度。"""
+        window = _FRESH_WINDOW if window is None else window
+        now = time.time()
+        out = {'http': 0, 'tls': 0}
+        with self._lock:
+            for ip, _m in self._good:
+                tier, t = self._tier.get(ip, (None, 0))
+                if tier and now - t <= window:
+                    out[tier] = out.get(tier, 0) + 1
+        return out
 
     def snapshot(self):
         with self._lock:
             return list(self._good), self._last
 
     def candidates(self):
+        """转发/热备取候选的地方 —— 实测拉黑的"假边缘"一律不给，
+        哪怕它刚从体检名次里排到最前（2026-10-24：就是它把用户带到 400 页面上的）。"""
         with self._lock:
-            return [ip for ip, _m in self._good]
+            return [ip for ip, _m in self._good if not _bad_edge(ip)]
 
     def drop(self, ip):
         with self._lock:
@@ -1538,7 +2367,6 @@ def fetch_official_ips():
     global CANDIDATES
     urls = (
         'https://api.github.com/meta',
-        'https://gitee.com/kele551/FoxPath/raw/main/meta.json',
         'https://raw.githubusercontent.com/kele551/FoxPath/main/meta.json',
     )
     last_err = None
@@ -1560,7 +2388,16 @@ def fetch_official_ips():
                 net = ipaddress.ip_network(cidr, strict=False)
             except ValueError:
                 continue
-            first = next(net.hosts(), None) or net.network_address
+            # 【2026-10-24 修·官方 IP 表同步在 Python 3.12 上会炸】
+            # 官方 /meta 的 web 现在**几乎全是 /32 单地址**(实测 50 条里 40 多条是
+            # "20.205.243.166/32" 这种)。而 ipaddress 在 3.12 里对 /32 走特例、
+            # 返回的是 **list** 而不是迭代器(3.13 才是迭代器) ——
+            # `next(net.hosts(), None)` 当场 TypeError: 'list' object is not an iterator。
+            # 这一行在 try 外面, 所以炸掉的是**整个官方 IP 表同步**, 而在 3.12 下
+            # 从源码跑时它还在 health_loop 的调用链上, 会把体检线程一起带死
+            # (exe 用 3.13 打包, 所以装机版看不出来 —— 判据不该押在打包 Python 的版本上)。
+            # 先 iter() 一下, list / 迭代器都吃得下。
+            first = next(iter(net.hosts()), None) or net.network_address
             if net.version == 4:
                 ips.append(str(first))
             # IPv6 网段的首地址不是真实主机（实测 HTTP 层 Domain Not Found），
@@ -1649,6 +2486,13 @@ def recover():
 
 # ------------------------------------------------------------------- 代理
 
+# 接管清单（**唯一来源**）：PAC 的判定条件、代理的路由判断、面板上"接管域名"那一格
+# 的计数，全都从 PAC_HOSTS 来 —— 以前 PAC 里手写一份、PROXY_HOSTS 里再手写一份，
+# 改一处忘一处（2026-10-24 加 codeload 时正好撞上，就并成一份了）。
+# github.io 及其子域（*.github.io）由下面 PAC 里的 dnsDomainIs 单独覆盖。
+PAC_HOSTS = PROXY_HOSTS + PROXY_HOSTS_RAW
+_PAC_HOSTS_JS = ' || '.join('host === "%s"' % h for h in PAC_HOSTS)
+
 PAC_TEMPLATE = """function FindProxyForURL(url, host) {
     host = host.toLowerCase();
     // github.com -> local proxy.
@@ -1664,17 +2508,18 @@ PAC_TEMPLATE = """function FindProxyForURL(url, host) {
     // github.io and *.github.io (GitHub Pages) also go through the local proxy.
     // They share the 185.199.108.0/22 pool with raw/objects, but the proxy checks
     // them against the *.github.io certificate, NOT the githubusercontent one.
-    if (host === "github.com" || host === "www.github.com" ||
-        host === "raw.githubusercontent.com" ||
-        host === "objects.githubusercontent.com" ||
-        host === "avatars.githubusercontent.com" ||
-        host === "camo.githubusercontent.com" ||
+    // 2026-10-24: codeload.github.com joins the list (same web fleet and the same
+    // *.github.com certificate as github.com; measured 301 on the pool IPs).
+    // gist.github.com is NOT taken over yet: with SNI=gist.github.com every
+    // official IP got a reset during the handshake, so another IP cannot help.
+    // githubassets stays DIRECT (already fast; different certificate).
+    if (%s ||
         host === "github.io" || dnsDomainIs(host, ".github.io")) {
-        return "PROXY 127.0.0.1:%d; DIRECT";
+        return "PROXY 127.0.0.1:%%d; DIRECT";
     }
     return "DIRECT";
 }
-"""
+""" % _PAC_HOSTS_JS
 
 
 class ProxyHandler(socketserver.StreamRequestHandler):
@@ -1845,6 +2690,30 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         if young:
             cand = young
 
+        # 【2026-10-24 新增·改法② 快速失败】
+        # 这一池子有没有"近期真答过话"的证据? 判据跟面板上"实测可用"完全一致:
+        #   · 近 _FRESH_WINDOW 秒里跑通过一次 HTTP(tier='http'), 或
+        #   · 吞吐台账还新鲜(_kbps_of 自带 TTL 判定)
+        # 两条都没有 = 31 个 IP 全是"证书还握得上、页面一次没跑通"的旧名次,
+        # 这时候按老规矩并发 6 个、每个等 4 秒, 纯属拿用户的浏览器陪葬。
+        # 改成只轻探 2 个、每个 2 秒, 不通马上退回系统解析。
+        # 只对**跑 HTTP 的池子**生效: raw / Pages 按设计只验证书(它们的 GET /
+        # 必然 400/404, 拿不到 tier='http'), 拿这条尺子量它们会把好 IP 误杀。
+        fast = False
+        if pool.checks_http:
+            _now = time.time()
+            _strong = [x for x in cand
+                       if pool.tier_of(x)[0] == 'http'
+                       and _now - pool.tier_of(x)[1] <= _FRESH_WINDOW]
+            if not _strong and not any(_kbps_of(x) for x in cand):
+                fast = True
+                if _fast_log_ok(key):
+                    log('%s 候选池近 %d 秒没有一个实测成过、吞吐台账也全过期 —— '
+                        '本次只做 2 秒轻探, 随即退回系统解析' %
+                        (label, int(_FRESH_WINDOW)))
+
+        _tried = set()      # 这次请求已经试过的 IP, 防止同一个死 IP 连撞两回
+
         # 【2026-10-11 三修·台账里实测最快的直接放行, 不进抢连】
         # 抢连比的是 **TCP 握手快慢**, 而"握手快 ≠ 传得动" —— 前两版都栽在这:
         #   1) 直连放进抢连名单, 结果握手快的坏 IP 赢了, 当场吃 30 秒超时;
@@ -1858,6 +2727,7 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         if best and best[1] >= _KBPS_DIRECT_MIN:
             need = _SYS_WIN_RATIO if best[0] in sys_ips else _KBPS_WIN_RATIO
             if second is None or best[1] >= second[1] * need:
+                _tried.add(best[0])
                 try:
                     # 超时压到 2.0 秒: 证据新鲜时连接通常 <0.5 秒就回来,
                     # 超过 2 秒基本可以断定"台账已过期", 早撤早回落抢连。
@@ -1866,6 +2736,7 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     _LAST_GOOD[key] = best[0]
                     _fail_clear(best[0])
                     _ip_born(best[0])
+                    _sys_fail_reset(key)
                     log('按实测吞吐直连 %s: %d KB/s, 次快 %s'
                         % (best[0], best[1],
                            ('%d KB/s' % second[1]) if second else '无'))
@@ -1875,18 +2746,113 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     _hot_drop(key, best[0])
                     _kbps_forget(best[0])   # 赌输了就忘掉它, 下次别再赔一轮超时
 
+        # 【2026-10-24 新增·改法③ 后台判直连赢就立刻走直连】
+        # 原来只有"直连 IP 在吞吐台账里还新鲜且够快"时才会走直连, 可台账一旦被
+        # _kbps_forget 作废(赌输一次)或过了 TTL, 而 _SYS_CAP 的对比结论还新鲜,
+        # 下一次请求就**还挂在过期的候选池上抢连** —— 用户反馈包里"吞吐对比…选直连"
+        # 之后仍然满屏"候选 IP 全军覆没", 就是这个脱节。
+        # 现在对比说直连明显快, 就先拿 2 秒试一把直连; 试不上再按原逻辑抢连。
+        if not fast and _sys_wins(host):
+            _sc = _cap_of(host, _SYS_CAP) or {}
+            _sip = _sc.get('ip') or ''
+            if _sip and _sip not in _tried and _fail_rank(_sip) == 0:
+                _tried.add(_sip)
+                try:
+                    _s2 = socket.create_connection((_sip, port), timeout=2.0)
+                    _note_route(key, _sip, [_sip])
+                    _LAST_GOOD[key] = _sip
+                    _fail_clear(_sip)
+                    _ip_born(_sip)
+                    _sys_fail_reset(key)
+                    log('吞吐对比判直连更快(直连 %d KB/s vs 池 %d KB/s): '
+                        '本次先走直连 %s' % (
+                            _sc.get('kbps', 0),
+                            (_cap_of(host, _POOL_CAP) or {}).get('kbps', 0), _sip))
+                    return _s2, _sip
+                except OSError:
+                    _fail_note(_sip)
+                    _kbps_forget(_sip)
+
+        # 【2026-10-24 新增·fast 时先"实测"再转发】
+        # fast 意味着这一池子近 90 秒没有任何一条 HTTP 证据、吞吐台账也全过期。
+        # 老做法是直接拿 2 个 IP 做 TCP 抢连 —— 可 TCP 通了不代表页面通：
+        # 今天满屏的 400 就是这么来的（隧道加密，转发层看不见里面那个 400，日志还一切正常）。
+        # 现在先拿体检同一把尺子问一发 GET /（并发 3 个、TCP 1.5 秒 + HTTP 2 秒封顶），
+        # 谁真答 2xx/3xx 就用谁；一个都没答话，才按老路做 2 秒轻抢连、再退回系统解析。
+        if fast and pool.checks_http:
+            # 【2026-10-25 加宽 3→6·按本机日志改】fast 只会落在"闲了一阵之后的第一条请求"上,
+            # 而那一条正是用户亲手点开页面的那一下, 亏不得。本机 foxpath.log 今天的记录:
+            #   18:34:41 轻探实测 20.200.245.247 回 2xx(267ms)  → 秒开
+            #   19:33:53 轻探实测 20.250.119.67  回 2xx(568ms)  → 秒开
+            #   19:11 / 19:14 / 19:17 / 19:36 四条 3 个都没答话 → 直接掉到
+            #           "候选 IP 全军覆没, 本次退回系统解析"
+            # 而系统解析那一位在同一份日志里是"直连 20.205.243.166(28 KB/s)"或"连不上",
+            # 也就是掉下去的这几条大概率就是用户说的"又打不开"。同一时刻体检报的是
+            # 可用 22~29/50 —— 池子里明明有活的, 只问 3 个等于抽奖。
+            # 6 是这套代码里反复验证过的"覆盖多网段又不自拥塞"的上限(下面抢连 max_race=6、
+            # _prescan 批次的成本红线都按 6 收的), 并发仍然只这一批、单个仍然 1.5 秒封顶,
+            # 所以最坏耗时没有变大, 只是把命中率从 3 个候选抬到 6 个。
+            _try = [x for x in cand if x not in _tried and not _bad_edge(x)][:6]
+            # 【2026-10-24 二修·改法④b】同一轮 HTTP 实测里**也问一句系统解析的 IP**。
+            # 为什么现在才加：今天先试的是"fast 时先拿 2 秒 TCP 连一把直连"，A/B 一跑
+            # 就露馅了(见 logs/UI整改-20261024/挑线路实测-20261024.txt)——
+            # 22:16 那半小时里直连 IP 是"握手通、正文死"，对照组 8/8 个 200 中位 1.35s，
+            # 而 TCP 优先插队的版本 3/8 条 4 秒没吐一个字节，反而更糟。
+            # 2026-10-11 记过的老坑是同一个：20.205.243.166 握手 0.12s 全场最快、
+            # 页面却 25 秒下不完。所以**不能拿 TCP 握手当证据**，只能拿 HTTP 应答当证据。
+            # 现在把它拉进本来就在并发跑的实测里(不多花一秒)，并且**排在这轮结果的最后**：
+            # 池子有人答话就还是池子的(它有寿命/吞吐台账)，只有池子全不答话而直连答了 2xx/3xx，
+            # 才走这条"刚被证实真能吐页面"的路 —— 省掉后面 2 秒 TCP 抢连和 3~10 秒兜底等待。
+            _sys_now = self._sys_ips(host) or []
+            for _x in _sys_now[:1]:
+                if _x and _x not in _try and _fail_rank(_x) == 0:
+                    _try.append(_x)
+            if _try and _prescan_take():
+                try:
+                    with ThreadPoolExecutor(max_workers=len(_try)) as _ex:
+                        _pr = dict(zip(_try, _ex.map(lambda x: pool._probe(x, timeout=1.5), _try)))
+                finally:
+                    _prescan_release()      # 探针批次一结束就交还闸门
+                _cert = sorted([(m[0], x) for x, m in _pr.items()
+                                if m and m[1] == 'http'])
+                # 池内 IP 优先, 直连垫底(同一把尺子答了话才有资格排进来)
+                _cert.sort(key=lambda t: (1 if t[1] in _sys_now else 0, t[0]))
+                for _ms, _ip in _cert:
+                    try:
+                        _s4 = socket.create_connection((_ip, port), timeout=2.0)
+                    except OSError:
+                        _fail_note(_ip)
+                        continue
+                    _note_route(key, _ip, _sys_now)
+                    _LAST_GOOD[key] = _ip
+                    _fail_clear(_ip)
+                    _ip_born(_ip)
+                    _sys_fail_reset(key)
+                    log('%s 轻探实测: %s 的 GET / 回到 2xx/3xx(%dms，%s)，本次用它转发'
+                        % (label, _ip, _ms,
+                           '系统解析' if _ip in _sys_now else '候选池'))
+                    return _s4, _ip
+                # 问下来一个都不答话: 回 4xx 的那些已经被 _probe 就地拉黑，
+                # 别再让它们参与下面的抢连(它们握手最快，一抢就赢，赢了就是 400)。
+                cand = [x for x in cand if not _bad_edge(x)] or cand
+
         # 一批并发抢连(6 个): 谁先通就用谁。
         # 不做"分批重试" —— 每多一批就多叠加一轮超时, 实测分批版出现过 16 秒尖峰。
         # 并发数**不是越多越好**: 试过 14 个, 国际链路上这些连接会互相挤占带宽,
         # 结果每个都变慢(实测退化到 7~10 秒); 6 个兼顾"覆盖多网段"与"不自拥塞"。
         # timeout 4 秒: 并发抢连的返回时间取决于"最快成功的那个", 不是这个上限,
         # 所以放宽它是零成本的, 高丢包时给 TCP 重传留够时间。
-        sock, ip = self._connect_race(cand, port, timeout=4.0, max_race=6)
+        # 但"没有任何实测证据"时(fast)反过来 —— 此时更可能全灭, 等越久亏越多,
+        # 所以轻探 2 个、2 秒封顶。
+        sock, ip = self._connect_race(cand, port,
+                                      timeout=2.0 if fast else 4.0,
+                                      max_race=2 if fast else 6)
         if sock is not None:
             _note_route(key, ip, sys_ips)
             _LAST_GOOD[key] = ip
             _fail_clear(ip)
             _ip_born(ip)          # 寿命台账: 这个 IP 第一次被证实可用
+            _sys_fail_reset(key)
             return sock, ip
         for dead in cand[:6]:
             pool.drop(dead)
@@ -1895,14 +2861,89 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             _hot_drop(key, dead)  # 热备里也剔掉, 下轮补新的
 
         _LAST_GOOD[key] = ''
-        # 整批都撞死了 —— 热备池多半也过期了, 立刻补一批新的待命
-        threading.Thread(target=lambda: hot_refresh(key, pool), daemon=True).start()
+        # 整批都撞死了 —— 热备池多半也过期了, 立刻补一批新的待命。
+        # 【2026-10-25 收口·别自己挤自己】原来**每一条**失败的转发都各开一个补充线程:
+        # 本机日志 19:47:27~19:47:30 三秒里 raw 连吃 7 条"全军覆没", 于是 7 个线程
+        # 各带并发 4 的探针同时上路(28 个探测), 而那会儿链路正在拥塞 —— 补充本身
+        # 变成新的负担, 越拥塞越补不上(和 _measure_hot / _prescan 记过的是同一个坑)。
+        # 现在同一池 30 秒内只补一次; 后来的请求照旧往下走系统解析兜底, 一秒都不多等。
+        # 判据用时间戳, 跟 trigger_selfheal 的 60 秒闸门同一个写法。
+        _rnow = time.time()
+        if _rnow - _HOT_REFILL_TS.get(key, 0.0) >= _HOT_REFILL_COOLDOWN:
+            _HOT_REFILL_TS[key] = _rnow
+            threading.Thread(target=lambda: hot_refresh(key, pool), daemon=True).start()
         log('%s 候选 IP 全军覆没, 本次退回系统解析' % label)
         trigger_selfheal()
+        # 连续全灭过就把兜底的等待压到 3 秒(见 _sys_fail_budget 的说明),
+        # 单条请求最坏从 ~14 秒降到 ~5 秒, 浏览器不至于整站卡死。
+        _budget = _sys_fail_budget(key)
+        # 【2026-10-24 三修·改法④c】退回系统解析之前, 最后拿实测问一句。
+        # 起因是装机版 22:37:00 那一条日志 + 同一秒的一次实测:
+        #   "候选 IP 全军覆没, 本次退回系统解析" → curl 拿到 **400 + 1440 字节**,
+        #   正文是 GitHub 的 "Bad request" 假前门页 —— 用户看到的"外国仓库打不开"就是这个。
+        # 老做法这里是**闭眼放行**: 系统解析到谁就连谁, 而 Azure 前门里有一批节点
+        # 证书里有 github.com、TCP/TLS 全通, 页面却必定回 400(2026-10-24 实测过 8/8 次 400
+        # 的 20.200.245.244、20.205.243.161)。转发是加密隧道, 里面那个 400 我们看不见,
+        # 于是日志一路绿灯、用户满屏打不开。
+        # 现在先问一发 GET /(体检同一把尺子):
+        #   · 答 2xx/3xx —— 用它转发, 这一下从"必定 400"变成"能开";
+        #   · 答 4xx/5xx —— _probe 已经就地把它实测拉黑 15 分钟, 这次就不给它转发
+        #     (宁可让这一条请求干脆失败, 也不把必定回 400 的前门交给浏览器);
+        #   · 不答话 —— 没证据也没反证, 保持老行为交给系统解析赌一把。
+        # 两个闸门, 免得在最该快的时候添堵:
+        #   fast(近 90 秒没有任何 HTTP 证据)时**不问** —— 上面 ④b 刚刚用同一把尺子
+        #   问过同一个 IP, 再问一遍只是白加 2 秒;
+        #   连续全灭(_budget 已被压到 3 秒)时也不问 —— 那正是整站在抽风的时候,
+        #   保平的"别卡死"比这一发的运气重要。
+        _sys_all = [x for x in (self._sys_ips(host) or []) if x]
+        if (pool.checks_http and not fast and _sys_all
+                and all(_bad_edge(x) for x in _sys_all)):
+            # 【2026-10-24 三修·把那段 15 分钟的洞堵上】上面"实测拉黑 15 分钟"原来
+            # 只让**第一条**请求拒得掉: _sys_now 是从"没被拉黑的系统 IP"里挑的, 一拉黑
+            # _sys_now 就空了、整段被跳过, 底下那句 create_connection((host, port))
+            # 又闭眼连回同一个必定回 400 的前门。装机版日志就是这么写的 ——
+            # 「退回前实测」0 条, 同期「候选 IP 全军覆没, 本次退回系统解析」100 条,
+            # 用户看到的仍是那页 GitHub "Bad request"(也就是"外国仓库打不开")。
+            # 现在: 系统解析到的**每一个** IP 都在实测拉黑期内 → 不探针、不连接、直接拒。
+            # 这一句不花任何额外时间(连那 1.5 秒探针都省), 只把"必定 400"换成一次干脆的失败。
+            log('%s 退回前实测: 系统解析到的 %s 全在实测拉黑期内(假前门)，'
+                '本次不给它转发，下次重新抢连' % (label, '、'.join(_sys_all[:2])))
+            return None, None
+        if pool.checks_http and not fast and _budget >= _SYS_FAIL_FULL_TIMEOUT:
+            _sys_now = [x for x in _sys_all if not _bad_edge(x)]
+            _p_ip = _sys_now[0] if _sys_now else ''
+            if _p_ip:
+                _pm = None
+                try:
+                    _pm = pool._probe(_p_ip, timeout=1.5)
+                except Exception:
+                    _pm = None
+                if _pm and _pm[1] == 'http':
+                    try:
+                        _s5 = socket.create_connection((_p_ip, port), timeout=2.0)
+                    except OSError:
+                        _fail_note(_p_ip)
+                    else:
+                        _note_route(key, _p_ip, _sys_now)
+                        _LAST_GOOD[key] = _p_ip
+                        _fail_clear(_p_ip)
+                        _ip_born(_p_ip)
+                        _sys_fail_reset(key)
+                        log('%s 退回前实测: 系统解析 %s 的 GET / 回到 2xx/3xx(%dms)，'
+                            '本次用它转发' % (label, _p_ip, _pm[0]))
+                        return _s5, _p_ip
+                elif _bad_edge(_p_ip):
+                    log('%s 退回前实测: 系统解析 %s 回 4xx/5xx(假前门)，'
+                        '本次不给它转发，下次重新抢连' % (label, _p_ip))
+                    return None, None
         try:
-            return socket.create_connection((host, port), timeout=10), None
+            _s3 = socket.create_connection((host, port), timeout=_budget)
+            _sys_fail_reset(key)
+            return _s3, None
         except OSError as e:
-            log('连接 %s 失败: %s' % (host, e))
+            _n = _sys_fail_bump(key)
+            log('连接 %s 失败: %s（兜底等了 %.1f 秒, 连续第 %d 次全灭）' %
+                (host, e, _budget, _n))
             return None, None
 
     def _connect(self, host, port):
@@ -1939,6 +2980,9 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             self._send(502, b'Bad Gateway')
             trigger_selfheal()
             return
+        # 【2026-10-24】面板"本次会话"那一格：PAC 命中走候选池 / 退回系统解析各算一次。
+        # 只统计**转发成功**的连接，失败的不算命中。
+        hit_count(bool(used))
         try:
             self.wfile.write(b'HTTP/1.1 200 Connection established\r\n\r\n')
             self.wfile.flush()
@@ -2316,10 +3360,9 @@ def autostart_on():
 # 升级源: 仓库里的 version.json, Gitee raw 优先、GitHub 兜底;
 #         测试时可在数据目录放一个 update_url.txt 指到本地文件。
 UPDATE_URLS = (
-    # 2026-10-17: 主源切到 GitCode（国内、快、下载数可统计）；Gitee / GitHub 保留兜底。
+    # 2026-10-23: 按用户要求去掉 Gitee 兜底（老仓库地址一律不出现）；只留 GitCode + GitHub。
     # GitCode 没有 Gitee 那种 raw 直链，用它的 API raw：/raw/version.json?ref=main
     'https://gitcode.com/api/v5/repos/kele551/FoxPath/raw/version.json?ref=main',
-    'https://gitee.com/kele551/FoxPath/raw/main/version.json',
     'https://raw.githubusercontent.com/kele551/FoxPath/main/version.json',
 )
 
@@ -3786,412 +4829,1355 @@ def apply_update_async(auto=False):
         % (os.path.getsize(new), sha[:16]))
 
 PANEL_HTML = """<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
+<html lang="zh-CN" data-theme="dark">
+<head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>狐径 FoxPath __VERSION__</title>
 <style>
- *{box-sizing:border-box}
- body{margin:0;padding:28px;background:#fff;color:#1a1a1a;
-      font:14px/1.6 "Microsoft YaHei UI",system-ui,sans-serif;max-width:860px}
- h1{font-size:20px;margin:0 0 4px;font-weight:600}
- .sub{color:#6b7280;font-size:13px;margin-bottom:22px}
- .card{border:1px solid #e5e7eb;border-radius:8px;padding:16px 18px;margin-bottom:16px}
- .row{display:flex;gap:14px;flex-wrap:wrap;align-items:center}
- .k{color:#6b7280;width:88px;display:inline-block}
- .big{font-size:17px;font-weight:600;color:#0f766e}
- .off{color:#b91c1c}
- button{padding:8px 16px;border:1px solid #d1d5db;background:#fff;border-radius:6px;
-        cursor:pointer;font-size:14px;font-family:inherit}
- button:hover{background:#f3f4f6}
- button.primary{background:#0f766e;color:#fff;border-color:#0f766e}
- button.primary:hover{background:#0d5f59}
- button.danger{background:#b91c1c;color:#fff;border-color:#b91c1c}
- button.danger:hover{background:#991b1b}
- label{display:flex;align-items:center;gap:6px;cursor:pointer}
- table{width:100%;border-collapse:collapse;font-size:13px}
- th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #f0f0f0}
- th{color:#6b7280;font-weight:500}
- pre{background:#f8fafc;border:1px solid #e5e7eb;border-radius:6px;padding:12px;
-     height:190px;overflow:auto;font:12px/1.7 Consolas,monospace;margin:0;color:#374151}
- .upd-ver{font:600 15px/1.5 Consolas,monospace;color:#0f766e}
- .upd-track{font:600 15px/1.5 Consolas,monospace;color:#cbd5e1;white-space:pre}
- .upd-bar{height:10px;background:#eef2f4;border-radius:6px;overflow:hidden;margin-top:10px}
- .upd-bar > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#0f766e,#22c1ae);
-   transition:width .25s ease}
- .upd-note{color:#6b7280;font-size:13px;margin-top:8px}
-.upd-banner{margin-top:10px;padding:8px 10px;border-radius:6px;background:#fff7ed;
-  border:1px solid #fed7aa;color:#9a3412;font-size:13px}
- .upd-ok{color:#0f766e;font-weight:600}
- .upd-err{color:#b91c1c;font-weight:600}</style></head><body>
-<h1>狐径 FoxPath __VERSION__</h1>
-<div class="sub">本机代理接管 GitHub 流量，直连当前实测可用的官方 IP。不改 hosts、不用管理员权限。</div>
+/* ══════════════════════════════════════════════════════════════════════════
+   设计令牌 —— 与《UI 整改方案》同一套（石墨灰 + 狐径橙），只改变量、不写字面量
+   ══════════════════════════════════════════════════════════════════════════ */
+:root{
+  --font:"Microsoft YaHei UI","Microsoft YaHei","PingFang SC","Segoe UI",system-ui,sans-serif;
+  --mono:"Cascadia Mono",Consolas,"Courier New",monospace;
+  --bg:#171a20; --bg-1:#1c2027; --card:#20252d; --card-2:#262d37;
+  --line:#303844; --line-2:#3e4856;
+  --txt:#e7ebf1; --txt-2:#a3aebe; --txt-3:#76818f;
+  --ok:#3ecf8e; --warn:#f0b429; --danger:#f2555a; --info:#4f8cff;
+  --accent:#f0883e; --accent-ink:#241103;
+  --fs-title:20px; --fs-h:14px; --fs-body:13px; --fs-meta:12px; --fs-micro:11px;
+  --r-card:10px; --r-btn:8px; --r-pill:999px;
+  --shadow-1:0 1px 0 rgba(0,0,0,.18); --shadow-2:0 14px 40px rgba(0,0,0,.45);
+  /* 浏览器原生那部分（滚动条/表单控件/日期弹层）也一起跟主题，不然暗色页面配亮色滚动条。
+     2026-10-24 四款一起补这一行。 */
+  color-scheme:dark;
+}
+[data-theme="light"]{
+  --bg:#f3f5f9; --bg-1:#e9edf4; --card:#ffffff; --card-2:#f7f9fc;
+  --line:#e2e7ef; --line-2:#d3dae5;
+  --txt:#17202b; --txt-2:#5b6675; --txt-3:#8a96a5;
+  --ok:#12a150; --warn:#a86f00; --danger:#d13438; --info:#1a5fd0;
+  --accent:#c2620f; --accent-ink:#fff;
+  --shadow-1:0 1px 0 rgba(16,30,54,.04); --shadow-2:0 18px 40px rgba(20,34,60,.14);
+  color-scheme:light;
+}
 
-<div class="card" id="updCard">
-  <div class="row" style="margin-bottom:6px">
-    <span class="k">版本</span>
-    <span class="upd-ver" id="uvLocal">__VERSION__</span>
-    <span class="upd-track" id="uvArrow">   =====>   </span>
-    <span class="upd-ver" id="uvRemote">—</span>
-    <button class="primary" id="btnUpdCheck">检查更新</button>
-    <button class="primary" id="btnUpdGo" style="display:none">立即升级</button>
-    <label><input type="checkbox" id="autoUpd"> 自动升级</label>
-    <label><input type="checkbox" id="notifyBubble"> 升级结果气泡</label>
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--txt)}
+body{font:var(--fs-body)/1.55 var(--font);-webkit-font-smoothing:antialiased;
+  background-image:radial-gradient(120% 60% at 50% -10%,rgba(240,136,62,.07),transparent 60%)}
+[data-theme="light"] body{background-image:none}
+button,input{font:inherit;color:inherit}
+button{cursor:pointer;background:none;border:0}
+h1,h2,h3,p{margin:0}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:8px;border:2px solid var(--bg)}
+::-webkit-scrollbar-track{background:transparent}
+.wrap{max-width:1180px;margin:0 auto;padding:18px 20px 40px}
+
+/* ── 顶栏 ───────────────────────────────────────────────────────────── */
+.top{display:flex;align-items:center;gap:14px;padding:2px 2px 16px}
+.logo{width:38px;height:38px;border-radius:11px;flex:none;display:grid;place-items:center;
+  background:var(--accent);color:var(--accent-ink);font-weight:700;font-size:17px;
+  box-shadow:var(--shadow-1)}
+.top h1{font-size:var(--fs-title);font-weight:650;letter-spacing:.2px;display:flex;
+  align-items:center;gap:8px;flex-wrap:wrap}
+.ver{font:600 var(--fs-micro)/1 var(--mono);color:var(--txt-2);background:var(--card-2);
+  border:1px solid var(--line);border-radius:var(--r-pill);padding:4px 8px;letter-spacing:.02em}
+.top p{color:var(--txt-3);font-size:var(--fs-micro);margin-top:3px}
+.top-r{margin-left:auto;display:flex;align-items:center;gap:8px}
+
+/* ── 通用组件 ───────────────────────────────────────────────────────── */
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r-card);
+  padding:16px 18px;box-shadow:var(--shadow-1);margin-bottom:14px}
+.card.tight{padding:14px 16px}
+.card-h{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.card-h h2{font-size:var(--fs-h);font-weight:600}
+.card-h .hint{color:var(--txt-2);font-size:var(--fs-micro)}
+.card-h .right{margin-left:auto;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.muted{color:var(--txt-3)}
+.xs{font-size:var(--fs-micro)}
+.mono{font-family:var(--mono)}
+.num{font-variant-numeric:tabular-nums}
+.t-lg{font-size:17px;font-weight:650;line-height:1.35}
+.msg{display:block;font-size:var(--fs-micro);color:var(--ok);min-height:15px;margin-top:6px}
+.msg.bad{color:var(--danger)}
+
+.pill{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 10px;
+  border-radius:var(--r-pill);border:1px solid var(--line);font-size:var(--fs-micro);
+  color:var(--txt-2);white-space:nowrap;background:var(--card-2)}
+.pill i{width:6px;height:6px;border-radius:50%;background:var(--txt-3);flex:none}
+.pill.ok i{background:var(--ok);box-shadow:0 0 0 3px rgba(62,207,142,.18)}
+.pill.warn i{background:var(--warn);box-shadow:0 0 0 3px rgba(240,180,41,.18)}
+.pill.bad i{background:var(--danger);box-shadow:0 0 0 3px rgba(242,85,90,.18)}
+.pill.on{color:var(--accent);border-color:rgba(240,136,62,.45);background:rgba(240,136,62,.12)}
+
+.btn{height:30px;padding:0 12px;border-radius:var(--r-btn);border:1px solid var(--line);
+  background:var(--card-2);color:var(--txt);font-size:var(--fs-meta);
+  display:inline-flex;align-items:center;gap:7px;white-space:nowrap;
+  transition:border-color .15s,background .15s,color .15s,opacity .15s}
+.btn:hover{border-color:var(--line-2);background:var(--card)}
+.btn.primary{background:var(--accent);border-color:transparent;color:var(--accent-ink);font-weight:600}
+.btn.primary:hover{filter:brightness(1.07)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--txt-2)}
+.btn.ghost:hover{color:var(--txt);background:var(--card-2)}
+.btn.danger{color:var(--danger);border-color:rgba(242,85,90,.38);background:transparent}
+.btn.danger:hover{background:rgba(242,85,90,.12)}
+.btn.sm{height:26px;padding:0 9px;font-size:var(--fs-micro)}
+.btn:disabled{opacity:.45;cursor:default}
+.icon-btn{width:30px;height:30px;border-radius:var(--r-btn);border:1px solid var(--line);
+  background:var(--card-2);color:var(--txt-2);display:grid;place-items:center;font-size:14px;
+  transition:border-color .15s,color .15s}
+.icon-btn:hover{color:var(--txt);border-color:var(--line-2)}
+
+.chip{height:26px;padding:0 11px;border-radius:var(--r-pill);border:1px solid var(--line);
+  background:transparent;color:var(--txt-2);font-size:var(--fs-meta);
+  display:inline-flex;align-items:center;gap:6px;transition:all .15s}
+.chip:hover{color:var(--txt);border-color:var(--line-2)}
+.chip.on{background:rgba(240,136,62,.14);border-color:rgba(240,136,62,.45);
+  color:var(--accent);font-weight:600}
+[data-theme="light"] .chip.on{background:rgba(194,98,15,.12)}
+kbd{font:500 10px/1 var(--mono);color:var(--txt-3);border:1px solid var(--line-2);
+  border-radius:5px;padding:3px 5px;background:var(--card)}
+
+/* 开关 */
+.sw{width:36px;height:20px;border-radius:var(--r-pill);background:var(--line-2);position:relative;
+  flex:none;transition:background .18s}
+.sw:after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
+  background:#fff;transition:transform .18s;box-shadow:0 1px 2px rgba(0,0,0,.35)}
+.sw.on{background:var(--accent)}
+.sw.on:after{transform:translateX(16px)}
+.sw.big{width:56px;height:30px;border-radius:var(--r-pill)}
+.sw.big:after{width:26px;height:26px}
+.sw.big.on:after{transform:translateX(26px)}
+.sw[disabled]{opacity:.5;cursor:default}
+
+/* hero */
+.hero{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:10px}
+.hero-mid{flex:1;min-width:230px}
+.hero-mid .sub{color:var(--txt-3);font-size:var(--fs-micro);margin-top:2px}
+.hero-right{display:flex;align-items:center;gap:22px;flex-wrap:wrap}
+.kv .k{color:var(--txt-2);font-size:var(--fs-micro);letter-spacing:.02em}
+.kv .v{font-size:15px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
+.kv .v small{font-size:var(--fs-micro);font-weight:400;color:var(--txt-3);margin-left:2px}
+.kv .v.mono{font-family:var(--mono);font-size:14px;font-weight:500}
+.btns{display:flex;gap:8px}
+
+/* 状态说明行（原来那几条提示，现在放在 hero 下面一行一条） */
+.tips{margin:0 2px 14px;display:flex;flex-direction:column;gap:4px}
+.tips>div{font-size:var(--fs-micro);color:var(--txt-2)}
+/* 线路状态移进日志卡后：红字区分，空的自动收起 */
+.logtips{margin:0 0 10px;gap:5px}
+.logtips>div{font-size:var(--fs-micro);line-height:1.6;color:var(--danger)}
+.logtips>div:empty{display:none}
+
+/* 数字卡 */
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:var(--r-card);
+  padding:13px 15px;box-shadow:var(--shadow-1)}
+.stat .k{color:var(--txt-2);font-size:var(--fs-micro);letter-spacing:.04em;text-transform:uppercase}
+.stat .v{font-size:24px;font-weight:650;line-height:1.25;margin-top:5px;font-variant-numeric:tabular-nums}
+.stat .v small{font-size:var(--fs-meta);font-weight:500;color:var(--txt-3);margin-left:3px}
+.stat .d{font-size:var(--fs-micro);color:var(--txt-2);margin-top:3px}
+.stat .d.up{color:var(--ok)} .stat .d.down{color:var(--danger)}
+
+/* 两栏 */
+.cols{display:block}
+.col{min-width:0}
+.col>*:last-child{margin-bottom:0}
+
+/* 表格 */
+.tbl{width:100%;border-collapse:collapse;font-size:var(--fs-meta)}
+.tbl th{text-align:left;font-weight:500;font-size:var(--fs-micro);letter-spacing:.05em;
+  text-transform:uppercase;color:var(--txt-2);padding:0 8px 8px;border-bottom:1px solid var(--line);
+  white-space:nowrap}
+.tbl th.sortable{cursor:pointer;user-select:none}
+.tbl th.sortable:hover{color:var(--txt-2)}
+.tbl th .arw{display:inline-block;width:9px;color:var(--accent);font-size:9px}
+.tbl td{padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+.tbl tbody tr:hover td{background:var(--card-2)}
+.tbl tbody tr:last-child td{border-bottom:0}
+.tbl th.r,.tbl td.r{text-align:right}
+.copy{opacity:0;transition:opacity .15s;color:var(--txt-3);font-size:var(--fs-micro);padding:2px 4px}
+tr:hover .copy{opacity:1}
+.copy:hover{color:var(--accent)}
+.table-foot{display:flex;align-items:center;gap:10px;margin-top:10px;font-size:var(--fs-micro);
+  color:var(--txt-2);flex-wrap:wrap}
+.empty{padding:14px 4px;font-size:var(--fs-meta);color:var(--txt-3);line-height:1.7}
+
+/* 句子式设置行（线路体检 / 设置项） */
+.set{display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--line)}
+.set:first-of-type{border-top:0}
+.set .txt{flex:1;min-width:0}
+.set .txt b{display:block;font-size:var(--fs-body);font-weight:550;word-break:break-all}
+.set .txt span{display:block;color:var(--txt-3);font-size:var(--fs-micro);margin-top:2px}
+.set .ctl{flex:none}
+
+/* 图例 */
+.legend{display:flex;align-items:center;gap:14px;margin-top:8px;font-size:var(--fs-micro);
+  color:var(--txt-2);flex-wrap:wrap}
+.legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px}
+#chart{width:100%;height:152px;display:block}
+
+/* 日志 */
+details.logwrap{margin:0}
+details.logwrap>summary{cursor:pointer;font-size:var(--fs-meta);color:var(--txt-2);
+  list-style:none;display:flex;align-items:center;gap:6px}
+details.logwrap>summary::-webkit-details-marker{display:none}
+details.logwrap>summary:before{content:"▸";color:var(--txt-3);transition:transform .15s}
+details.logwrap[open]>summary:before{transform:rotate(90deg)}
+.log{font:12px/1.7 var(--mono);color:var(--txt-2);background:var(--bg-1);
+  border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:10px;
+  height:190px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+.lognote{color:var(--txt-3);font-size:var(--fs-micro);margin-left:auto}
+
+/* 升级卡 */
+.upd-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.upd-ver{font:600 15px/1.5 var(--mono);color:var(--txt)}
+.upd-track{font:600 15px/1.5 var(--mono);color:var(--line-2);white-space:pre}
+.upd-bar{height:8px;background:var(--line);border-radius:6px;overflow:hidden;margin-top:10px}
+.upd-bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--warn));
+  transition:width .25s ease}
+.upd-note{color:var(--txt-2);font-size:var(--fs-micro);margin-top:6px}
+.upd-banner{margin-top:8px;padding:8px 10px;border-radius:6px;background:rgba(240,180,41,.12);
+  border:1px solid rgba(240,180,41,.35);color:var(--txt);font-size:var(--fs-meta)}
+.upd-ok{color:var(--ok);font-weight:600}
+.upd-err{color:var(--danger);font-weight:600}
+.field{display:flex;gap:8px}
+.input{flex:1;min-width:0;height:30px;padding:0 10px;border-radius:var(--r-btn);
+  border:1px solid var(--line);background:var(--bg-1);color:var(--txt);font-size:var(--fs-meta)}
+.input:focus{border-color:var(--accent)}
+.input::placeholder{color:var(--txt-3)}
+
+.foot{display:flex;align-items:center;gap:10px;justify-content:center;margin-top:18px;
+  font-size:var(--fs-micro);color:var(--txt-3);flex-wrap:wrap}
+.foot a{color:var(--txt-3)}
+.foot a:hover{color:var(--accent)}
+
+/* Toast */
+.toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,14px);opacity:0;
+  pointer-events:none;background:var(--card);border:1px solid var(--line-2);
+  box-shadow:var(--shadow-2);border-radius:9px;padding:9px 14px;font-size:var(--fs-meta);
+  display:flex;align-items:center;gap:10px;transition:opacity .18s,transform .18s;z-index:40;
+  max-width:min(560px,92vw)}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+.toast b{color:var(--accent);font-weight:600}
+
+@media (max-width:1000px){
+  .cols{grid-template-columns:minmax(0,1fr)}
+  .stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .hero-right{gap:14px}
+}
+@media (max-width:640px){
+  .wrap{padding:14px 12px 30px}
+  .stats{grid-template-columns:minmax(0,1fr)}
+  .top{align-items:flex-start}
+}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body data-app="fox">
+<div class="wrap">
+
+  <header class="top">
+    <div class="logo">狐</div>
+    <div style="min-width:0">
+      <h1>狐径 FoxPath <span class="ver">v__VERSION__</span></h1>
+      <p>本机代理接管 GitHub 流量 · 只影响 GitHub 相关域名 · 不装证书、不改 hosts、零管理员</p>
+    </div>
+    <div class="top-r">
+      <span class="pill" id="hdrPill"><i></i><span id="hdrPillText">读取中…</span></span>
+      <button class="icon-btn" id="btnTheme" title="切换明暗（也可以按 T）">☾</button>
+    </div>
+  </header>
+
+  <!-- ① hero：大开关 + 状态句 + 出口 IP + 延迟 + 两个按钮 -->
+  <section class="card hero">
+    <button class="sw big" id="btnPower" role="switch" aria-checked="false"
+            title="启用 / 停用（会改本机系统代理）"></button>
+    <div class="hero-mid">
+      <div class="t-lg" id="state">读取中…</div>
+      <div class="sub" id="stateSub">系统代理接管 · 只影响 GitHub 相关域名 · 不装证书、不改 hosts</div>
+      <span class="msg" id="actMsg"></span>
+    </div>
+    <div class="hero-right">
+      <div class="kv"><div class="k">出口 IP</div><div class="v mono" id="ip">检测中…</div></div>
+      <div class="kv"><div class="k">延迟</div><div class="v" id="ms">— <small>ms</small></div></div>
+      <div class="btns">
+        <button class="btn" id="btnTest">立即重测</button>
+        <button class="btn danger" id="btnDisable">停用并还原</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 线路状态那几句话已移入「日志」卡（2026-10-24 用户要求：红字别堆在首页），空了自动隐藏 -->
+
+  <!-- ② 4 个数字卡 -->
+  <section class="stats">
+    <div class="stat"><div class="k">实测可用</div>
+      <div class="v" id="stIp">— <small>/ —</small></div>
+      <div class="d" id="stIpD">近期真跑通过一次请求的 IP</div></div>
+    <div class="stat"><div class="k">接管域名</div>
+      <div class="v" id="stHosts">— <small>个</small></div>
+      <div class="d" id="stHostsD">含 *.github.io</div></div>
+    <div class="stat"><div class="k">上次体检</div>
+      <div class="v" id="stCheck">— <small>前</small></div>
+      <div class="d" id="stCheckD">还没体检过</div></div>
+    <div class="stat"><div class="k">本次会话</div>
+      <div class="v" id="stHits">0 <small>次</small></div>
+      <div class="d" id="stHitsD">PAC 命中 0 · 直连 0</div></div>
+  </section>
+
+  <div class="cols">
+    <div class="col">
+      <!-- ③ 延迟曲线（canvas 手绘，没有图表库） -->
+      <section class="card">
+        <div class="card-h">
+          <h2>延迟走势</h2>
+          <span class="hint" id="histHint">每次体检一个点（5 分钟）</span>
+          <div class="right">
+            <button class="chip on" id="range3">3 小时</button>
+            <button class="chip" id="range24">24 小时</button>
+            <a class="btn ghost sm" id="btnCsv" href="/api/history.csv?hours=3" download>导出 CSV</a>
+          </div>
+        </div>
+        <canvas id="chart" width="760" height="152" aria-label="延迟走势图"></canvas>
+        <div class="legend">
+          <span><i style="background:var(--accent)"></i>出口 IP 延迟</span>
+          <span><i style="background:var(--danger)"></i>这一轮全灭</span>
+          <span style="margin-left:auto" id="histSummary">还没有采样</span>
+        </div>
+      </section>
+
+      <!-- ④ IP 表：可排序 / 行内复制 / 复制全部 -->
+      <section class="card">
+        <div class="card-h">
+          <h2>当前可用 IP</h2>
+          <span class="pill ok"><i></i><span id="sortPill">按延迟排序</span></span>
+          <div class="right">
+            <button class="chip" id="onlyGood" title="把丢包抽样 100% 的行先收起来">隐藏 100% 丢包</button>
+            <button class="btn ghost sm" id="btnCopyAll">复制全部</button>
+            <button class="btn ghost sm" id="btnRetest2">重新体检</button>
+          </div>
+        </div>
+        <table class="tbl">
+          <thead id="ipHead"><tr>
+            <th class="sortable" data-sort="ip">IP<span class="arw"></span></th>
+            <th class="sortable r" data-sort="ms">延迟<span class="arw"></span></th>
+            <th class="sortable r" data-sort="loss">丢包<span class="arw"></span></th>
+            <th class="sortable r" data-sort="fails">失败<span class="arw"></span></th>
+            <!-- 【2026-10-24 新增列】这个 IP 的证据强度: 真跑过请求 / 只验过证书 / 已出窗 -->
+            <th class="r">证据</th>
+            <th class="r"></th>
+          </tr></thead>
+          <tbody id="ips"></tbody>
+        </table>
+        <div class="table-foot">
+          <span id="ipsCount">读取中…</span>
+          <span class="muted">丢包＝本机 3 次 TCP 握手失败率（不是 ICMP 丢包）；失败＝连续转发失败次数，成功即清零</span>
+        </div>
+      </section>
+
+
+  <!-- ⑨ 版本与升级：老功能一个都没少 -->
+  <section class="card" id="updCard">
+    <div class="card-h">
+      <h2>版本与升级</h2>
+      <span class="hint" id="updMsg">默认自动升级: 启动后发现有新版本会自动下好、校验、换上新版（不弹确认框）</span>
+    </div>
+    <div class="upd-row">
+      <span class="muted xs">版本</span>
+      <span class="upd-ver" id="uvLocal">__VERSION__</span>
+      <span class="upd-track" id="uvArrow">   =====>   </span>
+      <span class="upd-ver" id="uvRemote">—</span>
+      <button class="btn primary" id="btnUpdCheck">检查更新</button>
+      <button class="btn primary" id="btnUpdGo" style="display:none">立即升级</button>
+      <span style="flex:1"></span>
+      <span class="set" style="border:0;padding:0;gap:10px">
+        <span class="txt" style="display:flex;align-items:center;gap:8px">
+          <b style="font-size:var(--fs-meta);font-weight:500">自动升级</b>
+          <button class="sw" id="autoUpd" role="switch" aria-checked="false" title="自动升级"></button>
+        </span>
+      </span>
+      <span class="set" style="border:0;padding:0;gap:10px">
+        <span class="txt" style="display:flex;align-items:center;gap:8px">
+          <b style="font-size:var(--fs-meta);font-weight:500">升级结果气泡</b>
+          <button class="sw" id="notifyBubble" role="switch" aria-checked="false" title="升级结果气泡"></button>
+        </span>
+      </span>
+    </div>
+    <div class="upd-bar" id="updBarWrap" style="display:none"><i id="updBar"></i></div>
+    <div class="upd-banner" id="updBanner" style="display:none"></div>
+    <div class="upd-note upd-ok" id="updAuto"></div>
+    <div class="upd-note" id="updLast"></div>
+    <div class="upd-note" id="updDetail"></div>
+  </section>
+
+
+    </div>
+
+    <div class="col">
+      <!-- ⑤ 线路体检：每域名一行状态 -->
+      <section class="card">
+        <div class="card-h">
+          <h2>线路体检</h2>
+          <span class="pill" id="ipv6Pill"><i></i><span id="ipv6Text">IPv6 检测中</span></span>
+        </div>
+        <div id="lines"><div class="empty">读取中…</div></div>
+        <div class="field" style="margin-top:12px;gap:8px">
+          <button class="btn" id="btnDiagCopy" style="flex:1;justify-content:center">复制诊断信息</button>
+          <button class="btn primary" id="btnReport" style="flex:1;justify-content:center">一键反馈包</button>
+        </div>
+        <span class="msg" id="diagMsg"></span>
+        <div class="field" style="margin-top:10px">
+          <button class="btn ghost sm" id="btnDiagRe">刷新体检信息</button>
+        </div>
+        <details class="logwrap" style="margin-top:10px">
+          <summary>诊断原文（复制用，点开看）</summary>
+          <div class="upd-note" style="word-break:break-all;white-space:pre-wrap" id="diag">读取中…</div>
+        </details>
+      </section>
+
+      <!-- ⑥ 手动指定 IP -->
+      <section class="card">
+        <div class="card-h">
+          <h2>手动指定 IP</h2>
+          <span class="hint">自动探测一个都不通时用</span>
+        </div>
+        <div class="field">
+          <input class="input mono" id="ipInput" placeholder="例如 20.205.243.166" spellcheck="false">
+          <button class="btn primary" id="btnIpSave">保存并重测</button>
+        </div>
+        <div class="field" style="margin-top:8px">
+          <button class="btn ghost sm" id="btnIpClear">清除手动 IP</button>
+          <span class="msg" id="ipMsg" style="margin:0;align-self:center"></span>
+        </div>
+        <p class="muted xs" style="margin-top:8px">只影响本机 PAC 这一份名单，随时可清除。</p>
+      </section>
+
+      <!-- ⑦ 更多设置 -->
+      <section class="card">
+        <div class="card-h"><h2>更多</h2><span class="hint">按 <kbd>/</kbd> 跳到手动 IP，<kbd>Esc</kbd> 取消</span></div>
+        <div class="set">
+          <div class="txt"><b>开机自启</b><span>登录后静默驻留托盘，不弹窗</span></div>
+          <div class="ctl"><button class="sw" id="auto" role="switch" aria-checked="false" title="开机自启"></button></div>
+        </div>
+        <div class="set">
+          <div class="txt"><b>立即测速</b><span>真下载一段 GitHub 首页，量出经狐径 / 直连各自的速度</span></div>
+          <div class="ctl"><button class="btn sm" id="btnSpeed">开始测速</button></div>
+        </div>
+        <div class="set">
+          <div class="txt"><b>退出并还原</b><span>退出前把系统代理恢复成原来的样子</span></div>
+          <div class="ctl"><button class="btn danger sm" id="btnQuit">退出</button></div>
+        </div>
+        <span class="msg" id="speedMsg"></span>
+      </section>
+
+      <!-- ⑧ 日志：默认折叠 -->
+      <section class="card tight">
+        <details class="logwrap">
+          <summary>日志（实时，最近 200 行）</summary>
+          <div class="tips logtips">
+            <div id="lifeBar"></div>
+            <div id="directTip"></div>
+            <div id="speedTip"></div>
+            <div id="routeTip"></div>
+            <div id="chanTip"></div>
+          </div>
+          <pre class="log" id="log"></pre>
+        </details>
+      </section>
+
+
+    </div>
   </div>
-  <div class="upd-bar" id="updBarWrap" style="display:none"><i id="updBar"></i></div>
-  <div class="upd-banner" id="updBanner" style="display:none"></div>
-  <div class="upd-note" id="updMsg">默认自动升级: 启动后发现有新版本会自动下好、校验、换上新版（不弹确认框）。</div>
-  <div class="upd-note upd-ok" id="updAuto"></div>
-  <div class="upd-note" id="updLast"></div>
-</div>
-<div class="card">
-  <div class="row" style="margin-bottom:10px">
-    <span class="k">出口 IP</span><span class="big" id="ip">检测中…</span>
-    <span class="k">加速状态</span><span class="big" id="state">-</span>
-    <span class="k">上次体检</span><span id="time">-</span>
+
+  <div class="foot">
+    <span>狐径 FoxPath · 作者 __AUTHOR__</span>
+    <span>·</span>
+    <a href="https://__HOMEPAGE__" target="_blank" rel="noopener">__HOMEPAGE__</a>
+    <span>·</span>
+    <span>所有请求只在本机；本页没有任何外部资源</span>
   </div>
-  <div class="row">
-    <button class="primary" id="btnEnable">启用加速</button>
-    <button id="btnDisable">停用并还原</button>
-    <button id="btnTest">立即重测</button>
-    <button id="btnSpeed">立即测速</button>
-    <label><input type="checkbox" id="auto"> 开机自启</label>
-    <button class="danger" id="btnQuit">退出并还原</button>
-    <span id="actMsg" style="font-size:13px;color:#16a34a"></span>
-  </div>
-  <div class="row" id="lifeBar" style="margin-top:8px;font-size:13px;color:#64748b"></div>
-  <div class="row" id="directTip" style="margin-top:6px;font-size:13px"></div>
-  <div class="row" id="speedTip" style="margin-top:6px;font-size:13px;color:#64748b"></div>
-  <div class="row" id="routeTip" style="margin-top:6px;font-size:13px;color:#64748b"></div>
-  <div class="row" id="speedMsg" style="font-size:13px;color:#64748b"></div>
 </div>
 
-<div class="card">
-  <div style="margin-bottom:8px"><b>当前可用 IP</b>（按延迟排序）</div>
-  <table><thead><tr><th>IP</th><th>延迟</th></tr></thead><tbody id="ips"></tbody></table>
-</div>
-
-<div class="card">
-  <div style="margin-bottom:8px"><b>线路体检</b>
-    <span style="color:#6b7280">—— 点「复制诊断信息」把这一行发给作者，就能定位卡在哪一环</span></div>
-  <div id="diag" style="font-family:Consolas,monospace;font-size:12px;background:#f6f8fa;
-       padding:8px;border-radius:6px;word-break:break-all;white-space:pre-wrap">读取中…</div>
-  <div class="row" style="margin-top:8px">
-    <button class="primary" id="btnDiagCopy">复制诊断信息</button>
-    <button id="btnDiagRe">刷新体检</button>
-    <span id="diagMsg" style="margin-left:8px;color:#16a34a"></span>
-  </div>
-</div>
-
-<div class="card">
-  <div style="margin-bottom:8px"><b>手动指定 IP</b>
-    <span style="color:#6b7280">—— 自动探测一个都不通时用：填一个你这条线能连上的 GitHub 官方 IP</span></div>
-  <div class="row">
-    <input id="ipInput" placeholder="例如 20.205.243.166" style="min-width:220px;padding:4px 6px">
-    <button class="primary" id="btnIpSave">保存并重测</button>
-    <button id="btnIpClear">清除</button>
-    <span id="ipMsg" style="margin-left:8px;color:#6b7280"></span>
-  </div>
-</div>
-
-<div class="card"><div style="margin-bottom:8px"><b>日志</b></div><pre id="log"></pre></div>
+<div class="toast" id="toast"><span id="toastText"></span></div>
 
 <script>
-function api(u){return fetch(u).then(r=>r.json())}
-function act(u){return fetch(u,{method:'POST'}).then(r=>r.json())}
-function refresh(){
-  api('/api/status').then(d=>{
-    document.getElementById('ip').textContent = d.ip ? d.ip+' ('+d.ms+' ms)' : '暂无可用 IP';
-    const s=document.getElementById('state');
-    s.textContent = d.enabled ? '已启用' : '未启用';
-    s.className = d.enabled ? 'big' : 'big off';
-    document.getElementById('time').textContent = d.last || '-';
-    // IP 寿命台账: 直接回答"多久会被锁死、还剩多久、有没有备胎"(2026-10-11)
-    const lb = document.getElementById('lifeBar');
-    if (d.life && d.cur_ip) {
-      const src = d.life_n ? ('本机实测 ' + d.life_n + ' 个样本') : '经验值(攒够样本后自动校准)';
-      const left = d.cur_left;
-      // cur_left 为 null = 这个 IP 已失效或还没建立寿命记录, 不能显示成"还能撑 X 秒"
-      const tail = (left === null || left === undefined)
-        ? '寿命未知(该 IP 已失效, 下次访问会换新的)'
-        : ('已撑 ' + d.cur_age + ' 秒, 约 ' + Math.max(0, left) + ' 秒后自动提前换掉(不等它锁死)');
-      lb.textContent = 'IP 寿命基准 ' + d.life + ' 秒(' + src + ') · 当前 ' + d.cur_ip
-        + ' · ' + tail + ' · 热备 ' + (d.hot || 0) + ' 个待命';
-      lb.style.color = (left !== null && left !== undefined && left < 30) ? '#dc2626' : '#64748b';
-    } else { lb.textContent = ''; }
-    // 线路体检: 明说"是线路不通还是狐径没干活", 别让用户猜(2026-10-11 用户反复报打不开)
-    const dt = document.getElementById('directTip');
-    if (d.direct === false) {
-      dt.textContent = '当前这台机器直连 github 主站也不通（不是狐径的问题，换 IP 也打不开）。'
-        + '狐径会在线路恢复时自动生效；急用可开手机热点，或先用 Gitee。';
-      dt.style.color = '#dc2626';
-    } else if (d.direct === true) {
-      dt.textContent = '直连 github 正常，狐径会挑更快的 IP 走。';
-      dt.style.color = '#16a34a';
-    } else { dt.textContent = ''; }
-    // 线路测速(2026-10-11): 光看"通不通"会误判 —— 实测里握手 0.1 秒就成功、
-    // 数据却要 20 秒才下完, 浏览器表现就是"打不开"。这里把真实下载速度摆出来,
-    // 走狐径和直连各一份, 谁在拖后腿一眼看清。
-    const stEl = document.getElementById('speedTip');
-    const sp = d.speed || {};
-    const rd = function(v){
-      if (!v || !v.ts) return null;
-      // 一个字节都没等到时别写"不通": 那是超时(连接其实建起来了), 写清楚
-      if (!v.ok) return {bad: true, txt: v.err || '不通', t: v.total || 0};
-      return {bad: false, kb: Math.round((v.bytes||0)/1024), t: v.total,
-              kbps: v.kbps, ttfb: v.ttfb, ts: v.ts};
-    };
-    const P = rd(sp.proxy), D = rd(sp.direct);
-    if (sp.busy) {
-      stEl.textContent = '正在测速…(真下载一段 github 首页, 最多 40 秒)';
-      stEl.style.color = '#64748b';
-    } else if (!P && !D) {
-      stEl.textContent = '';
-    } else {
-      const one = function(v){
-        if (v.bad) return v.t ? ('超时(等了 ' + v.t + 's 零字节)') : ('失败(' + v.txt + ')');
-        return v.kb + 'KB/' + v.t + 's ≈ ' + v.kbps + ' KB/s';
-      };
-      let txt = '';
-      const age = Math.round(Date.now()/1000 - (P ? P.ts : D.ts));
-      txt += '线路实测(' + age + '秒前)：经狐径 ' + (P ? one(P) : '未测')
-           + ' · 直连 ' + (D ? one(D) : '未测');
-      let verdict = '';
-      let color = '#64748b';
-      if (P && !P.bad && D && !D.bad) {
-        if (P.kbps < 50 && D.kbps < 50) {
-          verdict = ' —— 两条路都堵着，是这条宽带到 GitHub 的链路在拥塞，换 IP 也救不了，只能等它缓过来';
-          color = '#dc2626';
-        } else if (P.kbps >= 200) {
-          verdict = ' —— 通畅';
-          color = '#16a34a';
-        } else if (P.kbps >= 50) {
-          verdict = ' —— 偏慢，能开但会转圈';
-          color = '#b45309';
-        } else {
-          verdict = ' —— 经狐径也很慢';
-          color = '#dc2626';
-        }
-        if (D.kbps > 0 && P.kbps > D.kbps * 1.5) {
-          verdict += '（狐径比直连快 ' + (P.kbps / D.kbps).toFixed(1) + ' 倍，加速是生效的）';
-        }
-      } else if (P && P.bad && D && D.bad) {
-        verdict = ' —— 两边都连不上，等线路恢复';
-        color = '#dc2626';
-      }
-      stEl.textContent = txt + verdict;
-      stEl.style.color = color;
-    }
-    // 路由来源(2026-10-11): 最近一次转发到底走了谁 —— 候选池挑的 IP, 还是系统
-    // 解析出来的那个(也就是"直连"), 以及后台用同一把尺子量出来的两边吞吐。
-    // 一直显示池子 = 池子确实更快; 老显示直连 = 池子选得不如外面那条路。
-    const rtEl = document.getElementById('routeTip');
-    const rt = (d.route || {}).github || (d.route || {}).raw
-             || (d.route || {}).pages || null;
-    const cp = d.cap || {};
-    const kbps = function(o){ return (o && o.ok) ? (o.kbps + ' KB/s') : '传不动'; };
-    if (rt && rt.ip) {
-      const rage = Math.round(Date.now()/1000 - (rt.ts || 0));
-      let why = '';
-      if (cp.sys && cp.pool) {
-        why = ' —— 后台实测：直连 ' + kbps(cp.sys) + ' vs 候选池 ' + kbps(cp.pool)
-            + (cp.sys_wins ? '，直连更快所以放行' : '，池子更快所以走池');
-      }
-      rtEl.textContent = '上一次转发走了：' + (rt.src === 'sys'
-          ? ('系统解析(直连) ' + rt.ip) : ('候选池 ' + rt.ip)) + why
-        + '（' + rage + ' 秒前）';
-      rtEl.style.color = '#64748b';
-    } else { rtEl.textContent = ''; }
-    document.getElementById('auto').checked = d.autostart;
-    // 自动升级开关 + 本次启动的升级结果(2026-10-09 用户要求: 默认自动升级、不弹提示)
-    document.getElementById('autoUpd').checked = !!d.autoupd;
-    document.getElementById('updAuto').textContent = d.upgraded || '';
-    // 升级结果气泡开关(默认开) + 「上次升级结果」一行(成功/失败 + 时间, 不只靠气泡)
-    document.getElementById('notifyBubble').checked = d.notify !== false;
-    const lr = document.getElementById('updLast');
-    lr.textContent = d.lastres || '';
-    lr.className = 'upd-note ' + (d.lastres ? (d.lastok ? 'upd-ok' : 'upd-err') : '');
-    // 有新版本时亮一条: 自动升级开着就说"会自动升", 关着才让用户自己点
-    const nb = document.getElementById('updBanner');
-    if (d.newver) {
-      nb.style.display = 'block';
-      nb.innerHTML = d.autoupd
-        ? ('发现新版本 <b>v' + d.newver + '</b> —— 已按设置自动升级（不弹确认框, 校验不过会保留旧版）。')
-        : ('发现新版本 <b>v' + d.newver + '</b> —— 自动升级已关闭, 点下面的「检查更新」再点「立即升级」。');
-    } else {
-      nb.style.display = 'none';
-    }
-    document.getElementById('ips').innerHTML = (d.good||[])
-      .map(x=>'<tr><td>'+x[0]+'</td><td>'+x[1]+' ms</td></tr>').join('') ||
-      '<tr><td colspan="2">一个都不通</td></tr>';
-    document.getElementById('log').textContent = (d.logs||[]).join('\\n');
-    const p=document.getElementById('log'); p.scrollTop=p.scrollHeight;
-  }).catch(()=>{});
+/* ══════════════════════════════════════════════════════════════════════════
+   狐径面板脚本（全部原生 JS，零依赖、零外部请求）
+   ① 主题 ② 小工具 ③ 状态渲染 ④ 曲线 ⑤ IP 表排序 ⑥ 升级 ⑦ 键盘
+   ══════════════════════════════════════════════════════════════════════════ */
+function $(id){return document.getElementById(id);}
+function api(u){return fetch(u,{cache:'no-store'}).then(function(r){return r.json();});}
+function act(u){return fetch(u,{method:'POST'}).then(function(r){return r.json();});}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+
+/* ── Toast（底部居中，3 秒）──────────────────────────────────────────── */
+var _toastTimer=null;
+function toast(txt,ms){
+  var t=$('toast'); if(!t)return;
+  $('toastText').textContent=txt||'';
+  t.className='toast on';
+  clearTimeout(_toastTimer);
+  _toastTimer=setTimeout(function(){t.className='toast';},ms||3000);
 }
-function doAct(u){
-  act(u).then(r=>{
-    // 后端的 ok/msg 必须显示出来: 启用失败时用户绝不能以为已经生效(审查 H-2)
-    if(r&&r.ok===false){_say('actMsg',(r.msg||'操作没有成功'),12000,true);}
-    else{_say('actMsg',(r&&r.msg)||'已完成',3000,false);}
-    refresh();
-  }).catch(()=>{_say('actMsg','面板没有响应, 操作结果未知',12000,true);refresh();});
-}
-document.getElementById('autoUpd').onchange = (e)=>{
-  // 默认开; 关掉就只提示(设置存在数据目录的 settings.json 里)
-  act('/api/autoupdate?on='+(e.target.checked?1:0)).then(r=>{
-    _say('updMsg', (r&&r.msg)||'已保存', 6000, false); refresh();
-  }).catch(()=>{_say('updMsg','设置没有保存成功',8000,true);refresh();});
-};
-document.getElementById('notifyBubble').onchange = (e)=>{
-  // 升级结果气泡(默认开): 关掉就完全不弹, 面板「上次升级结果」那一行照留
-  act('/api/notifybubble?on='+(e.target.checked?1:0)).then(r=>{
-    _say('updMsg', (r&&r.msg)||'已保存', 6000, false); refresh();
-  }).catch(()=>{_say('updMsg','设置没有保存成功',8000,true);refresh();});
-};
-document.getElementById('btnEnable').onclick = ()=>doAct('/api/enable');
-document.getElementById('btnDisable').onclick = ()=>doAct('/api/disable');
-document.getElementById('btnTest').onclick = ()=>{
-  document.getElementById('btnTest').disabled=true;
-  act('/api/retest').then(()=>{document.getElementById('btnTest').disabled=false;refresh()});
-};
-// 「立即测速」(2026-10-11): 真下载一段 github 首页量速度, 后台跑完自己刷新
-document.getElementById('btnSpeed').onclick = ()=>{
-  const b = document.getElementById('btnSpeed'), m = document.getElementById('speedMsg');
-  b.disabled = true; m.textContent = '测速中…';
-  act('/api/speedtest').then(r=>{
-    m.textContent = r.msg || '';
-    b.disabled = false;
-    setTimeout(refresh, 500); setTimeout(refresh, 8000); setTimeout(refresh, 20000);
-  });
-};
-document.getElementById('auto').onchange = (e)=>
-  act('/api/autostart?on='+(e.target.checked?1:0)).then(refresh);
-document.getElementById('btnQuit').onclick = ()=>{
-  if(confirm('退出后 GitHub 将恢复原有连接方式，确定退出？')){
-    act('/api/quit').then(()=>{
-      clearInterval(_refreshTimer); clearInterval(_diagTimer);
-      document.getElementById('state').textContent='已安全退出，可关闭此页';
-      _say('actMsg','狐径已退出，系统代理已还原', 6000, false);
-    }).catch(()=>{
-      document.getElementById('state').textContent='已退出（面板无响应，可关闭此页）';
-    });
-  }
-};
-function loadDiag(){
-  // /api/diag 现在是 JSON(审查 M-6: 不再是 text/plain, 免得被当脚本嗅探),
-  // 而且里面不含完整 IP(出口地址这类敏感字段不进 diag)。
-  api('/api/diag').then(d=>{
-    document.getElementById('diag').textContent = (d&&d.diag)||'读取失败';
-  }).catch(()=>{});
-}
-function _say(id,txt,ms,err){const e=document.getElementById(id);if(e){e.textContent=txt;
-  e.style.color=err?'#b91c1c':'';setTimeout(()=>{e.textContent='';e.style.color='';},ms||2500);}}
-function copyDiag(){
-  const t=document.getElementById('diag').textContent||'';
-  if(navigator.clipboard&&navigator.clipboard.writeText){
-    navigator.clipboard.writeText(t).then(()=>_say('diagMsg','已复制，直接粘贴发给作者就行'))
-      .catch(()=>fallbackCopy(t));
-  } else { fallbackCopy(t); }
-}
+
+/* ── 复制（先试剪贴板 API，不行再退回旧的 execCommand）──────────────── */
 function fallbackCopy(t){
-  const ta=document.createElement('textarea'); ta.value=t; document.body.appendChild(ta);
-  ta.select(); try{document.execCommand('copy'); _say('diagMsg','已复制');}catch(e){_say('diagMsg','复制失败，请手动选中复制');}
+  var ta=document.createElement('textarea');
+  ta.value=t; ta.style.position='fixed'; ta.style.top='-1000px'; ta.style.left='-1000px';
+  document.body.appendChild(ta); ta.select();
+  var ok=false;
+  try{ok=document.execCommand('copy');}catch(e){ok=false;}
   document.body.removeChild(ta);
+  return ok;
 }
-document.getElementById('btnDiagCopy').onclick = copyDiag;
-document.getElementById('btnDiagRe').onclick = ()=>{loadDiag();refresh();};
-document.getElementById('btnIpSave').onclick = ()=>{
-  const v=document.getElementById('ipInput').value.trim();
-  if(!v){_say('ipMsg','先填一个 IP');return;}
-  // 后端会拒收私网/回环地址并给人话(审查 M-14), 这里必须把原因显示出来, 不能一律说"已保存"
-  act('/api/set-ip?ip='+encodeURIComponent(v)).then(r=>{
-    if(r&&r.ok===false){_say('ipMsg',(r.msg||'这个地址不能用'),12000,true);return;}
-    _say('ipMsg',(r&&r.msg)||'已保存，正在重测…'); loadDiag(); refresh();
-  }).catch(()=>{_say('ipMsg','面板没有响应, 结果未知',12000,true);});
-};
-document.getElementById('btnIpClear').onclick = ()=>{
-  act('/api/set-ip?ip=').then(r=>{
-    _say('ipMsg',(r&&r.msg)||'已清除');loadDiag();refresh();
-  }).catch(()=>{_say('ipMsg','面板没有响应',8000,true);});
-};
-loadDiag(); var _diagTimer = setInterval(loadDiag,10000);
-refresh(); var _refreshTimer = setInterval(refresh,3000);
-</script>
-<script>
-/* 在线升级: 版本迁移动画 + 渐变进度条 + 状态轮询 */
+function copyText(t,okMsg){
+  if(!t){toast('没有东西可复制');return;}
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(function(){toast(okMsg||'已复制');})
+      .catch(function(){toast(fallbackCopy(t)?(okMsg||'已复制'):'复制失败，请手动选中复制');});
+  }else{
+    toast(fallbackCopy(t)?(okMsg||'已复制'):'复制失败，请手动选中复制');
+  }
+}
+
+/* ── 主题：默认跟随系统，手动切换会记住（localStorage）────────────────
+   【2026-10-24 修 主题两个键打架】右下角「外观」面板存的是 ui-theme-mode（auto|light|dark），
+   顶栏那个旧按钮存的是 foxpath.theme（dark|light）。两边各写各的，旧键会被面板忽略，
+   手动切过的观感刷新就没了。现在：读的时候新键优先（auto=跟随系统），写的时候两个键一起写。 */
+var THEME_KEY='foxpath.theme';
+var AP_KEY='ui-theme-mode';
+function themeMode(){
+  try{
+    var m=localStorage.getItem(AP_KEY), old=localStorage.getItem(THEME_KEY);
+    /* 只有旧键（顶栏 ☾/☀ 切过主题）的人，在这里一次性搬到新键：
+       页尾「外观」面板只认 ui-theme-mode，不搬的话它会把旧键的选择当没有、按系统重来一遍。 */
+    if(!m && (old==='dark'||old==='light')){ localStorage.setItem(AP_KEY, old); return old; }
+    return m||old||'auto';
+  }catch(e){ return 'auto'; }
+}
+function sysTheme(){
+  try{ return window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'; }
+  catch(e){ return 'dark'; }
+}
+function applyTheme(t,remember){
+  t=(t==='light')?'light':'dark';
+  document.documentElement.setAttribute('data-theme',t);
+  var b=$('btnTheme');
+  if(b){b.textContent=(t==='light')?'☀':'☾';
+    b.title='当前 '+(t==='light'?'亮色':'暗色')+'，点按或按 T 切换';}
+  if(remember){try{localStorage.setItem(THEME_KEY,t);localStorage.setItem(AP_KEY,t);}catch(e){}}
+  drawChart();
+}
+function initTheme(){
+  var forced=null;
+  try{forced=new URLSearchParams(location.search).get('theme');}catch(e){}
+  var m=themeMode();
+  var eff=forced||(m==='light'||m==='dark'?m:sysTheme());
+  applyTheme(eff,false);
+}
+
+/* ── 线路状态那几条提示（沿用原来的判断，只换了放的位置）────────────── */
+function _say(id,txt,ms,err){
+  var e=$(id); if(!e)return;
+  e.textContent=txt||'';
+  e.className='msg'+(err?' bad':'');
+  clearTimeout(e._t);
+  if(txt){e._t=setTimeout(function(){e.textContent='';e.className='msg';},ms||2500);}
+}
+
+var ST={};            // 最近一次 /api/status
+var HIST={hours:3,points:[],summary:{}};
+var SORT={key:'ms',dir:1};
+var ONLY_GOOD=false;
+var SORT_LABEL={ip:'IP',ms:'延迟',loss:'丢包',fails:'失败'};
+
+function paintStatus(d){
+  ST=d;
+  /* hero */
+  var on=!!d.enabled;
+  var pw=$('btnPower');
+  pw.className='sw big'+(on?' on':'');
+  pw.setAttribute('aria-checked',on?'true':'false');
+  pw.title=on?'已开启加速——点一下停用并还原系统代理':'未开启——点一下启用加速（会改本机系统代理）';
+  $('state').textContent=on?'加速已开启':'未启用加速';
+  $('stateSub').textContent=on
+    ?'系统代理已接管 · 只影响 GitHub 相关域名 · 不装证书、不改 hosts'
+    :'系统代理没有被接管 · 点左边开关才会真正生效';
+  $('hdrPill').className='pill '+(on?'ok':'');
+  $('hdrPillText').textContent=on?'加速中':'未启用';
+  $('ip').textContent=d.ip||'暂无可用 IP';
+  $('ms').innerHTML=(d.ms==null)?'— <small>ms</small>':(d.ms+' <small>ms</small>');
+
+  /* 数字卡 */
+  var okN=(d.good_n==null)?0:d.good_n, allN=d.total_n;
+  /* 【2026-10-24 改口径】大数字改成"实测成过"的个数 —— 近 90 秒真发过一次请求
+     并拿到 2xx/3xx 的 IP。原来这里显示的是 good_n(证书验过就算), 实测两者能差到
+     31 vs 1, 用户看着"可用 31 个"却打不开页面。分母仍是候选总数。 */
+  var strongN=(d.good_strong_n==null)?okN:d.good_strong_n;
+  var tn=d.tier_n||{};
+  $('stIp').innerHTML=strongN+' <small>/ '+(allN==null?'—':allN)+'</small>';
+  var delta='';
+  var pts=HIST.points||[];
+  if(pts.length>=2){
+    var a=pts[pts.length-1].ok, b=pts[pts.length-2].ok;
+    if(a!=null&&b!=null){
+      var dv=a-b;
+      delta='比上一轮 '+(dv>0?'+':(dv<0?'':'±'))+dv;
+      $('stIpD').className='d'+(dv>0?' up':(dv<0?' down':''));
+    }
+  }else{$('stIpD').className='d';}
+  if(strongN===0&&okN>0){
+    /* 一个近期答过话的都没有 —— 这一格必须显眼, 别用绿色糊过去 */
+    $('stIpD').className='d down';
+    $('stIpD').textContent='池里 '+okN+' 个都没近期答过话(仅证书 '+(tn.tls||0)+' 个)·现在只能靠直连兜底';
+  }else{
+    $('stIpD').textContent=delta?('实测成过 '+strongN+' · '+(tn.tls||0)+' 个仅验证书 · '+delta)
+      :('实测成过 '+strongN+' · '+(tn.tls||0)+' 个仅验证书 · 每 5 分钟体检一次');
+  }
+
+  var hosts=(d.pac_hosts||[]).length+1;   // +1 = *.github.io 这一组
+  $('stHosts').innerHTML=(hosts||'—')+' <small>个</small>';
+  $('stHostsD').textContent='codeload 已接管 · gist 暂未接管';
+
+  var age=d.health_age;
+  if(age==null){$('stCheck').innerHTML='— <small>前</small>';$('stCheckD').textContent='还没体检过';}
+  else{
+    var unit='秒',val=age;
+    if(age>=60){val=Math.round(age/60);unit='分钟前';}
+    if(age>=3600){val=Math.round(age/3600);unit='小时前';}
+    $('stCheck').innerHTML=val+' <small>'+(unit==='秒'?'秒前':unit)+'</small>';
+    $('stCheckD').textContent=d.last?('上次 '+d.last+' 完成'):'每 5 分钟自动一次';
+  }
+
+  var h=d.hits||{};
+  $('stHits').innerHTML=(h.total||0)+' <small>次</small>';
+  $('stHitsD').textContent='PAC 命中 '+(h.pool||0)+' · 直连 '+(h.sys||0);
+
+  /* 线路状态提示（原逻辑照搬） */
+  var lb=$('lifeBar');
+  if(d.life&&d.cur_ip){
+    var src=d.life_n?('本机实测 '+d.life_n+' 个样本'):'经验值(攒够样本后自动校准)';
+    var left=d.cur_left;
+    var tail=(left===null||left===undefined)
+      ?'寿命未知(该 IP 已失效, 下次访问会换新的)'
+      :('已撑 '+d.cur_age+' 秒, 约 '+Math.max(0,left)+' 秒后自动提前换掉(不等它锁死)');
+    lb.textContent='IP 寿命基准 '+d.life+' 秒('+src+') · 当前 '+d.cur_ip
+      +' · '+tail+' · 热备 '+(d.hot||0)+' 个待命';
+    lb.style.color=(left!==null&&left!==undefined&&left<30)?'var(--danger)':'';
+  }else{lb.textContent='';}
+
+  var dt=$('directTip');
+  if(d.direct===false){
+    dt.textContent='当前这台机器直连 github 主站也不通（不是狐径的问题，换 IP 也打不开）。'
+      +'狐径会在线路恢复时自动生效；急用可开手机热点。';
+    dt.style.color='var(--danger)';
+  }else if(d.direct===true){
+    dt.textContent='直连 github 正常，狐径会挑更快的 IP 走。';
+    dt.style.color='var(--ok)';
+  }else{dt.textContent='';dt.style.color='';}
+
+  var stEl=$('speedTip');
+  var sp=d.speed||{};
+  function rd(v){
+    if(!v||!v.ts)return null;
+    if(!v.ok)return {bad:true,txt:v.err||'不通',t:v.total||0};
+    return {bad:false,kb:Math.round((v.bytes||0)/1024),t:v.total,kbps:v.kbps,ttfb:v.ttfb,ts:v.ts};
+  }
+  var P=rd(sp.proxy),D=rd(sp.direct);
+  if(sp.busy){
+    stEl.textContent='正在测速…(真下载一段 github 首页, 最多 40 秒)';
+    stEl.style.color='';
+  }else if(!P&&!D){
+    stEl.textContent='';stEl.style.color='';
+  }else{
+    function one(v){
+      if(v.bad)return v.t?('超时(等了 '+v.t+'s 零字节)'):('失败('+v.txt+')');
+      return v.kb+'KB/'+v.t+'s ≈ '+v.kbps+' KB/s';
+    }
+    var txt='';
+    var age2=Math.round(Date.now()/1000-((P?P.ts:D.ts)||0));
+    txt+='线路实测('+age2+'秒前)：经狐径 '+(P?one(P):'未测')+' · 直连 '+(D?one(D):'未测');
+    var verdict='',color='';
+    if(P&&!P.bad&&D&&!D.bad){
+      if(P.kbps<50&&D.kbps<50){
+        verdict=' —— 两条路都堵着，是这条宽带到 GitHub 的链路在拥塞，换 IP 也救不了，只能等它缓过来';
+        color='var(--danger)';
+      }else if(P.kbps>=200){verdict=' —— 通畅';color='var(--ok)';}
+      else if(P.kbps>=50){verdict=' —— 偏慢，能开但会转圈';color='var(--warn)';}
+      else{verdict=' —— 经狐径也很慢';color='var(--danger)';}
+      if(D.kbps>0&&P.kbps>D.kbps*1.5){
+        verdict+='（狐径比直连快 '+(P.kbps/D.kbps).toFixed(1)+' 倍，加速是生效的）';
+      }
+    }else if(P&&P.bad&&D&&D.bad){
+      verdict=' —— 两边都连不上，等线路恢复';color='var(--danger)';
+    }
+    stEl.textContent=txt+verdict;
+    stEl.style.color=color;
+  }
+
+  var rtEl=$('routeTip');
+  var rt=(d.route||{}).github||(d.route||{}).raw||(d.route||{}).pages||null;
+  var cp=d.cap||{};
+  function kbps(o){return (o&&o.ok)?(o.kbps+' KB/s'):'传不动';}
+  if(rt&&rt.ip){
+    var rage=Math.round(Date.now()/1000-(rt.ts||0));
+    var why='';
+    if(cp.sys&&cp.pool){
+      why=' —— 后台实测：直连 '+kbps(cp.sys)+' vs 候选池 '+kbps(cp.pool)
+        +(cp.sys_wins?'，直连更快所以放行':'，池子更快所以走池');
+    }
+    rtEl.textContent='上一次转发走了：'+(rt.src==='sys'
+      ?('系统解析(直连) '+rt.ip):('候选池 '+rt.ip))+why+'（'+rage+' 秒前）';
+    rtEl.style.color='';
+  }else{rtEl.textContent='';}
+
+  paintChan(d);
+
+  /* 开关 / 升级相关 */
+  setSw('auto',!!d.autostart);
+  setSw('autoUpd',d.autoupd!==false);
+  setSw('notifyBubble',d.notify!==false);
+  $('updAuto').textContent=d.upgraded||'';
+  var lr=$('updLast');
+  lr.textContent=d.lastres||'';
+  lr.className='upd-note '+(d.lastres?(d.lastok?'upd-ok':'upd-err'):'');
+  var nb=$('updBanner');
+  if(d.newver){
+    nb.style.display='block';
+    nb.innerHTML=d.autoupd
+      ?('发现新版本 <b>v'+esc(d.newver)+'</b> —— 已按设置自动升级（不弹确认框, 校验不过会保留旧版）。')
+      :('发现新版本 <b>v'+esc(d.newver)+'</b> —— 自动升级已关闭, 点上面的「检查更新」再点「立即升级」。');
+  }else{nb.style.display='none';}
+
+  /* 日志 / IPv6 / 体检 */
+  var logEl=$('log');
+  var txt=(d.logs||[]).join('\\n');
+  if(logEl.textContent!==txt){logEl.textContent=txt;logEl.scrollTop=logEl.scrollHeight;}
+  var v6=$('ipv6Pill');
+  v6.className='pill '+(d.ipv6?'ok':'warn');
+  $('ipv6Text').textContent=d.ipv6?'IPv6 可用':'IPv6 暂不可用';
+
+  paintLines(d);
+  paintIps();
+}
+
+function setSw(id,on){
+  var el=$(id); if(!el)return;
+  el.className='sw'+(on?' on':'');
+  el.setAttribute('aria-checked',on?'true':'false');
+}
+
+/* ── 每 10 分钟的"跑得通通道"重匹配 ────────────────────────────────────
+   数据来自后台 channel_loop()：它是真下载一遍(主站)／真复验一遍(raw、Pages)之后
+   的结果，跟「可用 22/50」那种"证书对就算活着"的口径不是一回事，所以单独一行。
+   本轮一个都没跑通时要点破：那多半是链路在拥塞，换 IP 救不了，别让人误以为程序坏了。 */
+function paintChan(d){
+  var el=$('chanTip'); if(!el) return;
+  var ch=d.chan||{}, order=[['github','主站'],['raw','raw'],['pages','Pages']];
+  var parts=[], worst=99;
+  for(var i=0;i<order.length;i++){
+    var c=ch[order[i][0]];
+    if(!c||!c.ts) continue;
+    /* 本轮还在实测中(pass 仍是初值 0)时别说"一个都没跑通"—— 那是扫描途中的假象 */
+    if(c.running){parts.push(order[i][1]+'：本轮 '+(c.sampled||0)+' 个正在实测…'); continue;}
+    var age=Math.round(Date.now()/1000-c.ts);
+    var isGh=order[i][0]==='github';
+    var t=order[i][1]+'：测'+(c.sampled||0)+' 通'+(c.pass||0)
+      +(c.weak?(' 偏慢'+c.weak):'')
+      +' · 最佳 '+(c.ip_best||'无')
+      +(isGh&&c.kbps_best?('（'+c.kbps_best+' KB/s）'):'')
+      +' · 在用 '+(c.in_use||'无')
+      +(c.swapped?'（刚换岗）':'')
+      +(c.note?('（'+c.note+'）'):'')
+      +' · '+(age<90?(age+'秒前'):Math.round(age/60)+'分钟前');
+    if(isGh){worst=Math.min(worst,(c.pass||0));}
+    parts.push(t);
+  }
+  if(!parts.length){el.textContent='';el.style.color='';return;}
+  var every=Math.round((d.chan_interval||600)/60);
+  var tail=(worst===0)
+    ?' —— 主站本轮没有一个跑得通：这是这条宽带到 GitHub 的链路在拥塞，换 IP 也救不了，等它缓过来'
+    :'';
+  el.textContent='通道重匹配（每 '+every+' 分钟）：'+parts.join(' ｜ ')+tail;
+  el.style.color=(worst===0)?'var(--danger)':'';
+}
+
+/* ── 线路体检那 4 行 ─────────────────────────────────────────────────── */
+function paintLines(d){
+  var box=$('lines'); var rows=d.lines||[];
+  if(!rows.length){box.innerHTML='<div class="empty">还没有体检数据，点「立即重测」跑一轮。</div>';return;}
+  box.innerHTML=rows.map(function(r){
+    var cls=r.status==='ok'?'ok':(r.status==='warn'?'warn':(r.status==='bad'?'bad':''));
+    var label=r.status==='ok'?'通':(r.status==='warn'?'慢':(r.status==='bad'?'不通':'直连'));
+    var sub;
+    if(r.status==='off'){sub=r.note||'未接管（保持直连）';}
+    else{
+      sub='可用 '+r.n+'/'+r.total;
+      if(r.fastest!=null){sub+=' · 最快 '+r.fastest+'ms';}
+      if(r.status==='bad'){sub+=' · 本轮全部超时';}
+    }
+    return '<div class="set"><div class="txt"><b>'+esc(r.host)+'</b><span>'+esc(sub)+'</span></div>'
+      +'<span class="ctl"><span class="pill '+cls+'"><i></i>'+label+'</span></span></div>';
+  }).join('');
+}
+
+/* ── IP 表：排序 / 筛选 / 复制 ────────────────────────────────────────── */
+function ipRows(){
+  var d=ST||{};
+  var rows=(d.ips_detail||[]).slice();
+  if(!rows.length&&d.good){
+    rows=d.good.map(function(x){return {ip:x[0],ms:x[1]};});
+  }
+  if(ONLY_GOOD){rows=rows.filter(function(r){return r.loss!==100;});}
+  rows.sort(function(a,b){
+    var k=SORT.key,x=a[k],y=b[k];
+    if(k==='ip'){return (x>y?1:(x<y?-1:0))*SORT.dir;}
+    var nx=(x===null||x===undefined)?1e9:x, ny=(y===null||y===undefined)?1e9:y;
+    if(nx===ny){return (a.ms||0)-(b.ms||0);}
+    return (nx-ny)*SORT.dir;
+  });
+  return rows;
+}
+function paintSort(){
+  var ths=document.querySelectorAll('#ipHead th[data-sort]');
+  for(var i=0;i<ths.length;i++){
+    var k=ths[i].getAttribute('data-sort');
+    var arw=ths[i].querySelector('.arw');
+    if(arw){arw.textContent=(SORT.key===k)?(SORT.dir>0?'▲':'▼'):'';}
+  }
+  $('sortPill').textContent='按「'+(SORT_LABEL[SORT.key]||'延迟')+'」'+(SORT.dir>0?'升序':'降序');
+}
+function paintIps(){
+  var rows=ipRows(), tb=$('ips');
+  if(!rows.length){
+    tb.innerHTML='<tr><td colspan="6"><div class="empty">还没有可用 IP —— 可能正在体检，'
+      +'或者这条线当前连不上（点「重新体检」再试一次）。</div></td></tr>';
+  }else{
+    tb.innerHTML=rows.map(function(r){
+      var loss=(r.loss===null||r.loss===undefined)
+        ?'<span class="muted">—</span>'
+        :('<span style="color:'+(r.loss>0?'var(--warn)':'inherit')+'">'+r.loss+'%</span>');
+      var fails=(r.fails===null||r.fails===undefined)?'<span class="muted">—</span>'
+        :(r.fails>0?('<span style="color:var(--danger)">'+r.fails+'</span>'):'0');
+      var delay=(r.ms==null)?'<span class="muted">—</span>':(r.ms+' <small class="muted">ms</small>');
+      /* 证据列: 'http' = 近 90 秒真发过一次请求并拿到 2xx/3xx(能打开页面的口径);
+         'tls' = 只有证书验过; null/缺字段 = 证据已出窗或这轮没验。 */
+      var tier=(r.tier==='http')
+        ?'<span style="color:var(--ok)">跑通过</span>'
+        :(r.tier==='tls'
+          ?'<span style="color:var(--warn)">仅证书</span>'
+          :'<span class="muted">已出窗</span>');
+      return '<tr><td class="mono">'+esc(r.ip)+'</td>'
+        +'<td class="r num">'+delay+'</td>'
+        +'<td class="r num">'+loss+'</td>'
+        +'<td class="r num">'+fails+'</td>'
+        +'<td class="r">'+tier+'</td>'
+        +'<td class="r"><button class="copy" data-ip="'+esc(r.ip)+'">复制</button></td></tr>';
+    }).join('');
+  }
+  var n=rows.length, total=(ST.good_n||n);
+  var fw=ST.fresh_window||90;
+  $('ipsCount').textContent=n
+    ?('显示 '+n+' 个 / 共 '+total+' 个活着'+(total>n?'（表格只列前 10 个）':'')
+      +' · 其中近 '+fw+' 秒跑通过 '+(ST.good_strong_n==null?'?':ST.good_strong_n)+' 个')
+    :'';
+  paintSort();
+}
+
+/* ── 延迟曲线（canvas 手绘）─────────────────────────────────────────── */
+function cssVar(name,fallback){
+  try{
+    var v=getComputedStyle(document.documentElement).getPropertyValue(name);
+    return (v&&v.trim())||fallback;
+  }catch(e){return fallback;}
+}
+function hexA(hex,a){
+  var h=(hex||'').trim();
+  var m=/^#([0-9a-fA-F]{6})$/.exec(h);
+  if(!m){return h;}
+  var n=parseInt(m[1],16);
+  return 'rgba('+((n>>16)&255)+','+((n>>8)&255)+','+(n&255)+','+a+')';
+}
+function drawChart(){
+  var c=$('chart');
+  if(!c||!c.getContext)return;
+  var cssW=c.clientWidth||600, cssH=152;
+  var dpr=Math.min(2,window.devicePixelRatio||1);
+  if(c.width!==Math.round(cssW*dpr)||c.height!==Math.round(cssH*dpr)){
+    c.width=Math.round(cssW*dpr); c.height=Math.round(cssH*dpr);
+  }
+  var g=c.getContext('2d');
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,cssW,cssH);
+  var accent=cssVar('--accent','#f0883e'),
+      danger=cssVar('--danger','#f2555a'),
+      line=cssVar('--line','#303844'),
+      txt3=cssVar('--txt-2','#a3aebe');
+  var pad={l:34,r:14,t:12,b:18};
+  var W=Math.max(10,cssW-pad.l-pad.r), H=Math.max(10,cssH-pad.t-pad.b);
+  g.lineWidth=1; g.strokeStyle=line;
+  for(var i=0;i<=3;i++){
+    var y=Math.round(pad.t+H*i/3)+.5;
+    g.beginPath(); g.moveTo(pad.l,y); g.lineTo(pad.l+W,y); g.stroke();
+  }
+  var pts=HIST.points||[];
+  if(!pts.length){
+    g.fillStyle=txt3;
+    g.font='12px "Microsoft YaHei UI",system-ui,sans-serif';
+    g.textAlign='center'; g.textBaseline='middle';
+    g.fillText('还没有采样：每次体检（5 分钟）会写下一个点',pad.l+W/2,pad.t+H/2);
+    return;
+  }
+  var ts0=pts[0].ts, ts1=pts[pts.length-1].ts;
+  if(ts1<=ts0){ts1=ts0+1;}
+  var lats=[];
+  pts.forEach(function(p){if(p.latency!=null){lats.push(p.latency);}});
+  var lo=lats.length?Math.min.apply(null,lats):0,
+      hi=lats.length?Math.max.apply(null,lats):1;
+  if(hi-lo<80){var mid=(hi+lo)/2; lo=Math.max(0,mid-40); hi=mid+40;}
+  function X(t){return pad.l+W*(t-ts0)/(ts1-ts0);}
+  function Y(v){return pad.t+H-H*(v-lo)/(hi-lo);}
+
+  var grad=g.createLinearGradient(0,pad.t,0,pad.t+H);
+  grad.addColorStop(0,hexA(accent,.28));
+  grad.addColorStop(1,hexA(accent,0));
+
+  var segs=[],seg=[];
+  pts.forEach(function(p){
+    if(p.latency!=null){seg.push(p);}
+    else{if(seg.length){segs.push(seg);seg=[];}}
+  });
+  if(seg.length){segs.push(seg);}
+
+  segs.forEach(function(s){
+    if(s.length>1){
+      g.beginPath();
+      s.forEach(function(p,i){var x=X(p.ts),y=Y(p.latency);i?g.lineTo(x,y):g.moveTo(x,y);});
+      g.lineTo(X(s[s.length-1].ts),pad.t+H);
+      g.lineTo(X(s[0].ts),pad.t+H);
+      g.closePath(); g.fillStyle=grad; g.fill();
+    }
+    g.beginPath();
+    s.forEach(function(p,i){var x=X(p.ts),y=Y(p.latency);i?g.lineTo(x,y):g.moveTo(x,y);});
+    g.strokeStyle=accent; g.lineWidth=2; g.lineJoin='round'; g.lineCap='round'; g.stroke();
+    if(s.length===1){
+      g.beginPath(); g.arc(X(s[0].ts),Y(s[0].latency),2.6,0,Math.PI*2);
+      g.fillStyle=accent; g.fill();
+    }
+    var last=s[s.length-1];
+    g.beginPath(); g.arc(X(last.ts),Y(last.latency),3.4,0,Math.PI*2);
+    g.fillStyle=accent; g.fill();
+    g.beginPath(); g.arc(X(last.ts),Y(last.latency),7,0,Math.PI*2);
+    g.strokeStyle=hexA(accent,.35); g.lineWidth=3; g.stroke();
+  });
+  pts.forEach(function(p){
+    if(p.latency==null){
+      g.beginPath(); g.arc(X(p.ts),pad.t+H-1,3,0,Math.PI*2);
+      g.fillStyle=danger; g.fill();
+    }
+  });
+  g.font='10px Consolas,monospace'; g.fillStyle=txt3;
+  g.textAlign='left'; g.textBaseline='middle';
+  g.fillText(hi+'ms',2,pad.t+6);
+  g.fillText(lo+'ms',2,pad.t+H-4);
+  g.textAlign='right';
+  g.fillText(histTime(ts0),pad.l+W,pad.t+H+9);
+}
+
+function histTime(ts){
+  try{
+    var d=new Date(ts*1000);
+    return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2);
+  }catch(e){return '';}
+}
+function paintHist(){
+  var s=HIST.summary||{};
+  if(!s.n){$('histSummary').textContent='还没有采样（每次体检一个点，5 分钟）';return;}
+  var txt='最低 '+s.min+'ms · 最高 '+s.max+'ms · 中位 '+s.median+'ms';
+  if(s.down){txt+=' · 全灭 '+s.down+' 轮';}
+  $('histSummary').textContent=txt;
+  var hint=$('histHint');
+  hint.textContent=(HIST.hours===24?'最近 24 小时':'最近 3 小时')+' · 每 5 分钟一个点';
+}
+function loadHistory(hours){
+  if(hours){HIST.hours=hours;}
+  api('/api/history?hours='+HIST.hours).then(function(d){
+    HIST.points=d.points||[];
+    HIST.summary=d.summary||{};
+    paintHist(); drawChart(); paintStatus(ST);
+    var a=$('btnCsv'); if(a){a.href='/api/history.csv?hours='+HIST.hours;}
+    $('range3').className='chip'+(HIST.hours===3?' on':'');
+    $('range24').className='chip'+(HIST.hours===24?' on':'');
+  }).catch(function(){});
+}
+
+/* ── 动作按钮 ───────────────────────────────────────────────────────── */
+function doAct(u,msgId){
+  act(u).then(function(r){
+    if(r&&r.ok===false){_say(msgId||'actMsg',(r.msg||'操作没有成功'),12000,true);}
+    else{_say(msgId||'actMsg',(r&&r.msg)||'已完成',4000,false);}
+    refresh(true);
+  }).catch(function(){_say(msgId||'actMsg','面板没有响应, 操作结果未知',12000,true);refresh(true);});
+}
+function refresh(withHistory){
+  api('/api/status').then(function(d){
+    paintStatus(d);
+    if(withHistory){loadHistory();}
+  }).catch(function(){});
+}
+
+function copyDiag(){
+  api('/api/diag').then(function(d){
+    copyText((d&&d.diag)||'','诊断信息已复制，直接粘贴发给作者就行');
+  }).catch(function(){
+    var t=$('diag')?$('diag').textContent:'';
+    copyText(t,'诊断信息已复制');
+  });
+}
+
+/* ── 升级卡（沿用原来的动画与状态机）────────────────────────────────── */
 (function(){
-  var U={bar:document.getElementById('updBar'),wrap:document.getElementById('updBarWrap'),
-         msg:document.getElementById('updMsg'),remote:document.getElementById('uvRemote'),
-         arrow:document.getElementById('uvArrow'),go:document.getElementById('btnUpdGo'),
-         local:document.getElementById('uvLocal'),anim:null,timer:null};
-  if(!U.msg) return;
+  var U={bar:$('updBar'),wrap:$('updBarWrap'),msg:$('updMsg'),
+    remote:$('uvRemote'),arrow:$('uvArrow'),go:$('btnUpdGo'),
+    local:$('uvLocal'),detail:$('updDetail'),anim:null,timer:null};
+  if(!U.msg)return;
   function spin(on){
     if(U.anim){clearInterval(U.anim);U.anim=null;}
     if(!on){U.arrow.textContent='   =====>   ';return;}
     var fr=['o--------->','=o-------->','==o------->','===o------>','====o----->',
-            '=====o---->','======o--->','=======o-->','========o->','=========>'];
-    var i=0; U.anim=setInterval(function(){U.arrow.textContent='   '+fr[i%fr.length]+'   ';i++;},85);
+      '=====o---->','======o--->','=======o-->','========o->','=========>'];
+    var i=0;
+    U.anim=setInterval(function(){U.arrow.textContent='   '+fr[i%fr.length]+'   ';i++;},85);
   }
   function kb(n){return Math.round((n||0)/1024)+' KB';}
   function paint(v){
-    U.remote.textContent = v.remote ? ('v'+v.remote) : '—';
-    var busy = (v.phase==='downloading'||v.phase==='verifying'||v.phase==='applying');
+    U.remote.textContent=v.remote?('v'+v.remote):'—';
+    var busy=(v.phase==='downloading'||v.phase==='verifying'||v.phase==='applying');
     spin(v.phase==='checking');
     if(v.phase==='downloading'){
       U.wrap.style.display='block';
       U.bar.style.width=(v.pct||0)+'%';
-      U.msg.textContent=(v.auto?'正在自动下载新版本（已按设置自动升级）  ':'正在下载新版本  ')+kb(v.got)+(v.total?(' / '+kb(v.total)+'   '+(v.pct||0)+'%'):'');
+      U.msg.className='hint';
+      U.msg.textContent=(v.auto?'正在自动下载新版本（已按设置自动升级）  ':'正在下载新版本  ')
+        +kb(v.got)+(v.total?(' / '+kb(v.total)+'   '+(v.pct||0)+'%'):'');
       U.go.style.display='none';
-    } else if(v.phase==='verifying'||v.phase==='applying'){
+    }else if(v.phase==='verifying'||v.phase==='applying'){
       U.wrap.style.display='block'; U.bar.style.width='100%';
-      U.msg.innerHTML='<span class="upd-ok">'+v.msg+'</span>';
+      U.msg.innerHTML='<span class="upd-ok">'+esc(v.msg||'')+'</span>';
       U.go.style.display='none';
-    } else if(v.phase==='failed'){
+    }else if(v.phase==='failed'){
       U.wrap.style.display='block';
-      U.msg.innerHTML='<span class="upd-err">升级没有完成：'+(v.msg||'')+'</span>';
-    } else if(v.newer){
-      // ★ 只有服务端按**版本号语义**判出"远程严格大于本地"才提示升级、才放开按钮。
-      // 2026-10-09 线上事故: 这里以前写的是 v.remote!==v.local, 于是本地 1.0.7
-      // 对着线上 1.0.6 也提示「发现新版本 v1.0.6」, 用户一点就把 1.0.7 换成了 1.0.6。
-      U.msg.innerHTML='<span class="upd-ok">发现新版本 v'+v.remote+'</span>'+(v.notes?('  '+v.notes):'');
-      U.go.style.display=''; U.go.disabled=false; U.go.style.opacity='';
+      U.msg.innerHTML='<span class="upd-err">升级没有完成：'+esc(v.msg||'')+'</span>';
+    }else if(v.newer){
+      U.msg.innerHTML='<span class="upd-ok">发现新版本 v'+esc(v.remote)+'</span>'+(v.notes?('  '+esc(v.notes)):'');
+      U.go.style.display=''; U.go.disabled=false;
       U.wrap.style.display='none'; U.bar.style.width='0';
-    } else if(v.relation==='older'){
-      // 本地比线上新(预发布/开发版本): 不提示升级, 按钮置灰且点不动;
-      // 就算有人跳过前端直接调接口, 服务端也会拒绝(见 update_gate)。
+    }else if(v.relation==='older'){
       U.msg.innerHTML='<span class="upd-err">本地版本比线上新（预发布/开发版本），线上暂未发布</span>'
-        +'<span style="color:#6b7280">　本地 v'+(v.local||'')+' · 线上 v'+(v.remote||'')+'</span>';
-      U.go.style.display=''; U.go.disabled=true; U.go.style.opacity='0.45';
+        +'<span class="muted">　本地 v'+esc(v.local||'')+' · 线上 v'+esc(v.remote||'')+'</span>';
+      U.go.style.display=''; U.go.disabled=true;
       U.go.title='本地版本比线上新，不能升级（要退回旧版本请用手动方式）';
       U.wrap.style.display='none'; U.bar.style.width='0';
-    } else {
+    }else{
+      U.msg.className='hint';
       U.msg.textContent=v.msg||'还没检查过线上版本，点「检查更新」看一眼';
       U.go.style.display='none';
+    }
+    if(U.detail){
+      var bits=[];
+      if(v.local){bits.push('本地 v'+v.local);}
+      if(v.remote){bits.push('线上 v'+v.remote);}
+      if(v.phase){bits.push('阶段 '+v.phase);}
+      if(v.pct!=null&&busy){bits.push((v.pct||0)+'%');}
+      U.detail.textContent=bits.join(' · ');
     }
     var b=(v.phase!=='idle'&&v.phase!=='failed');
     if(b&&!U.timer){U.timer=setInterval(tick,400);}
     if(!b&&U.timer){clearInterval(U.timer);U.timer=null;}
   }
-  function tick(){ api('/api/update/status').then(paint); }
-  document.getElementById('btnUpdCheck').onclick=function(){
+  function tick(){api('/api/update/status').then(paint).catch(function(){});}
+  $('btnUpdCheck').onclick=function(){
+    U.msg.className='hint';
     U.msg.textContent='正在检查升级源…'; spin(true);
-    act('/api/update/check').then(tick);
+    act('/api/update/check').then(tick).catch(function(){tick();});
   };
-  document.getElementById('btnUpdGo').onclick=function(){
+  $('btnUpdGo').onclick=function(){
     if(U.go.disabled){return;}
     U.go.style.display='none'; U.wrap.style.display='block'; U.bar.style.width='0';
     act('/api/update/start').then(function(r){
-      // 服务端闸门也会拒绝(远程不高于本地): 必须把原因显示出来, 不能"点了没反应"
-      if(r&&r.ok===false){U.wrap.style.display='none';
-        _say('updMsg', r.msg||'这次不能升级', 12000, true);}
+      if(r&&r.ok===false){
+        U.wrap.style.display='none';
+        _say('updMsg',r.msg||'这次不能升级',12000,true);
+      }
       tick();
-    }).catch(function(){U.wrap.style.display='none';
-      _say('updMsg','面板没有响应, 升级结果未知',12000,true); tick();});
+    }).catch(function(){
+      U.wrap.style.display='none';
+      _say('updMsg','面板没有响应, 升级结果未知',12000,true); tick();
+    });
   };
   tick();
-  // 面板开着的时候每 15 秒跟一次服务端结论: 用户什么都不点, 也能自己看到
-  // 「发现新版本」或者「本地版本比线上新（预发布/开发版本）」(2026-10-09 加)。
-  setInterval(tick, 15000);
+  setInterval(tick,15000);
 })();
-</script><div style="margin:16px 0 6px;text-align:center;font-size:12px;color:#8a8a8f">狐径 FoxPath · 作者 __AUTHOR__ · <a href="https://__HOMEPAGE__" target="_blank" rel="noopener" style="color:#8a8a8f;text-decoration:none">__HOMEPAGE__</a></div>
+
+/* ── 事件绑定 ───────────────────────────────────────────────────────── */
+$('btnTheme').onclick=function(){
+  var cur=document.documentElement.getAttribute('data-theme');
+  applyTheme(cur==='light'?'dark':'light',true);
+};
+$('btnPower').onclick=function(){
+  var on=!!(ST&&ST.enabled);
+  if(on){
+    if(!confirm('停用后 GitHub 会恢复原来的连接方式，确定停用？')){return;}
+    doAct('/api/disable','actMsg');
+  }else{
+    doAct('/api/enable','actMsg');
+  }
+};
+$('btnDisable').onclick=function(){
+  if(!confirm('停用后 GitHub 会恢复原来的连接方式，确定停用？')){return;}
+  doAct('/api/disable','actMsg');
+};
+$('btnTest').onclick=function(){
+  var b=this; b.disabled=true; _say('actMsg','正在重测（约 10~30 秒）…',30000,false);
+  act('/api/retest').then(function(){
+    b.disabled=false;
+    setTimeout(function(){refresh(true);},6000);
+    setTimeout(function(){refresh(true);},16000);
+    setTimeout(function(){refresh(true);},28000);
+  }).catch(function(){b.disabled=false;_say('actMsg','面板没有响应',12000,true);});
+};
+$('btnRetest2').onclick=function(){$('btnTest').click();};
+$('btnSpeed').onclick=function(){
+  var b=this; b.disabled=true; $('speedMsg').textContent='测速中…';
+  act('/api/speedtest').then(function(r){
+    $('speedMsg').textContent=(r&&r.msg)||'';
+    b.disabled=false;
+    setTimeout(function(){refresh();},800);
+    setTimeout(function(){refresh();},8000);
+    setTimeout(function(){refresh();},20000);
+  }).catch(function(){b.disabled=false;$('speedMsg').textContent='面板没有响应';});
+};
+$('auto').onclick=function(){
+  var on=this.getAttribute('aria-checked')!=='true';
+  setSw('auto',on);
+  act('/api/autostart?on='+(on?1:0)).then(function(){refresh();}).catch(function(){refresh();});
+};
+$('autoUpd').onclick=function(){
+  var on=this.getAttribute('aria-checked')!=='true';
+  setSw('autoUpd',on);
+  act('/api/autoupdate?on='+(on?1:0)).then(function(r){
+    _say('updMsg',(r&&r.msg)||'已保存',6000,false); refresh();
+  }).catch(function(){_say('updMsg','设置没有保存成功',8000,true);refresh();});
+};
+$('notifyBubble').onclick=function(){
+  var on=this.getAttribute('aria-checked')!=='true';
+  setSw('notifyBubble',on);
+  act('/api/notifybubble?on='+(on?1:0)).then(function(r){
+    _say('updMsg',(r&&r.msg)||'已保存',6000,false); refresh();
+  }).catch(function(){_say('updMsg','设置没有保存成功',8000,true);refresh();});
+};
+$('btnQuit').onclick=function(){
+  if(!confirm('退出后 GitHub 将恢复原有连接方式，确定退出？')){return;}
+  act('/api/quit').then(function(){
+    clearInterval(_refreshTimer); clearInterval(_histTimer); clearInterval(_diagTimer);
+    $('state').textContent='已安全退出，可关闭此页';
+    _say('actMsg','狐径已退出，系统代理已还原',30000,false);
+  }).catch(function(){
+    $('state').textContent='已退出（面板无响应，可关闭此页）';
+  });
+};
+$('btnIpSave').onclick=function(){
+  var v=$('ipInput').value.trim();
+  if(!v){_say('ipMsg','先填一个 IP',6000,true);return;}
+  act('/api/set-ip?ip='+encodeURIComponent(v)).then(function(r){
+    if(r&&r.ok===false){_say('ipMsg',(r.msg||'这个地址不能用'),12000,true);return;}
+    _say('ipMsg',(r&&r.msg)||'已保存，正在重测…',8000,false);
+    loadDiag(); refresh(true);
+  }).catch(function(){_say('ipMsg','面板没有响应, 结果未知',12000,true);});
+};
+$('btnIpClear').onclick=function(){
+  act('/api/set-ip?ip=').then(function(r){
+    _say('ipMsg',(r&&r.msg)||'已清除',6000,false); loadDiag(); refresh(true);
+  }).catch(function(){_say('ipMsg','面板没有响应',8000,true);});
+};
+$('ipInput').addEventListener('keydown',function(e){
+  if(e.key==='Enter'){$('btnIpSave').click();}
+});
+$('btnDiagCopy').onclick=copyDiag;
+$('btnDiagRe').onclick=function(){loadDiag();refresh(true);};
+$('btnReport').onclick=function(){
+  var b=this; b.disabled=true;
+  api('/api/report').then(function(d){
+    copyText((d&&d.text)||'','反馈包已复制（版本+系统+可用 IP+日志尾部 50 行），直接粘给作者');
+    b.disabled=false;
+  }).catch(function(){
+    b.disabled=false; toast('面板没有响应，稍后再点');
+  });
+};
+$('btnCopyAll').onclick=function(){
+  var rows=ipRows();
+  if(!rows.length){toast('还没有可用 IP 可复制');return;}
+  copyText(rows.map(function(r){return r.ip;}).join('\\n'),'已复制 '+rows.length+' 个 IP');
+};
+$('onlyGood').onclick=function(){
+  ONLY_GOOD=!ONLY_GOOD;
+  this.className='chip'+(ONLY_GOOD?' on':'');
+  paintIps();
+};
+$('ips').addEventListener('click',function(e){
+  var b=e.target.closest?e.target.closest('button.copy'):null;
+  if(!b){return;}
+  var ip=b.getAttribute('data-ip');
+  copyText(ip,'已复制 '+ip);
+});
+$('ipHead').addEventListener('click',function(e){
+  var th=e.target.closest?e.target.closest('th[data-sort]'):null;
+  if(!th){return;}
+  var k=th.getAttribute('data-sort');
+  if(SORT.key===k){SORT.dir=-SORT.dir;}else{SORT.key=k;SORT.dir=1;}
+  paintIps();
+});
+$('range3').onclick=function(){loadHistory(3);};
+$('range24').onclick=function(){loadHistory(24);};
+
+/* 键盘：/ 跳到手动 IP，Esc 取消焦点/收起提示，T 切主题 */
+document.addEventListener('keydown',function(e){
+  var tag=(e.target&&e.target.tagName)||'';
+  var typing=(tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'||(e.target&&e.target.isContentEditable));
+  if(e.key==='/'&&!typing&&!e.ctrlKey&&!e.metaKey&&!e.altKey){
+    e.preventDefault();
+    var el=$('ipInput');
+    if(el){el.focus();el.select&&el.select();}
+    return;
+  }
+  if(e.key==='Escape'){
+    if(document.activeElement&&document.activeElement.blur){document.activeElement.blur();}
+    $('toast').className='toast';
+    return;
+  }
+  if((e.key==='t'||e.key==='T')&&!typing&&!e.ctrlKey&&!e.metaKey&&!e.altKey){
+    var cur=document.documentElement.getAttribute('data-theme');
+    applyTheme(cur==='light'?'dark':'light',true);
+  }
+});
+
+/* ── 轮询 ───────────────────────────────────────────────────────────── */
+var _refreshTimer=setInterval(function(){refresh();},3000);
+var _histTimer=setInterval(function(){loadHistory();},60000);
+var _diagTimer=null;
+function loadDiag(){
+  api('/api/diag').then(function(d){
+    $('diag').textContent=(d&&d.diag)||'读取失败';
+  }).catch(function(){});
+}
+_diagTimer=setInterval(loadDiag,30000);
+
+initTheme();
+paintSort();
+refresh(true);
+loadDiag();
+setTimeout(function(){drawChart();},60);
+window.addEventListener('resize',function(){drawChart();});
+</script>
+<!-- ===== 外观：主题三档 + 主色（2026-10-24 四款统一组件） ===== -->
+<style>
+#apFab{z-index:70;width:30px;height:30px;border-radius:50%;flex:none;margin-left:6px;border:1px solid var(--line);background:transparent;color:var(--txt-2);display:grid;place-items:center;cursor:pointer;font-size:13px;padding:0}
+#apFab:hover{color:var(--accent);border-color:var(--accent)}
+#apPop{position:fixed;z-index:71;width:250px;background:var(--card);border:1px solid var(--line-2);
+  border-radius:12px;box-shadow:0 14px 40px rgba(0,0,0,.45);padding:12px;display:none}
+#apPop.on{display:block}
+.ap-row{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.ap-lab{font-size:11px;color:var(--txt-3);width:30px;flex:none}
+.ap-seg{display:flex;gap:4px;flex:1}
+.ap-seg button{flex:1;height:26px;border-radius:7px;border:1px solid var(--line);background:transparent;
+  color:var(--txt-2);font-size:11px;cursor:pointer;padding:0}
+.ap-seg button.on{background:color-mix(in srgb,var(--accent) 15%,transparent);border-color:var(--accent);color:var(--accent);font-weight:600}
+.ap-sw{display:flex;gap:8px;flex:1}
+.ap-sw button{width:20px;height:20px;border-radius:50%;border:2px solid transparent;cursor:pointer;padding:0;flex:none}
+.ap-sw button.on{border-color:var(--txt)}
+.ap-hint{font-size:10px;color:var(--txt-3);line-height:1.5;margin-top:9px}
+#btnTheme,#themeBtn{display:none!important}
+html[data-accent="blue"]{--accent:#4f8cff;--accent-ink:#04122e}
+html[data-accent="green"]{--accent:#3ecf8e;--accent-ink:#062016}
+html[data-accent="violet"]{--accent:#a78bfa;--accent-ink:#1a1030}
+html[data-accent="amber"]{--accent:#f0b429;--accent-ink:#221603}
+html[data-theme="light"][data-accent="blue"]{--accent:#1a5fd0;--accent-ink:#fff}
+html[data-theme="light"][data-accent="green"]{--accent:#0f9d58;--accent-ink:#fff}
+html[data-theme="light"][data-accent="violet"]{--accent:#6d28d9;--accent-ink:#fff}
+html[data-theme="light"][data-accent="amber"]{--accent:#a86f00;--accent-ink:#fff}
+html[data-accent]{--accent-soft:color-mix(in srgb,var(--accent) 14%,transparent);--accent-line:color-mix(in srgb,var(--accent) 45%,transparent)}
+</style>
+<button id="apFab" title="外观：主题与主色" aria-label="外观">◐</button>
+<div id="apPop" role="dialog" aria-label="外观设置">
+  <div class="ap-row"><span class="ap-lab">主题</span><div class="ap-seg" id="apMode">
+    <button type="button" data-m="auto">跟随系统</button><button type="button" data-m="light">亮色</button><button type="button" data-m="dark">暗色</button>
+  </div></div>
+  <div class="ap-row"><span class="ap-lab">主色</span><div class="ap-sw" id="apAcc">
+    <button type="button" data-a="default" title="品牌色"></button><button type="button" data-a="blue" title="蓝" style="background:#4f8cff"></button><button type="button" data-a="green" title="绿" style="background:#3ecf8e"></button><button type="button" data-a="violet" title="紫" style="background:#a78bfa"></button><button type="button" data-a="amber" title="琥珀" style="background:#f0b429"></button>
+  </div></div>
+  <div class="ap-hint">「跟随系统」随 Windows 亮/暗模式自动切换；选择记在本机，重开仍在。</div>
+</div>
+<script>
+(function(){
+  var R=document.documentElement, K='ui-theme-mode', A='ui-accent';
+  var media=window.matchMedia?window.matchMedia('(prefers-color-scheme: light)'):null;
+  var brand=(getComputedStyle(R).getPropertyValue('--accent')||'').trim()||'#888';
+  function mode(){ try{return localStorage.getItem(K)||'auto'}catch(e){return 'auto'} }
+  function acc(){ try{return localStorage.getItem(A)||'default'}catch(e){return 'default'} }
+  function apply(){
+    var m=mode();
+    var dark = m==='dark' || (m==='auto' && !(media&&media.matches));
+    R.setAttribute('data-theme', dark?'dark':'light');
+    var a=acc();
+    if(a==='default'){ R.removeAttribute('data-accent'); } else { R.setAttribute('data-accent',a); }
+    sync(m,a);
+  }
+  function sync(m,a){
+    var mb=document.querySelectorAll('#apMode button');
+    for(var i=0;i<mb.length;i++) mb[i].classList.toggle('on', mb[i].getAttribute('data-m')===m);
+    var ab=document.querySelectorAll('#apAcc button');
+    for(var j=0;j<ab.length;j++) ab[j].classList.toggle('on', ab[j].getAttribute('data-a')===a);
+    var fab=document.getElementById('apFab');
+    if(fab) fab.textContent = R.getAttribute('data-theme')==='dark' ? '◐' : '◑';
+  }
+  function setMode(m){ try{localStorage.setItem(K,m)}catch(e){} apply(); }
+  function setAcc(a){ try{localStorage.setItem(A,a)}catch(e){} apply(); }
+  var fab=document.getElementById('apFab'), pop=document.getElementById('apPop');
+  var holder=document.querySelector('.top-r')||document.querySelector('.hbar')||document.querySelector('header');
+  if(holder && fab){ holder.appendChild(fab); if(holder.tagName==='HEADER'){ fab.style.position='fixed'; fab.style.top='10px'; fab.style.right='12px'; } }
+  if(fab) fab.addEventListener('click',function(e){ e.stopPropagation();
+    if(!pop.classList.contains('on')){ var r=fab.getBoundingClientRect();
+      pop.style.right='12px'; pop.style.left='auto'; pop.style.top=(r.bottom+8)+'px'; }
+    pop.classList.toggle('on'); });
+  document.addEventListener('click',function(e){ if(pop && !pop.contains(e.target) && e.target!==fab) pop.classList.remove('on'); });
+  document.addEventListener('keydown',function(e){
+    if(e.key==='Escape'){ pop && pop.classList.remove('on'); }
+    if((e.key==='t'||e.key==='T') && !/^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName||''))){
+      e.stopImmediatePropagation(); e.preventDefault();
+      setMode(R.getAttribute('data-theme')==='dark'?'light':'dark');
+    }
+  }, true);
+  document.getElementById('apMode').addEventListener('click',function(e){
+    var b=e.target.closest?e.target.closest('button'):null; if(!b) return; setMode(b.getAttribute('data-m'));
+  });
+  document.getElementById('apAcc').addEventListener('click',function(e){
+    var b=e.target.closest?e.target.closest('button'):null; if(!b) return; setAcc(b.getAttribute('data-a'));
+  });
+  var d=document.querySelector('#apAcc button[data-a="default"]'); if(d) d.style.background=brand;
+  if(media && media.addEventListener) media.addEventListener('change',function(){ if(mode()==='auto') apply(); });
+  else if(media && media.addListener) media.addListener(function(){ if(mode()==='auto') apply(); });
+  var forced=null; try{ forced=new URLSearchParams(location.search).get('theme'); }catch(e){}
+  if(forced==='light'||forced==='dark'){ R.setAttribute('data-theme',forced); sync(mode(),acc()); } else { apply(); }
+  window.__uiTheme={mode:mode,accent:acc,setMode:setMode,setAccent:setAcc};
+})();
+</script>
 </body></html>
 """
 
@@ -4204,12 +6190,14 @@ class PanelHandler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body, ctype='text/html; charset=utf-8'):
+    def _send(self, code, body, ctype='text/html; charset=utf-8', extra=None):
         self.send_response(code)
         self.send_header('Content-Type', ctype)
         # 审查 M-6: 没有 nosniff 时, 浏览器可能把 text/plain 的接口回话当脚本嗅探执行
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Length', str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -4227,13 +6215,52 @@ class PanelHandler(BaseHTTPRequestHandler):
             return
         _LAST_ACT[0] = time.time()
         path = self.path.split('?')[0]
+        query = self.path.split('?')[1] if '?' in self.path else ''
         if path == '/pac':
             self._send(200, (PAC_TEMPLATE % PROXY_PORT).encode('ascii'),
                        'application/x-ns-proxy-autoconfig')
         elif path in ('/', '/ui'):
             self._send(200, PANEL_PAGE.encode('utf-8'))
+        elif path == '/api/history':
+            # 【2026-10-24 新增】延迟曲线的数据源: 最近 N 小时（默认 3，最多 7 天）
+            hours = _query_int(query, 'hours', 3, 1, HISTORY_KEEP_DAYS * 24)
+            pts = history_points(hours)
+            self._send(200, json.dumps({
+                'ok': True, 'hours': hours, 'step': HISTORY_STEP,
+                'generated': int(time.time()), 'points': pts,
+                'summary': history_summary(pts),
+            }, ensure_ascii=False).encode('utf-8'),
+                'application/json; charset=utf-8')
+        elif path == '/api/history.csv':
+            # 【2026-10-24 新增】同一份采样导出 CSV（面板「导出 CSV」按钮用它）
+            hours = _query_int(query, 'hours', 3, 1, HISTORY_KEEP_DAYS * 24)
+            pts = history_points(hours)
+            rows = ['time,epoch,ip,latency_ms,ok_count,total,raw_ok,pages_ok']
+            for p in pts:
+                rows.append(','.join((
+                    time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p.get('ts') or 0)),
+                    str(int(p.get('ts') or 0)),
+                    str(p.get('ip') or ''),
+                    '' if p.get('latency') is None else str(int(p['latency'])),
+                    str(p.get('ok') if p.get('ok') is not None else ''),
+                    str(p.get('total') if p.get('total') is not None else ''),
+                    str(p.get('raw_ok') if p.get('raw_ok') is not None else ''),
+                    str(p.get('pages_ok') if p.get('pages_ok') is not None else ''),
+                )))
+            self._send(200, ('\r\n'.join(rows) + '\r\n').encode('utf-8'),
+                       'text/csv; charset=utf-8',
+                       {'Content-Disposition': 'attachment; filename="foxpath-history-%dh.csv"'
+                                               % hours})
+        elif path == '/api/report':
+            # 【2026-10-24 新增】一键反馈包：只回一段文本，面板负责复制到剪贴板。
+            # 不写共享文件、不上传（与「复制诊断信息」同一条隐私口径）。
+            self._send(200, json.dumps({'ok': True, 'text': feedback_text()},
+                                       ensure_ascii=False).encode('utf-8'),
+                       'application/json; charset=utf-8')
         elif path == '/api/status':
             good, ts = HEALTH.snapshot()
+            raw_good, _ = HEALTH_RAW.snapshot()
+            pages_good, _ = HEALTH_PAGES.snapshot()
             _cur_ip = _LAST_GOOD.get('github') or (good[0][0] if good else '')
             # 寿命未知要如实给 null: 转成 0 的话面板会显示"约 0 秒后换", 语义正好相反
             _cur_left = _ip_remaining(_cur_ip)
@@ -4291,6 +6318,33 @@ class PanelHandler(BaseHTTPRequestHandler):
                         'hot': sorted([{'ip': i, 'kbps': k} for i, k in
                                        ((x, _kbps_of(x)) for x in _hot_get('github'))
                                        if k], key=lambda d: -d['kbps'])},
+                # 【2026-10-24 新增】每 10 分钟一轮的"跑得通通道"重匹配结果。
+                # 这是**新字段**, 老调用方(read status['cap'] 那批)不受影响。
+                'chan': {k: _chan_public(v) for k, v in _CHAN.items()},
+                'chan_interval': int(_CHAN_INTERVAL),
+                'chan_min_kbps': _CHAN_MIN_KBPS,
+                # ── 【2026-10-24 UI 整改】仪表盘专用：全是**新增字段**，
+                #    上面那些老字段(ip/ms/good/life/cur_*/direct/speed/route/cap)
+                #    一个都没动，老调用方不受影响。
+                'good_n': len(good),
+                # 【2026-10-24 新增】"可用"拆成两个口径, 面板与反馈包都用这两个数:
+                #   good_strong_n —— 近 _FRESH_WINDOW 秒真发过一次请求并拿到 2xx/3xx
+                #   tier_n        —— 当前池子里两类证据各多少个
+                # 老字段 good/good_n 的含义一个没变, 只是再多给一层真相。
+                'good_strong_n': len(HEALTH.strong()),
+                'fresh_window': int(_FRESH_WINDOW),
+                'tier_n': HEALTH.tier_counts(),
+                'total_n': len([x for x in candidate_list() if ':' not in x]),
+                'raw_n': len(raw_good), 'raw_total': len(CANDIDATE_IPS_RAW_ALL),
+                'pages_n': len(pages_good),
+                'pages_total': len(CANDIDATE_IPS_PAGES_ALL),
+                'health_ts': ts,
+                'health_age': int(time.time() - ts) if ts else None,
+                'ipv6': bool(local_has_ipv6()),
+                'hits': hits_snapshot(),
+                'pac_hosts': list(PAC_HOSTS),
+                'lines': lines_status(),
+                'ips_detail': ips_detail(good),
             }
             self._send(200, json.dumps(data, ensure_ascii=False).encode('utf-8'),
                        'application/json; charset=utf-8')
@@ -4347,10 +6401,15 @@ class PanelHandler(BaseHTTPRequestHandler):
             ok, msg = disable_proxy()
             resp = {'ok': ok, 'msg': msg}
         elif path == '/api/retest':
-            threading.Thread(target=lambda: (HEALTH.refresh(candidate_list()),
-                                              HEALTH_RAW.refresh(CANDIDATE_IPS_RAW_ALL),
-                                              HEALTH_PAGES.refresh(CANDIDATE_IPS_PAGES_ALL)),
-                             daemon=True).start()
+            # 【2026-10-24】重测完把这一轮结果落进 history.jsonl（手动重测也是一次体检），
+            # 顺便抽一轮丢包样本 —— 以前这里是三行 lambda，现在包成函数好挂这两个新动作。
+            def _retest_job():
+                good = HEALTH.refresh(candidate_list())
+                raw_good = HEALTH_RAW.refresh(CANDIDATE_IPS_RAW_ALL)
+                pages_good = HEALTH_PAGES.refresh(CANDIDATE_IPS_PAGES_ALL)
+                history_append(good, raw_good, pages_good)
+                loss_probe_async(good)
+            threading.Thread(target=_retest_job, daemon=True).start()
             log('手动重测已触发(含 raw 与 github.io 池)')
         elif path == '/api/speedtest':
             # 面板「立即测速」(2026-10-11): 后台跑, 不卡页面; 已在测就直接告诉它等着
@@ -4395,6 +6454,11 @@ class PanelHandler(BaseHTTPRequestHandler):
                 if kv.startswith('ip='):
                     raw = urllib.parse.unquote(kv[3:])
             ok, msg = save_manual_ip(raw)
+            # 【2026-10-24 修·回执丢了】这里原来只把 ok/msg 赋给局部变量、**没写进 resp**，
+            # 于是接口永远回 {"ok":true,"msg":""}：面板收到的是"已保存"，而实际上
+            # 非法地址/私网地址被 save_manual_ip 拒了(审查 M-14 原本就要求把原因给人看)。
+            # 返回结构没变(还是 ok/msg)，只是把真实结果如实回给面板。
+            resp = {'ok': ok, 'msg': msg}
             log('手动 IP: ' + msg)
             if ok:
                 threading.Thread(target=lambda: HEALTH.refresh(candidate_list()),
@@ -4451,8 +6515,18 @@ def health_loop():
         good_raw = HEALTH_RAW.refresh(CANDIDATE_IPS_RAW_ALL)
         # GitHub Pages 与 raw/附件同一段 IP, 但证书记的是 *.github.io —— 单独体检
         good_pages = HEALTH_PAGES.refresh(CANDIDATE_IPS_PAGES_ALL)
+        # 【2026-10-24】每轮体检都落一行到 history.jsonl（面板延迟曲线的数据源;
+        # 手动重测那次在 /api/retest 里也落）。丢包抽样只在体检后抽一轮，纯展示用。
+        history_append(good, good_raw, good_pages)
+        loss_probe_async(good)
         if need_meta or len(good) < 3:
-            fetch_official_ips()
+            # 【2026-10-24 修】同步这件事**绝不能把体检线程带死**: 上面那条 /32 的
+            # TypeError 就是这么发生的(它落在 try 之外)。同步失败只是"表旧一点",
+            # 体检线程死了才是"从此不再挑线路"。
+            try:
+                fetch_official_ips()
+            except Exception as e:
+                log('官方 IP 表同步异常: %s（继续用现有表, 体检不中断）' % e)
             good = HEALTH.refresh(candidate_list())
 
         # 静默检查新版本 —— 启动后一次, 之后每 12 小时一次。
@@ -4836,6 +6910,12 @@ def main():
     threading.Thread(target=dns_warm_loop, daemon=True).start()
     # 直连能力体检: 只有"真能传数据"的直连 IP 才给竞速资格, 免得握手快的坏 IP 抢到
     threading.Thread(target=sys_cap_loop, daemon=True).start()
+    # 【2026-10-24 新增·每 10 分钟重匹配"跑得通的通道"】
+    # 上面几轮各管一层(体检排名 / 热备复验 / 直连切边), 没有一处会普查"这一批 IP 谁真传得动"。
+    # 这一轮补的就是那一层, 并且会在证据变差时**主动换岗**, 不等用户先挨一次超时。
+    # 先缓 15 秒再起: 让体检/热备把候选名单先立起来, 免得第一轮普查空手而归。
+    threading.Thread(target=lambda: (time.sleep(15), channel_loop()),
+                     daemon=True).start()
 
     # 【2026-10-11 修·启动预体检改为后台异步】消除"启动后头几分钟候选池为空/过期"全灭窗口,
     # 但必须放在 start_proxy/tray_serve 之后、用后台线程跑 —— 否则会阻塞代理/托盘起来,

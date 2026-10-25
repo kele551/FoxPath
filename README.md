@@ -4,7 +4,7 @@
 <h1>狐径 FoxPath</h1>
 
 <a href="https://gitcode.com/kele551/FoxPath/releases" title="点击去下载（GitHub + GitCode 合计 · 实时）"><img alt="Downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DFoxPath%26kind%3Ddownloads&style=flat-square" height="30"></a>
-<a href="https://gitcode.com/kele551/FoxPath" title="浏览量 · Gitee + GitCode 合计 · 实时"><img alt="浏览量" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DFoxPath%26kind%3Dviews&style=flat-square" height="30"></a>
+<a href="https://gitcode.com/kele551/FoxPath" title="浏览量 · GitCode 合计 · 实时"><img alt="浏览量" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DFoxPath%26kind%3Dviews&style=flat-square" height="30"></a>
 
 <a href="https://github.com/kele551/FoxPath/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
 <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?style=flat-square">
@@ -66,7 +66,7 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 
 | 步骤 | 做什么 |
 |---|---|
-| **① 下载** | [GitCode 发行页](https://gitcode.com/kele551/FoxPath/releases)（国内主源、直连快）或 [Gitee](https://gitcode.com/kele551/FoxPath/releases) / [GitHub Releases](https://github.com/kele551/FoxPath/releases)，拿 `FoxPath.exe`。代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像 |
+| **① 下载** | [GitCode 发行页](https://gitcode.com/kele551/FoxPath/releases)（国内主源、直连快）或 [GitCode](https://gitcode.com/kele551/FoxPath/releases) / [GitHub Releases](https://github.com/kele551/FoxPath/releases)，拿 `FoxPath.exe`。代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像 |
 | **② 运行** | 双击 `FoxPath.exe` → 浏览器自动弹出控制面板（首次启动等 15～20 秒，它在并发体检 IP） |
 | **③ 启用** | 面板点「启用加速」完事；不用了点「退出并还原」，系统设置恢复原样 |
 
@@ -75,7 +75,7 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 > 想先看它长什么样：仓库里有一页[演示页](docs/demo/index.html)，内嵌 2 分 30 秒的演示视频
 > （**录制于 v1.0.7**，界面以实际版本为准；最新变化见 [release-notes.md](docs/release-notes.md)），点开即播。
 
-> **三个平台代码一致**：[Gitee](https://gitee.com/kele551/FoxPath)（主源）· [GitHub](https://github.com/kele551/FoxPath)（镜像）· [AtomGit](https://atomgit.com/kele551/FoxPath)（代码镜像，只提供源码归档）。
+> **三个平台代码一致**：[GitCode](https://gitcode.com/kele551/FoxPath)（主源）· [GitHub](https://github.com/kele551/FoxPath)（镜像）· [AtomGit](https://atomgit.com/kele551/FoxPath)（代码镜像，只提供源码归档）。
 > **二进制发行包请从 GitCode（主）或 Gitee / GitHub（镜像）下载**；三个平台都收 Issue / PR。
 
 ---
@@ -132,14 +132,14 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 <summary><b>用法</b>（点击展开）</summary>
 
 
-1. 从 [Gitee Releases](https://gitcode.com/kele551/FoxPath/releases)（国内主源，直连快）或 [GitHub Releases](https://github.com/kele551/FoxPath/releases) 下载 `FoxPath.exe`
+1. 从 [GitCode Releases](https://gitcode.com/kele551/FoxPath/releases)（国内主源，直连快）或 [GitHub Releases](https://github.com/kele551/FoxPath/releases) 下载 `FoxPath.exe`
 2. 双击运行 → 浏览器自动打开控制面板 `http://127.0.0.1:8788/ui`
 3. 勾选「开机自启」即可后台常驻
 
 **首次启动请等 15～20 秒**：程序要并发体检 49 个候选 IP，体检完成前代理还没完全生效。
 
 > 升级最简单的方式是面板里的「检查更新 → 立即升级」（v1.1.1 起手动检查强制联网，不再被缓存挡住）。
-> 万一升级源也连不上，到 [Gitee 发行页](https://gitcode.com/kele551/FoxPath/releases) 下载最新 `FoxPath.exe`
+> 万一升级源也连不上，到 [GitCode 发行页](https://gitcode.com/kele551/FoxPath/releases) 下载最新 `FoxPath.exe`
 > 覆盖安装即可，配置与收藏全部保留、无需卸载。
 
 ### 控制面板上有什么
@@ -179,7 +179,7 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
   还原备份固定存在 `%LOCALAPPDATA%\FoxPath\proxy-backup.json`（不再依赖 exe 同级是否可写）；
   备份写不进去时**不会**去改注册表（宁可不开，也不留下无法还原的状态）。
   另有一条 `--restore`：即使备份没了、程序也删了，也能把残留的 PAC 设置收干净。
-- **在线升级**：控制面板最上面那张卡片里检查更新，升级源读仓库的 `version.json`（Gitee raw 优先、GitHub 兜底）；
+- **在线升级**：控制面板最上面那张卡片里检查更新，升级源读仓库的 `version.json`（GitCode 优先、GitHub 兜底）；
   升级源必须过两道闸：**① Ed25519 公钥验签**（同目录的 `version.json.sig`，用程序内置的公钥，验不过一律拒绝这条源，
   换下一个候选，全都不行就保留当前版本）、**② 新版 exe 的 SHA256 与字节数**；两道都过了才下到 `.new` 并交给小助手覆盖重启。
   程序没有"安装"这一步，升级就是换 exe。（签名防的是**升级源被篡改**；它不防维护者机器上的私钥本身被偷，
@@ -217,7 +217,7 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 - **不会把「降级」当「升级」**：按版本号语义比较（`1.0.10 > 1.0.9` 这种也算得对），线上不比本地新时按钮置灰、服务端也拒绝执行。
 - **升级失败会自动回滚**：新版连续起不来时，小助手把旧版本放回去并重新启动它。
 - **升级完成后程序会自动重新打开**；万一它没出现，双击 `FoxPath.exe` 就能正常使用 —— 升级本身是完成的，系统代理已还原，不会影响上网。
-- **升级源不通时（2026-10-12 补）**：点「检查更新」长时间连不上源，不必干等 —— 到 [Gitee 发行页](https://gitcode.com/kele551/FoxPath/releases) 下载最新 `FoxPath.exe`，关掉旧程序后双击覆盖即可，配置全部保留。
+- **升级源不通时（2026-10-12 补）**：点「检查更新」长时间连不上源，不必干等 —— 到 [GitCode 发行页](https://gitcode.com/kele551/FoxPath/releases) 下载最新 `FoxPath.exe`，关掉旧程序后双击覆盖即可，配置全部保留。
 
 > 升级细节与历史说明更正（`_PYI_*` 环境变量真因、v1.0.6→v1.0.7 那一跳、各版本护栏边界）见 [CONTRIBUTING.md](docs/CONTRIBUTING.md) 第九节。
 
@@ -238,7 +238,7 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 
 ## 版本记录
 
-> 当前对外发布版本 **v1.2.2**（2026-10-17）。主源 **GitCode** · 历史 **Gitee** · 镜像 **GitHub**；自 2026-10-16 起代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像。完整逐版说明见 [CHANGELOG.md](docs/CHANGELOG.md) 与 [release-notes.md](docs/release-notes.md)。
+> 当前对外发布版本 **v1.2.2**（2026-10-17）。主源 **GitCode** · 镜像 **GitHub**；自 2026-10-16 起代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像。完整逐版说明见 [CHANGELOG.md](docs/CHANGELOG.md) 与 [release-notes.md](docs/release-notes.md)。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
@@ -253,7 +253,7 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 
 ## 联系与反馈
 
-遇到打不开、体检全灭、或哪里不好用，欢迎直接提 Issue：[GitHub Issues](https://github.com/kele551/FoxPath/issues)　·　[Gitee Issues](https://gitee.com/kele551/FoxPath/issues)
+遇到打不开、体检全灭、或哪里不好用，欢迎直接提 Issue：[GitHub Issues](https://github.com/kele551/FoxPath/issues)　·　[GitCode Issues](https://gitcode.com/kele551/FoxPath/issues)
 
 反馈时顺手附上控制面板「当前可用 IP」那一栏的数字，定位会快很多。
 
@@ -275,7 +275,7 @@ MIT
 | 组件 | 用途 | 许可 |
 |---|---|---|
 | PyInstaller | 把主程序打包成单文件 exe（`build_exe.py`） | GPLv2-or-later **+ 官方特殊例外**（允许把用它打包的程序按自身许可分发） |
-| requests | 发布流水线（`tools/publish.py` 调 Gitee API、下载回验） | Apache-2.0 |
+| requests | 发布流水线（`tools/publish.py` 调 GitCode API、下载回验） | Apache-2.0 |
 
 - 版本口径写在 [requirements.txt](requirements.txt)，打包版本固定，便于复现；
 - 打包进 exe 的 Python 运行时是 Python 3.13（PSF 许可）；

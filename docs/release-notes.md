@@ -12,7 +12,7 @@
 
 ### 1. 面板页脚：地址换成 GitHub，并且可以点
 
-- 控制面板底部的作者一行，地址从已停更的 `gitee.com/kele551/FoxPath` 换成
+- 控制面板底部的作者一行，地址从已停更的 `gitcode.com/kele551/FoxPath` 换成
   **`github.com/kele551/FoxPath`**（国外镜像仓库，仍在更新）。
 - 从纯文字改成**可点链接**：点一下直接用默认浏览器打开项目主页，不用再手动复制粘贴。
 - 只改显示，**代理、IP 体检、吞吐挑 IP、在线升级这些功能一行没动**。
@@ -45,7 +45,7 @@
 | v1.0.5 | 2026-09-22 | 网页版在线升级（检查更新/立即升级/进度条/小助手） |
 | v1.0.0 | 2026-09-19 | 首个版本：本地代理 + PAC、IP 体检、候选池刷新、全灭自愈、退出还原 |
 
-反馈：[GitHub Issues](https://github.com/kele551/FoxPath/issues)　·　[Gitee Issues](https://gitee.com/kele551/FoxPath/issues)
+反馈：[GitHub Issues](https://github.com/kele551/FoxPath/issues)　·　[GitCode Issues](https://gitcode.com/kele551/FoxPath/issues)
 
 ---
 

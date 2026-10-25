@@ -1,7 +1,7 @@
 # 项目结构与上手路线（狐径 FoxPath）
 
 > 给想改代码的人：**15 分钟看懂这个项目从哪进、改哪儿、改完怎么验。**
-> 作者：海风（kele551） · 仓库：https://gitee.com/kele551/FoxPath
+> 作者：海风（kele551） · 仓库：https://gitcode.com/kele551/FoxPath
 
 ---
 

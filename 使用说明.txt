@@ -35,7 +35,7 @@
 
    [1] 版本与升级
        左边是当前版本, 中间一条箭头, 右边是新版本号 —— 没有新版时右边是「—」。
-       - 检查更新   问一次升级源 (Gitee 优先, GitHub 兜底)
+       - 检查更新   问一次升级源 (GitCode 优先, GitHub 兜底)
        - 立即升级   只在真有新版时才出现。点了之后的过程是:
                     下载新 exe → 校验 SHA256 → 交给一个独立小助手 →
                     旧程序退出并还原系统代理 → 覆盖 exe → 自动重启
@@ -81,7 +81,7 @@
    - 每 5 分钟并发重测候选池, 入选条件是 TCP 443 握手 + TLS 证书校验 +
      HTTP 首包必须 2xx/3xx (429 限流也算活着 —— 说明对面确实是 GitHub)
      (有些 IP 证书是对的, 但只服务 API/CDN, 访问首页返回 400, 必须滤掉)
-   - 候选池从三个源依次同步官方 IP 段: api.github.com/meta -> Gitee 上的
+   - 候选池从三个源依次同步官方 IP 段: api.github.com/meta -> GitCode 上的
      meta.json (国内三网都能拉; 联通/移动拉不到官方接口时的兜底) -> GitHub raw
    - 面板上的「线路体检」把可用数量、表源、最快 IP 列成一行, 点「复制诊断信息」
      就能直接发给作者定位问题; 自动探测全都不通时, 还能「手动指定 IP」救急
@@ -121,7 +121,7 @@
 
    当前是哪个版本: 看上面那两处任意一处 (本文件不抄版本号, 免得写死了会过期)。
    各版本分别改了什么: 见仓库里的 docs/CHANGELOG.md
-   (https://gitee.com/kele551/FoxPath/blob/main/docs/CHANGELOG.md)
+   (https://gitcode.com/kele551/FoxPath/blob/main/docs/CHANGELOG.md)
 
 
 8. 注意: 以前随仓库提供过一个旧版脚本 (Fix-GitHub.ps1 / Run-GitHubFix.bat)

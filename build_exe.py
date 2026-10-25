@@ -42,7 +42,7 @@ VERSION_TEMPLATE = """VSVersionInfo(
         StringStruct('OriginalFilename', 'FoxPath.exe'),
         StringStruct('ProductName', 'FoxPath'),
         StringStruct('ProductVersion', '%(ver)s'),
-        StringStruct('Comments', 'gitee.com/kele551/FoxPath')
+        StringStruct('Comments', 'gitcode.com/kele551/FoxPath')
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])

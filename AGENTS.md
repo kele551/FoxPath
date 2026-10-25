@@ -45,7 +45,7 @@ python tools/preflight_release.py  # 发版前自检（发布前必须全绿）
 
 ## 平台（三个，代码一致）
 
-代码同时镜像到三处：**Gitee（主源）** / **GitHub（镜像）** / **AtomGit（代码镜像）**。
+代码同时镜像到三处：**GitCode（主源）** / **GitHub（镜像）** / **AtomGit（代码镜像）**。
 **二进制发行包只发 Gitee 与 GitHub** —— AtomGit 目前没有附件上传接口（它的 Release 只提供源码归档）。
 
 ```powershell

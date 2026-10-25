@@ -1,6 +1,6 @@
 # FoxPath — GitHub access helper for Windows
 
-> Author: **HaiFeng (kele551)** · Gitee (primary): <https://gitee.com/kele551/FoxPath> · GitHub (mirror): <https://github.com/kele551/FoxPath> · AtomGit (code mirror): <https://atomgit.com/kele551/FoxPath>
+> Author: **HaiFeng (kele551)** · GitCode (primary): <https://gitcode.com/kele551/FoxPath> · GitHub (mirror): <https://github.com/kele551/FoxPath> · AtomGit (code mirror): <https://atomgit.com/kele551/FoxPath>
 > 中文说明见 [../README.md](../README.md)
 
 A **single-file Windows app** (no installer required). It runs a small local proxy that only handles
@@ -22,7 +22,7 @@ your system settings when it exits.
 
 ## Download
 
-- **Gitee (primary, faster in mainland China)**: <https://gitee.com/kele551/FoxPath/releases>
+- **GitCode (primary, faster in mainland China)**: <https://gitcode.com/kele551/FoxPath/releases>
 - **GitHub (mirror)**: <https://github.com/kele551/FoxPath/releases>
 
 Asset name: `FoxPath.exe` (single file — version number lives in the exe properties, not in the file name).

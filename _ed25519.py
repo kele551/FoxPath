@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# 作者: 海风（kele551）   https://gitee.com/kele551/FoxPath
+# 作者: 海风（kele551）   https://gitcode.com/kele551/FoxPath
 """Ed25519 纯 Python 实现（签名 + 验签），零第三方依赖。
 
 【这份实现的来历】与同作者项目「热点新闻 hotnews」的 `_ed25519.py` 是**同一份实现**
