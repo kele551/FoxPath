@@ -766,7 +766,11 @@ try:
             check_warn('升级演练的"旧版"与"新版"指纹不同（比 sha256 才有意义）',
                        sha(old) != new_sha, 'old=%s new999=%s' % (sha(old)[:12], new_sha[:12]))
         _new_name = os.path.basename(NEW999) or 'FoxPath-9.9.9-test.exe'
-        shutil.copy2(NEW999, os.path.join(os.path.dirname(old), _new_name))
+        # 缺 9.9.9 测试版时**不能**在这里抛 FileNotFoundError：2026-10-26 实跑踩过 ——
+        # 脚本在 ⑤/⑥（清理与注册表还原）之前整个崩掉，系统的 PAC 就留在演练状态里了，
+        # 用户看到的是"自检没跑完 + 网页从此不通"。让它红着走完，比红着崩掉有用。
+        if new_sha:
+            shutil.copy2(NEW999, os.path.join(os.path.dirname(old), _new_name))
         _srv, _base = _start_local_http(os.path.dirname(old))
         feed = {'version': '9.9.9', 'notes': 'preflight',
                 'exe': {'sha256': new_sha, 'url': '%s/%s' % (_base, _new_name),
@@ -965,8 +969,8 @@ finally:
 #   发布文件里一律不许再出现老仓库（Gitee）域名；历史的 CHANGELOG 除外。
 #   version.json 是带签名的线上升级源，这里只警告（改了必须重新签名并发版）。
 # ══════════════════════════════════════════════════════════════════════════
-say()
-say('老仓库地址清扫：发布文件里不含 Gitee 域名')
+print()
+print('⑦ 老仓库地址清扫：发布文件里不含 Gitee 域名')
 # 关键字拆开拼：不然"禁止清单"自己会被扫成命中（2026-10-19 邮箱那次就是这么翻车的）
 _NEEDLE = 'gitee' + '.com/kele551'
 _NEEDLE2 = 'raw.gitee' + 'usercontent'

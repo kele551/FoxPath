@@ -309,8 +309,11 @@ def main():
                     if 'is_github_related_host' in l), 99)
     check('总时限在域名判定之前就设好（后面每一手都看得到预算）',
           dl_at < host_at, True)
-    check('两处抢连都带了 key/label（闸门才生效）',
-          src.count('key=key, label=label'), 2)
+    # 原来这里数死"2 处"。2026-10-26 三点整改·① 在全灭之后又加了"预算内再转两轮",
+    # 手数会变而**规矩不变**: 任何一处抢连都不许绕过闸门裸放 SYN。
+    _races = src.count('self._connect_race(')
+    check('每一处抢连都带了 key/label（闸门才生效）',
+          (_races, src.count('key=key, label=label')), (_races, _races))
     check('兜底用的是剪过的 _tmo，不是原样 _budget',
           '_s3 = socket.create_connection((host, port), timeout=_tmo)' in src, True)
     check('广撒网 16 个之前先看预算',

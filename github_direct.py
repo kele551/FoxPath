@@ -69,7 +69,7 @@ except Exception:
     UPDATE_SIG_AVAILABLE = False
 
 APP_NAME = '狐径'
-APP_VERSION = '1.2.2'
+APP_VERSION = '1.2.3'
 # 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
 AUTHOR = '海风（kele551）'
 AUTHOR_ASCII = 'HaiFeng (kele551)'
@@ -414,6 +414,236 @@ def _race_gate_left(key):
         if now - since >= _RACE_STALE:
             return 0.0
         return max(0.0, _RACE_STALE - (now - since))
+
+
+# ==================================================== 网页级实测台账 (2026-10-26)
+# 【为什么要在体检之外再记一本账】
+# 面板那格"可用 31/50"是**体检**数出来的: 挨个 IP 做 TCP + TLS + GET /, 答了话就算
+# 可用。2026-10-26 下午把这把尺子的漏洞钉死了(本机 foxpath.log + 同一分钟手工实测):
+#   · 16:42 体检报"可用 6/50", 同一分钟手工实测 github.com/kele551/hotnews 走代理:
+#     6 发里 5 发直接被回 502, 剩下 1 发 13.5 秒才回首字节;
+#   · 手工触发全池重测之后变 5 发 3 中(3.4s / 4.2s / 9.7s), 另外 2 发是
+#     **收到 229KB / 278KB 之后断流** —— 握手对、证书对、GET / 也答了, 正文下到一半死。
+# 结论: "IP 可用"和"网页打得开"是两本账, 后者才是用户感知的那一本。所以这里只记
+# **真实转发**(浏览器那条 CONNECT)的结局, 一条探测都不掺:
+#   ok      —— 隧道建起来、也确实往浏览器搬过数据, 最后由一端正常收尾
+#   stall   —— 连上了但正文没搬动: 一个字节都没来 / 半途断流 / 空闲到点
+#   refused —— 建连就没成, 代理只能回 502
+#   badgw   —— 对面回 4xx/5xx 假前门(证书对、页面必定报错)
+WEB_OK, WEB_STALL, WEB_REFUSED, WEB_BADGW = 'ok', 'stall', 'refused', 'badgw'
+_WEB_LEDGER = {}           # key -> [(ts, kind, ms, nbytes)]  只留最近 _WEB_MAX 条
+_WEB_LOCK = threading.Lock()
+_WEB_WINDOW = 180.0        # 只按最近 3 分钟判定 —— 这条链路半衰期就几分钟, 老账会骗人
+_WEB_MAX = 60
+_WEB_MIN_SAMPLES = 3       # 少于 3 次不下结论, 只说"样本还少"
+
+# 【2026-10-26 三点整改·① 配套的两个数】
+_CONNECT_DEADLINE_MAX = 20.0    # 实测"慢但能成"时允许等多久(浏览器等得起, 用户等不起 30 秒)
+_CONNECT_RETRY_ROUNDS = 2       # 一轮全灭之后, 预算还剩就再转几轮(每轮都过抢连闸门)
+_CONNECT_RETRY_MIN_LEFT = 2.2   # 剩余预算少于这个就不再开新一轮
+_CONNECT_RETRY_BACKOFF = 0.6    # 每轮起跑前等这么久, 给 hot_refresh/自愈把新鲜结论写进来的时间
+_DIRECT_PROBE_FRESH = 150.0     # 直连探测结果的有效期(后台每 60 秒探一次, 取 2.5 个周期)
+
+
+def _pool_key_for(host):
+    """这个域名归哪个池管 —— 建连时限、网页台账、日志都要按池取, 别再各写一份判断。"""
+    try:
+        if is_raw_host(host):
+            return 'raw'
+        if is_pages_host(host):
+            return 'pages'
+        if is_github_host(host):
+            return 'github'
+    except Exception:
+        return ''
+    return ''
+
+
+def _web_record(key, kind, ms=0.0, nbytes=0):
+    """记一笔真实转发的结局。key 为空(非 GitHub 域名)时不记, 免得脏了三池的账。"""
+    if not key or kind not in (WEB_OK, WEB_STALL, WEB_REFUSED, WEB_BADGW):
+        return False
+    now = time.time()
+    with _WEB_LOCK:
+        rows = _WEB_LEDGER.setdefault(key, [])
+        rows.append((now, kind, max(0.0, float(ms or 0.0)), int(nbytes or 0)))
+        if len(rows) > _WEB_MAX:
+            del rows[:-_WEB_MAX]
+        # 顺手剪掉过窗口的老账(只留 _WEB_WINDOW 秒内的)
+        stale = [r for r in rows if now - r[0] > _WEB_WINDOW]
+        if stale:
+            _WEB_LEDGER[key] = rows = rows[len(stale):]
+    return True
+
+
+def _web_rows(key, now=None):
+    """窗口内的真实转发样本( oldest → newest )。"""
+    if now is None:
+        now = time.time()
+    with _WEB_LOCK:
+        rows = list(_WEB_LEDGER.get(key) or [])
+    return [r for r in rows if now - r[0] <= _WEB_WINDOW]
+
+
+def _web_median_ms(rows):
+    ok = sorted(r[2] for r in rows if r[1] == WEB_OK)
+    if not ok:
+        return None
+    n = len(ok)
+    return ok[n // 2] if n % 2 else (ok[n // 2 - 1] + ok[n // 2]) / 2.0
+
+
+def _web_counts(key, now=None):
+    """(总数, 成, 断流, 连不上, 假前门, 中位耗时秒 or None) —— 判定的唯一口径。"""
+    rows = _web_rows(key, now)
+    n = len(rows)
+    ok = sum(1 for r in rows if r[1] == WEB_OK)
+    stall = sum(1 for r in rows if r[1] == WEB_STALL)
+    refused = sum(1 for r in rows if r[1] == WEB_REFUSED)
+    badgw = sum(1 for r in rows if r[1] == WEB_BADGW)
+    med = _web_median_ms(rows)
+    return n, ok, stall, refused, badgw, (None if med is None else med / 1000.0)
+
+
+def _web_verdict(key, now=None):
+    """把真实转发的账换算成一句人话: (代码, 文字, 明细)。
+
+    门槛为什么这么定: 这条链路是**时好时坏**, 一次成功说明不了什么, 一次失败也
+    说明不了什么, 所以按窗口内的**成功占比**分档, 而不是"最后一条成没成"。
+    样本不足 3 条时不下结论 —— 装机后第一次点开页面就被判"打不开"是冤枉。
+    """
+    n, ok, stall, refused, badgw, med = _web_counts(key, now)
+    last = ('%.1f 秒' % med) if med is not None else '—'
+    if n == 0:
+        return ('unknown', '还没实测', '最近 %d 分钟没有真实网页请求' % int(_WEB_WINDOW / 60))
+    rate = float(ok) / n
+    if ok == 0:
+        return ('down', '打不开',
+                '%d 次全失败: 连不上 %d · 断流 %d · 假前门 %d' % (n, refused, stall, badgw))
+    if n < _WEB_MIN_SAMPLES:
+        return ('few', '样本还少', '最近只跑了 %d 次（成 %d），暂不下结论' % (n, ok))
+    if rate >= 0.8:
+        return ('good', '能打开', '最近 %d 次成 %d · 中位 %s' % (n, ok, last))
+    if rate >= 0.5:
+        # 措辞对着账走: 这一格现在唯一的职责是说实话。
+        # 失败主要发生在握手阶段(refused)却说"常断流"，等于把用户往错误的方向上支使
+        # (断流→刷新两下就好；连不上→多半是整条链路的事)。
+        # 计数一律用"连不上"而不是"502": 502 是浏览器上看到的结果, 连不上才是原因,
+        # 明细里再说一次 502 会让人以为有两种不同的故障。
+        lab = max((('断流', stall), ('连不上', refused), ('假前门', badgw)),
+                  key=lambda x: x[1])[0]
+        return ('slow', '能打开，但常%s' % lab,
+                '最近 %d 次成 %d · 断流 %d · 连不上 %d · 假前门 %d · 中位 %s'
+                % (n, ok, stall, refused, badgw, last))
+    return ('flaky', '时通时断',
+            '最近 %d 次只成 %d · 连不上 %d · 断流 %d · 假前门 %d' % (n, ok, refused, stall, badgw))
+
+
+def _web_status(key, now=None):
+    """/api/status 与面板用的一等公民指标: 最近 3 分钟**真实转发**的结论。"""
+    n, ok, stall, refused, badgw, med = _web_counts(key, now)
+    code, text, detail = _web_verdict(key, now)
+    return {'code': code, 'text': text, 'detail': detail, 'n': n, 'ok': ok,
+            'stall': stall, 'refused': refused, 'badgw': badgw,
+            'median_ms': (None if med is None else int(med * 1000)),
+            'window': int(_WEB_WINDOW)}
+
+
+def _web_dl_budget(key, base=None, now=None):
+    """这次建连最多等多久 —— 用真实转发的账来定, 不再拍一个死数。
+
+    · 最近成功的那几发本身就要 6~13 秒(本机 16:43 实测), 还按 8 秒一刀切就会把
+      "再等两三秒就轮到刚验活的通道"那一批直接判死, 浏览器只收到一句 502;
+      所以按实测中位给两倍余量, 上限 _CONNECT_DEADLINE_MAX。
+    · 反过来, 窗口内几乎全灭时**不要**把预算抬到 20 秒: 那正是链路拥塞的时候,
+      每条请求都等满 20 秒等于自己压自己(_prescan / hot_refresh 记过同一个坑),
+      8 秒到点撒手、把带宽留给后台重测才对。
+    """
+    base = _CONNECT_DEADLINE if base is None else base
+    rows = _web_rows(key, now)
+    med = _web_median_ms(rows)
+    out = base
+    if med is not None:
+        out = max(base, min(_CONNECT_DEADLINE_MAX, med / 1000.0 * 2.0))
+    n = len(rows)
+    fail = sum(1 for r in rows if r[1] != WEB_OK)
+    if n >= 4 and fail and float(fail) / n >= 0.8:
+        out = min(out, base)
+    return out
+
+
+def _direct_is_dead(key='github', now=None):
+    """后台那条"绕开狐径直连 github"的探测刚说过不通 —— 就别把预算押在它身上。
+
+    判据只用**新鲜**的探测结果(_DIRECT_PROBE_FRESH 秒内), 过期当"不知道",
+    保持老行为去赌一把兜底: 那条路本来就是"和没装本程序一样"的退路。
+    """
+    if now is None:
+        now = time.time()
+    if _DIRECT_OK[0] is not False:
+        return False
+    return (now - (_DIRECT_OK[1] or 0.0)) <= _DIRECT_PROBE_FRESH
+
+
+# ------------------------------------------------------- 断流 IP 的账(和握手失败分开)
+# 【2026-10-26 三点整改·②】
+# _FAIL_CNT 记的是"握手/建连失败", 一次失败降一名、几次失败靠边站, 这个口径没问题。
+# 但"连上了、TLS 也做完了、正文下到一半死掉"是**另一回事**: 这种 IP 在 _FAIL_CNT 里
+# 一分钱不欠(握手确实成功了), 于是体检名次照旧靠前、抢连一抢就赢, 赢完浏览器就转圈。
+# 本机 2026-10-26 实测的两发就是这样: 收到 229KB / 278KB 之后断流。
+# 这里单独记一本账, 只用来**降权**和**让它从池子里下岗**, 不学假前门那样拉黑 15 分钟
+# —— 它是时好时坏, 拉黑太狠会把仅有的几个候选也清空(2026-10-25 记过"池子被清空要等
+#  5 分钟才补上人"的坑)。
+_STALL = {}                # ip -> [(时刻, 那次搬了多少字节), ...]
+_STALL_LOCK = threading.Lock()
+_STALL_WINDOW = 300.0      # 5 分钟内的断流还算数
+_STALL_MIN_BYTES = 4096    # 不到 4KB 就断 = 根本没开始传, 比半途断流更差, 权重加倍
+_STALL_DEMOTE_RANK = 1     # 有过一次断流就开始降权
+_STALL_DROP_POOL = 2       # 窗口内两次断流 = 请出候选池(下一轮体检还会把它捞回来)
+
+
+def _stall_note(ip, nbytes=0, now=None):
+    if not ip:
+        return 0
+    if now is None:
+        now = time.time()
+    with _STALL_LOCK:
+        lst = [x for x in _STALL.setdefault(ip, []) if now - x[0] <= _STALL_WINDOW]
+        lst.append((now, int(nbytes or 0)))
+        _STALL[ip] = lst
+        return len(lst)
+
+
+def _stall_rank(ip, now=None):
+    """这个 IP 最近断流了几次(顺手把过期账剪掉)。用来和 _fail_rank 一起排候选。"""
+    if not ip:
+        return 0
+    if now is None:
+        now = time.time()
+    with _STALL_LOCK:
+        lst = _STALL.get(ip)
+        if not lst:
+            return 0
+        keep = [x for x in lst if now - x[0] <= _STALL_WINDOW]
+        if keep:
+            _STALL[ip] = keep
+        else:
+            _STALL.pop(ip, None)
+        return len(keep)
+
+
+def _stall_bytes(ip, now=None):
+    """最近一次断流时搬了多少字节(0 = 正文压根没来)。没账给 -1。"""
+    if now is None:
+        now = time.time()
+    with _STALL_LOCK:
+        lst = [x for x in (_STALL.get(ip) or []) if now - x[0] <= _STALL_WINDOW]
+    return lst[-1][1] if lst else -1
+
+
+def _stall_clear(ip):
+    with _STALL_LOCK:
+        _STALL.pop(ip, None)
 
 
 # --------------------------------------------------------------- IP 寿命台账
@@ -1608,10 +1838,16 @@ def diag_text(redact=True):
     last = time.strftime('%m-%d %H:%M:%S', time.localtime(ts)) if ts else '还没体检过'
     raw_good, _ = HEALTH_RAW.snapshot()
     pages_good, _ = HEALTH_PAGES.snapshot()
-    head = ('狐径体检 v%s | IPv4 可用 %d/%d | IPv6 可用 %d/%d | raw 可用 %d/%d | '
+    # 【2026-10-26 三点整改·③】这段文本是用户复制外发给我看的, 主语必须是"打不打得开"。
+    # 以前这里只有"可用 N/M", 而 2026-10-26 实测过"可用 6/50 + 6 发 5 个 502"同时成立,
+    # 光看 IP 数会把"坏了"读成"在干活"。
+    _wv = _web_verdict('github')
+    head = ('狐径体检 v%s | 网页实测 %s(%s) | IPv4 可用 %d/%d | IPv6 可用 %d/%d | '
+            'raw 可用 %d/%d | '
             'pages 可用 %d/%d | 表源 %s | 最快 %s | 系统代理 %s | 手动IP %s | '
             '上次体检 %s | 已运行 %d 分钟'
-            % (APP_VERSION, len(v4), len(all4), len(v6), len(all6),
+            % (APP_VERSION, _wv[1], _wv[2],
+               len(v4), len(all4), len(v6), len(all6),
                len(raw_good), len(CANDIDATE_IPS_RAW_ALL),
                len(pages_good), len(CANDIDATE_IPS_PAGES_ALL),
                _META_SOURCE[0] or '未同步(用内置表)', fastest,
@@ -1974,11 +2210,13 @@ def loss_of(ip):
 
 
 # ── 面板「线路体检」每一行的数据（全部来自真实体检结果，不做任何估算）──
-def _line_row(host, note, good, total, status=None, strong=None):
+def _line_row(host, note, good, total, status=None, strong=None, key=''):
     n = len(good or [])
     fastest = min([m for _i, m in good]) if good else None
     # strong = 近 _FRESH_WINDOW 秒**真跑通过一次请求**的个数；None = 这一池不跑 HTTP
     # (raw/pages 池拿 GET / 必然不是 2xx，按设计只验证书，所以不给这个口径)。
+    # 【2026-10-26 三点整改·③】再挂一份"网页实测"—— 这一行的红绿以后由它说话。
+    web = _web_status(key) if key else None
     if status is None:
         if n == 0:
             status = 'bad'
@@ -1992,8 +2230,12 @@ def _line_row(host, note, good, total, status=None, strong=None):
             status = 'warn'
         else:
             status = 'ok'
+        # 体检给的是绿灯、真实转发却全灭/时通时断 —— 以用户感知为准往下压。
+        # 反过来**不往上抬**: 网页账是"最近有人访问过"才有, 没人访问时不该抢答"通"。
+        if web and web['code'] in ('down', 'flaky', 'slow'):
+            status = 'bad' if web['code'] == 'down' else 'warn'
     return {'host': host, 'note': note, 'n': n, 'total': total,
-            'strong': strong,
+            'strong': strong, 'web': web,
             'fastest': (int(fastest) if fastest is not None else None),
             'status': status}
 
@@ -2006,11 +2248,11 @@ def lines_status():
     v4 = [ip for ip in candidate_list() if ':' not in ip]
     return [
         _line_row('github.com', '主站（codeload.github.com 同池）', good, len(v4),
-                  strong=len(HEALTH.strong())),
+                  strong=len(HEALTH.strong()), key='github'),
         _line_row('raw / objects / avatars / camo', 'raw 文件、发布附件、头像',
-                  raw_good, len(CANDIDATE_IPS_RAW_ALL)),
+                  raw_good, len(CANDIDATE_IPS_RAW_ALL), key='raw'),
         _line_row('github.io', 'GitHub Pages（user.github.io）',
-                  pages_good, len(CANDIDATE_IPS_PAGES_ALL)),
+                  pages_good, len(CANDIDATE_IPS_PAGES_ALL), key='pages'),
         _line_row('api.github.com', '未接管（保持直连）', [], 0, status='off'),
     ]
 
@@ -2070,6 +2312,14 @@ def feedback_text():
         % (int(_FRESH_WINDOW), _strong_n, len(good),
            '' if _strong_n or not good
            else '  ← 池子里没有一个近期答过话, 现在打开页面只能靠直连兜底'),
+        # 【2026-10-26 三点整改·②③】上面两行都是"体检"口径, 这一行才是用户体感:
+        # 最近 3 分钟**真实转发**的结局(成/断流/502/假前门)。以后用户贴给我看的
+        # 第一段就该读这句, 不用再靠"可用多少个 IP"猜。
+        '网页实测(真实转发): %s —— %s' % _web_verdict('github')[1:3],
+        '断流过 2 次以上的 IP(已从池子请出): %s' % (
+            ', '.join('%s×%d' % (ip, _stall_rank(ip))
+                      for ip in sorted(_STALL, key=lambda x: -_stall_rank(x))
+                      if _stall_rank(ip) >= _STALL_DROP_POOL) or '无'),
         '可用清单(前 10): %s' % (', '.join(
             '%s(%dms%s)' % (i, m, {'http': '', 'tls': ', 仅证书', None: ', 证据已出窗'}
                             [d.get('tier')])
@@ -2876,7 +3126,11 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         for x in _hot[:2]:
             cand.append(x)
         rest = [x for x in pool.candidates()[:24] if x not in cand]
-        rest.sort(key=lambda ip: _fail_rank(ip))   # 连着失败的往后靠
+        # 【2026-10-26 三点整改·②】排序把两本账一起算: _fail_rank 是"握手/建连失败",
+        # _stall_rank 是"连上了但正文搬不动/半途断流"。老写法只看前者, 于是那种
+        # "TCP 0.1 秒赢下抢连、正文一个字节不来"的 IP 永远欠不到账, 每轮都抢赢、
+        # 每次都把浏览器吊在半路(本机实测 229KB / 278KB 断流那两发就是它)。
+        rest.sort(key=lambda ip: _fail_rank(ip) + _stall_rank(ip))   # 两本账都往后靠
         # 摊到不同网段后再并发抢连: 一段全死还有别的段顶上
         cand += _pick_spread(rest, per_group=2, limit=6)
         for x in _hot[2:]:
@@ -3226,9 +3480,75 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             threading.Thread(target=lambda: hot_refresh(key, pool), daemon=True).start()
         log('%s 候选 IP 全军覆没, 本次退回系统解析' % label)
         trigger_selfheal()
+        # 【2026-10-26 三点整改·① 到点之前先在池里再转两轮, 别立刻撒手】
+        # 现场就是今天下午 16:42 那 6 发里的 5 个 502: 那会儿后台正在全池重测,
+        # 16:43:54 就报出"可用 6/50", 而 13.5 秒成的那一条**再等半秒就轮到刚验活的
+        # 通道** —— 老写法在这里直接清掉 _LAST_GOOD, 转身把剩下的预算押到那条已经
+        # 实测必死的直连上, 等完回一句 502。用户"多点一下刷新就通了"其实是后台
+        # 补上了人, 只是这条请求没等。
+        # 现在: 预算还剩 _CONNECT_RETRY_MIN_LEFT 秒以上就最多再转 _CONNECT_RETRY_ROUNDS
+        # 轮, 每轮先等 _CONNECT_RETRY_BACKOFF 秒让 hot_refresh/自愈把新鲜结论写进来。
+        # 并发仍然只有 _connect_race 那一批(6 个、1.5 秒封顶), 而且有抢连闸门:
+        # 同一个页面的其余 CONNECT 不追加 SYN, 只复用结论 —— 不会把拥塞放大。
+        for _rnd in range(_CONNECT_RETRY_ROUNDS):
+            if self._dl_left() < _CONNECT_RETRY_MIN_LEFT:
+                break
+            time.sleep(min(_CONNECT_RETRY_BACKOFF,
+                           max(0.0, self._dl_left() - 1.2)))
+            _lg = _LAST_GOOD.get(key)
+            if _lg:
+                try:
+                    _sr = socket.create_connection((_lg, port),
+                                                   timeout=min(1.5, max(0.5, self._dl_left() - 0.2)))
+                except OSError:
+                    _fail_note(_lg)
+                    _LAST_GOOD[key] = ''
+                else:
+                    _note_route(key, _lg, sys_ips)
+                    _fail_clear(_lg)
+                    _ip_born(_lg)
+                    _sys_fail_reset(key)
+                    log('%s 全灭后第 %d 轮: 后台补员结论已到, 复用 %s'
+                        % (label, _rnd + 1, _lg))
+                    return _sr, _lg
+            _c2 = [x for x in (list(_hot_get(key)) + cand + list(pool.candidates()))
+                   if x and x not in _tried and not _bad_edge(x)]
+            if not _c2:
+                _c2 = [x for x in (list(_hot_get(key)) + cand) if x and x not in _tried]
+            if not _c2:
+                break
+            sock, ip = self._connect_race(_c2, port, timeout=1.5, max_race=6,
+                                          key=key, label=label)
+            if sock is not None:
+                _note_route(key, ip, sys_ips)
+                _LAST_GOOD[key] = ip
+                _fail_clear(ip)
+                _ip_born(ip)
+                _sys_fail_reset(key)
+                log('%s 全灭后第 %d 轮抢到 %s, 本次用它转发' % (label, _rnd + 1, ip))
+                return sock, ip
+            for dead in _c2[:6]:
+                _fail_note(dead)
+                _hot_drop(key, dead)
         # 连续全灭过就把兜底的等待压到 3 秒(见 _sys_fail_budget 的说明),
         # 单条请求最坏从 ~14 秒降到 ~5 秒, 浏览器不至于整站卡死。
         _budget = _sys_fail_budget(key)
+        # 【2026-10-26 三点整改·① 另一半: 不去等那条实测已经死了的直连】
+        # 后台每 60 秒**绕开狐径**直连 github.com 探一次(_DIRECT_OK), 今天下午它给
+        # 的就是"不通"(我同一时刻手工复现: 直连 443 12 秒超时)。老写法却把剩下的
+        # 预算全押在这条路上 —— 探针 1.5 秒 + 兜底 3~10 秒, 等完仍是一句 502,
+        # 而同样这几秒够候选池再转一轮(上面的轮转就是干这个的)。
+        # 所以: 直连刚探过且不通 → 这一注不押, 干脆失败, 让浏览器立刻重试;
+        #       还没探过 / 探到过 / 探测结果过期 → 保持老行为, 留一条
+        #       "和没装本程序一样"的退路(这条退路本来就不该被我们主动阉掉)。
+        if _direct_is_dead(key):
+            _n0 = _sys_fail_bump(key)
+            log('%s 候选池 %d 轮全灭, 直连实测也不通(%d 秒前刚探过) —— 这次不押直连, '
+                '时间留给后台补员, 浏览器刷新即可(最近 %d 秒内第 %d 次全灭)'
+                % (label, _CONNECT_RETRY_ROUNDS + 1,
+                   int(time.time() - (_DIRECT_OK[1] or 0.0)),
+                   int(_SYS_FAIL_WINDOW), _n0))
+            return None, None
         # 【2026-10-26 修·账要按时间窗记】装机版 12:35~12:38 四分钟里这一句印了
         # 6 次"兜底等了 10.0 秒, 连续第 1 次全灭": 链路是**时好时坏**, 中间任何一条
         # 请求复用通道成功都会把老账本清零, 于是下一次撞死又从头等满 10 秒。
@@ -3319,7 +3639,10 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         # 【2026-10-26 新增·建连总时限】一次建连从进来到"放弃"最多花
         # _CONNECT_DEADLINE 秒。下面所有贵的手(抢连/广撒网/两轮轻探/兜底)
         # 都先看剩余预算, 不够就不做 —— 失败还是失败, 但不再拖到十几二十秒。
-        self._dl_start()
+        # 【2026-10-26 三点整改·①】这个"多久"不再是死数: 按最近真实转发的账调
+        # (见 _web_dl_budget)。当天下午实测到"成功的那几发本来就要 6~13 秒",
+        # 还按 8 秒一刀切, 等于把"再等两秒就通"的请求主动判死、回一句 502。
+        self._dl_start(_web_dl_budget(_pool_key_for(host)))
         # 【2026-10-10 修 声明不符】先卡域名：本代理只转发 GitHub 相关域名。
         # 对外写的是「只接管 GitHub 相关域名、不转发他人流量」，
         # 原来这里的兜底对任何 host 都建隧道，与声明冲突（docs/SECURITY.md 自己也列了这条）。
@@ -3348,9 +3671,14 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         host, _, p = target.partition(':')
         port = int(p or 443)
         self._read_headers()
+        _key = _pool_key_for(host)
+        _t0 = time.time()
         up, used = self._connect(host, port)
+        _conn_ms = (time.time() - _t0) * 1000.0
         if up is None:
             self._send(502, b'Bad Gateway')
+            # 【2026-10-26 三点整改·③】建连就没成 = 用户体感"打不开", 记进网页台账。
+            _web_record(_key, WEB_REFUSED, _conn_ms, 0)
             trigger_selfheal()
             return
         # 【2026-10-24】面板"本次会话"那一格：PAC 命中走候选池 / 退回系统解析各算一次。
@@ -3364,8 +3692,27 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             return
         if used:
             log_conn('%s -> %s' % (host, used))
-        up_err = self._relay(up)
-        if up_err and used:
+        out = self._relay(up)
+        # 【2026-10-26 三点整改·②③】这条隧道到底有没有把页面搬回来, 是网页台账
+        # 唯一的原材料 —— 只有真实转发知道答案, 体检不知道(体检只看 GET / 答不答)。
+        # 耗时按"建连 + 首字节"算: 浏览器等的就是这一段, 隧道后面挂多久是.keep-alive
+        # 的事, 混进来会把中位数拉到几百秒那种没意义的数上去。
+        _web_record(_key, out['kind'], _conn_ms + out['first_ms'], out['bytes_up'])
+        if out['kind'] == WEB_STALL and used:
+            # 断流记**另一本账**: 握手是成功的, _FAIL_CNT 一分钱不欠, 所以必须在这里
+            # 单独记账才降得动它的排序。满 _STALL_DROP_POOL 次才请出池子 —— 它是
+            # 时好时坏, 不像假前门那样必定骗人, 一棒子打死会把仅有的候选清光。
+            # 反过来也不因为"这次成了"就把账清零: 2026-10-26 已经吃过"一成功就清零"
+            # 的亏(见 _SYS_FAIL 的修法), 时好时坏的链路只让账自己按窗口过期。
+            _n = _stall_note(used, out['bytes_up'])
+            log('%s 断流: %s 这次搬了 %d 字节就停了(窗口内第 %d 次), 排序已降权%s'
+                % (host, used, out['bytes_up'], _n,
+                   '' if _n < _STALL_DROP_POOL else ', 请出候选池'))
+            if _n >= _STALL_DROP_POOL:
+                HEALTH.drop(used)
+                _hot_drop(_key, used)
+                trigger_selfheal()
+        if out['kind'] == WEB_BADGW and used:
             log('上游返回 4xx/5xx, 剔除假活 IP %s 并触发自愈' % used)
             HEALTH.drop(used)
             trigger_selfheal()
@@ -3374,7 +3721,11 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         conn = self.connection
         pair = [conn, up]
         up_err = False
+        stalled = False
         _first_up = True
+        bytes_up = 0
+        first_ms = 0.0
+        _t_relay = time.time()
         # 转发阶段由 select 统一管超时, 先把两端 socket 的超时都放宽到同一个空闲
         # 上限: 客户端那端带着 StreamRequestHandler 的 30 秒(self.timeout), 上游
         # 那端还是建连时 create_connection 留下的 5 秒 —— 大附件(raw /
@@ -3389,11 +3740,13 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             while True:
                 r, _, e = select.select(pair, [], pair, RELAY_IDLE_TIMEOUT)
                 if e:
+                    stalled = True
                     break
                 if not r:
                     # 双方都静默满一个空闲上限才收摊, 而且写进日志 ——
                     # 不再像以前那样不声不响地把流掐掉。
                     log('转发空闲超过 %d 秒, 关闭这条连接(对端可能已放弃)' % RELAY_IDLE_TIMEOUT)
+                    stalled = True
                     break
                 stop = False
                 for s in r:
@@ -3402,21 +3755,36 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     except TimeoutError:
                         # 3.10 起 socket.timeout 就是 TimeoutError
                         log('转发等待数据超过 %d 秒, 关闭这条连接' % RELAY_IDLE_TIMEOUT)
+                        stalled = s is up or bytes_up > 0
                         stop = True
                         break
                     except OSError:
+                        stalled = s is up or bytes_up > 0
                         stop = True
                         break
                     # 【2026-10-11 修·嗅探上游首段】上游 IP 若"证书对但被限流/封禁",
                     # 会返回 HTTP 4xx/5xx(典型 400): 这种假活 IP 之前 TCP/TLS 都通,
                     # 代理以为成功转发, 实则用户拿到错误页。首段若是 4xx/5xx 即判死。
+                    # 【2026-10-26 修·判状态位判错了】原来写的是 `code[2:3] in b'45'`
+                    # —— 那是状态码的**第三位**(404 的 4、504 的 4), 于是典型的
+                    # 400 / 500 / 503 全都漏网(本函数注释里点名的"典型 400"恰好是
+                    # 一个都不判)。状态码的类别看**第一位**, 现在按第一位判。
+                    # (说明: 走 CONNECT 的隧道里是 TLS 密文, 这段本来就只 cleartext
+                    #  代理时才会命中, 修它是为了让 badgw 这一档的口径与注释一致。)
                     if _first_up and s is up and data[:5] == b'HTTP/' and len(data) >= 12:
                         code = data[9:12]
-                        if code[:2].isdigit() and code[2:3] in b'45':
+                        if code[:2].isdigit() and code[:1] in (b'4', b'5'):
                             up_err = True
                             stop = True
                             break
-                    if s is up:
+                    if s is up and data:
+                        if _first_up:
+                            # 【2026-10-26 三点整改·③】首字节多久来 —— 浏览器"转圈"
+                            # 的那一段就是这个数, 网页台账的耗时按它算(不含 keep-alive)。
+                            first_ms = (time.time() - _t_relay) * 1000.0
+                        _first_up = False
+                        bytes_up += len(data)
+                    elif s is up:
                         _first_up = False
                     if not data:
                         stop = True
@@ -3440,7 +3808,21 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     s.close()
                 except Exception:
                     pass
-        return up_err
+        # 【2026-10-26 三点整改·②③】这条隧道的结局 —— 网页台账和断流账都从这里取。
+        #   badgw  上游回 4xx/5xx(假前门)
+        #   ok     搬过正文且不是我们自己等到超时/被断
+        #   stall  **其余全部**: 一个字节都没来(握手通、正文死的典型样子),
+        #          或搬了一半被超时/OSError 掐断(本机实测 229KB / 278KB 那两发)
+        # 为什么"没搬成数据"也算 stall 而不算 refused: 建连是成功的, 失败发生在
+        # 正文阶段 —— 这正是"体检可用 6/50、网页却打不开"那段时间的真实形状。
+        if up_err:
+            kind = WEB_BADGW
+        elif bytes_up > 0 and not stalled:
+            kind = WEB_OK
+        else:
+            kind = WEB_STALL
+        return {'kind': kind, 'bytes_up': bytes_up, 'first_ms': first_ms,
+                'stalled': stalled, 'up_err': up_err}
 
 
 class ProxyServer(socketserver.ThreadingTCPServer):
@@ -5555,9 +5937,12 @@ details.logwrap[open]>summary:before{transform:rotate(90deg)}
 
   <!-- ② 4 个数字卡 -->
   <section class="stats">
-    <div class="stat"><div class="k">实测可用</div>
-      <div class="v" id="stIp">— <small>/ —</small></div>
-      <div class="d" id="stIpD">近期真跑通过一次请求的 IP</div></div>
+    <!-- 【2026-10-26 三点整改·③】第一张卡从"体检可用 IP 数"换成"网页实测"：
+         最近 3 分钟浏览器真实请求的结局。老口径"可用 31/50"讲的是握手，用户问的是
+         "仓库能不能打开"，本机实测两个口径可以同时对立，所以把握手数降成明细。 -->
+    <div class="stat"><div class="k">网页实测</div>
+      <div class="v" id="stWeb">—</div>
+      <div class="d" id="stWebD">最近 3 分钟真实请求，不是体检</div></div>
     <div class="stat"><div class="k">接管域名</div>
       <div class="v" id="stHosts">— <small>个</small></div>
       <div class="d" id="stHostsD">含 *.github.io</div></div>
@@ -5853,31 +6238,33 @@ function paintStatus(d){
   $('ip').textContent=d.ip||'暂无可用 IP';
   $('ms').innerHTML=(d.ms==null)?'— <small>ms</small>':(d.ms+' <small>ms</small>');
 
-  /* 数字卡 */
+  /* 数字卡 —— 【2026-10-26 三点整改·③】第一张卡 = 网页实测(真实转发), 体检可用数
+     降为明细。理由写在 logs 里那份现场: "可用 6/50"的同一分钟, 6 发里 5 发 502。 */
   var okN=(d.good_n==null)?0:d.good_n, allN=d.total_n;
-  /* 【2026-10-24 改口径】大数字改成"实测成过"的个数 —— 近 90 秒真发过一次请求
-     并拿到 2xx/3xx 的 IP。原来这里显示的是 good_n(证书验过就算), 实测两者能差到
-     31 vs 1, 用户看着"可用 31 个"却打不开页面。分母仍是候选总数。 */
+  /* 【2026-10-24 改口径】大数字原本这里是"实测成过"的个数 —— 近 90 秒真发过一次请求
+     并拿到 2xx/3xx 的 IP。因为 good_n(证书验过就算)和它能差到 31 vs 1。 */
   var strongN=(d.good_strong_n==null)?okN:d.good_strong_n;
   var tn=d.tier_n||{};
-  $('stIp').innerHTML=strongN+' <small>/ '+(allN==null?'—':allN)+'</small>';
-  var delta='';
-  var pts=HIST.points||[];
-  if(pts.length>=2){
-    var a=pts[pts.length-1].ok, b=pts[pts.length-2].ok;
-    if(a!=null&&b!=null){
-      var dv=a-b;
-      delta='比上一轮 '+(dv>0?'+':(dv<0?'':'±'))+dv;
-      $('stIpD').className='d'+(dv>0?' up':(dv<0?' down':''));
+  var w=(d.web||{}).github||{};
+  var wcls=(w.code==='good')?'d up':((w.code==='down'||w.code==='flaky'||w.code==='slow')?'d down':'d');
+  var wv=$('stWeb'), wd=$('stWebD');
+  if(!wv||!wd){/* 老面板模板没这两格就什么都不画, 别让 JS 抛异常把后面整段带崩 */}
+  else{
+    wv.textContent=w.text||'还没实测';
+    var delta='';
+    var pts=HIST.points||[];
+    if(pts.length>=2){
+      var a=pts[pts.length-1].ok, b=pts[pts.length-2].ok;
+      if(a!=null&&b!=null){var dv=a-b;delta=' · 比上一轮 '+(dv>0?'+':(dv<0?'':'±'))+dv;}
     }
-  }else{$('stIpD').className='d';}
-  if(strongN===0&&okN>0){
-    /* 一个近期答过话的都没有 —— 这一格必须显眼, 别用绿色糊过去 */
-    $('stIpD').className='d down';
-    $('stIpD').textContent='池里 '+okN+' 个都没近期答过话(仅证书 '+(tn.tls||0)+' 个)·现在只能靠直连兜底';
-  }else{
-    $('stIpD').textContent=delta?('实测成过 '+strongN+' · '+(tn.tls||0)+' 个仅验证书 · '+delta)
-      :('实测成过 '+strongN+' · '+(tn.tls||0)+' 个仅验证书 · 每 5 分钟体检一次');
+    wd.className=wcls;
+    wd.textContent=(w.detail||'最近 3 分钟没有真实网页请求')
+      +' · 体检可用 '+strongN+'/'+(allN==null?'—':allN)
+      +'('+(tn.tls||0)+' 个仅验证书)'+delta;
+    if(strongN===0&&okN>0){
+      wd.className='d down';
+      wd.textContent='池里 '+okN+' 个都没近期答过话 · '+esc(w.text||'')+'，只能靠兜底';
+    }
   }
 
   var hosts=(d.pac_hosts||[]).length+1;   // +1 = *.github.io 这一组
@@ -6057,9 +6444,12 @@ function paintLines(d){
     var sub;
     if(r.status==='off'){sub=r.note||'未接管（保持直连）';}
     else{
-      sub='可用 '+r.n+'/'+r.total;
+      /* 【2026-10-26 三点整改·③】这一行的主语换成"网页实测"，握手可用数退到后面。
+         顺序很重要：用户先看能不能打开，再看凭什么。没实测样本时照旧只报体检。 */
+      var ww=r.web||{};
+      sub=(ww.n?(ww.text+'（'+ww.detail+'） '):'')+'体检可用 '+r.n+'/'+r.total;
       if(r.fastest!=null){sub+=' · 最快 '+r.fastest+'ms';}
-      if(r.status==='bad'){sub+=' · 本轮全部超时';}
+      if(r.status==='bad'&&!ww.n){sub+=' · 本轮全部超时';}
     }
     return '<div class="set"><div class="txt"><b>'+esc(r.host)+'</b><span>'+esc(sub)+'</span></div>'
       +'<span class="ctl"><span class="pill '+cls+'"><i></i>'+label+'</span></span></div>';
@@ -6744,6 +7134,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                 # 线路体检: 绕开狐径直连 github 通不通(None = 还没探过)
                 'direct': _DIRECT_OK[0],
                 'direct_age': int(time.time() - _DIRECT_OK[1]) if _DIRECT_OK[1] else None,
+                # 【2026-10-26 三点整改·③】网页实测: 最近 3 分钟**真实转发**的结局。
+                # 这格才是"用户能不能打开"的答案 —— "可用 6/50"是体检数出来的握手
+                # 能通的 IP 数, 本机 2026-10-26 实测两者可以同时对立(可用 6 个、
+                # 6 发 5 个 502)。面板首页第一张卡以后显示它, IP 数退成明细。
+                'web': {k: _web_status(k) for k in ('github', 'raw', 'pages')},
+                'stall_ips': len([ip for ip in _STALL if _stall_rank(ip) > 0]),
                 # 线路测速(2026-10-11): "连得上"和"打得开"是两回事, 把真实下载速度
                 # 也回给面板 —— 走狐径 / 直连各一份, 用户一眼能分出是谁在拖后腿。
                 'speed': {'proxy': dict(_SPEED.get('proxy') or {}),

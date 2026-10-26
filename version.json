@@ -1,13 +1,13 @@
 {
-  "version": "1.2.2",
-  "notes": "",
+  "version": "1.2.3",
+  "notes": "v1.2.3：① 候选池全灭后不再拿剩余时间赌直连（先看后台直连实测，不通就老实报错），并改为先在池里多转两轮；② 半途断流与握手失败分账，断流 IP 排序降权、两次请出池子；③ 面板第一格换成「网页实测」——读最近 3 分钟真实转发的结论，不再是「可用 N/50」。另修 4xx/5xx 假前门判位错误。",
   "exe": {
-    "sha256": "2A61AC277DEA713561F8BD14D7C5E5E94C6D37CA8FE7A1B4F1A8CE186D7D079F",
-    "url": "https://gitcode.com/kele551/FoxPath/releases/download/v1.2.2/FoxPath.exe",
-    "size": 8964755,
+    "sha256": "61D8471B705BFF2F9C70CB40F3115613656A993874DFDB90D0F28E181351A240",
+    "url": "https://gitcode.com/kele551/FoxPath/releases/download/v1.2.3/FoxPath.exe",
+    "size": 8780615,
     "mirrors": [
-      "https://gitee.com/kele551/FoxPath/releases/download/v1.2.2/FoxPath.exe",
-      "https://github.com/kele551/FoxPath/releases/download/v1.2.2/FoxPath.exe"
+      "https://gitcode.com/kele551/FoxPath/releases/download/v1.2.3/FoxPath.exe",
+      "https://github.com/kele551/FoxPath/releases/download/v1.2.3/FoxPath.exe"
     ]
   }
 }
