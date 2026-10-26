@@ -19,7 +19,9 @@ import os
 import tempfile
 import time
 
-SRC = r"F:\Harness\projects\狐径\repo\github_direct.py"
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+SRC = os.path.join(REPO, "github_direct.py")      # 跟着仓库走，换台机器也能跑（同 test_sys_wins.py）
 WANT = {"startup_proxy", "_write_run_mark", "_take_run_mark"}
 
 FAILS = []
