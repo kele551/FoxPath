@@ -1364,8 +1364,13 @@ def hot_loop():
                     log('空闲期换岗: %s 已撑 %d 秒(基准 %d 秒), 让位给热备 %s'
                         % (cur, int(_ip_age(cur)), int(_avg_life()), alt[0]))
                 else:
-                    _LAST_GOOD[key] = ''
-                    log('空闲期换岗: %s 已撑 %d 秒但暂时没有新鲜热备, 下次转发重新抢连'
+                    # 【2026-10-25 二修·别空手交枪】
+                    # 原来这里把 _LAST_GOOD 清空, 但热备池经常是空的(本机 21:20 日志:
+                    # "已撑 52 秒但暂时没有新鲜热备, 下次转发重新抢连")。清空之后下一次
+                    # 请求要从零发现通道, 先吃 4~10 秒全灭 —— 用户体感就是"刚才还能开,
+                    # 现在又慢"。换成: 没有替补就继续记着它, 让下面 2 秒试连/抢连
+                    # 在真死的时候自然淘汰; 空闲期不再主动制造空窗。
+                    log('空闲期换岗: %s 已撑 %d 秒, 暂无新鲜热备, 先继续用着它'
                         % (cur, int(_ip_age(cur))))
         except Exception:
             pass
@@ -1538,6 +1543,7 @@ _LAST_ACT = [0.0]
 
 _log_q = queue.Queue()
 _START_TS = [0.0]          # 进程启动时刻, 体检日志里用它显示"已运行多久"
+_BOOT_DIRTY = [None]       # 上次没正常退出留下的现场(见 startup_proxy)，没有戳就是 None
 
 
 # ── 启动阶段绝不弹模态对话框(★★ 2026-10-09 线上事故的加固)──────────────────
@@ -1618,6 +1624,10 @@ def _data_dir():
 DATA_DIR = _data_dir()
 LOG_FILE = os.path.join(DATA_DIR, 'foxpath.log')
 BACKUP_FILE = os.path.join(DATA_DIR, 'proxy-backup.json')
+# 2026-10-26 开机态自愈：起来就盖一个"我在跑"的戳，正常退出（on_exit）撤掉。
+# 戳还在 = 上次进程没走还原就没了（被任务管理器结束 / 断电 / 重启），
+# 下次启动据此说明"注册表里那条 PAC 是上次留下的"，而不是让用户自己猜。
+RUN_MARK_FILE = os.path.join(DATA_DIR, 'running.json')
 LOG_MAX = 512 * 1024
 LOG_TAIL_BYTES = 128 * 1024   # 超过上限时保留的尾部**字节数**(审查 M-9: 不再按行)
 LOG_PANEL_LINES = 200      # 面板 /api/status 只回尾部这么多行
@@ -2187,7 +2197,7 @@ class Health(object):
         # raw.githubusercontent.com 的根路径必然返回 400，用它判死会误杀好 IP）
         self.http_path = http_path
 
-    def _probe(self, ip, timeout=3.0):
+    def _probe(self, ip, timeout=3.0, http_timeout=2.0):
         t0 = time.time()
         try:
             raw = socket.create_connection((ip, 443), timeout=timeout)
@@ -2222,7 +2232,7 @@ class Health(object):
                 try:
                     if self.http_path is None:
                         raise _SkipHttp()
-                    s.settimeout(2.0)
+                    s.settimeout(http_timeout)
                     s.sendall(('GET %s HTTP/1.1\r\nHost: %s\r\n'
                                % (self.http_path, self.sni)).encode('ascii') +
                               b'User-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n')
@@ -2656,10 +2666,19 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         # 这里按台账算寿命: 用到 80% 就**趁它还活着主动让位**给热备池里的新鲜 IP。
         # 换是零成本的 —— 反正都是同域名同端口, 浏览器完全感知不到。
         if cur and _ip_expiring(cur):
-            avg = _avg_life()
-            log('预防性换 IP: %s 已撑 %d 秒(这类 IP 平均撑 %d 秒), 趁它还通着先让位'
-                % (cur, int(_ip_age(cur)), int(avg)))
-            cur = ''
+            # 【2026-10-25 二修·没有替补就别主动让位】
+            # 原来只要"用过 80% 寿命"就无条件把 cur 清掉, 可热备池经常是空的
+            # (本机 21:20 日志: 20.26.156.215 已撑 52 秒但暂时没有新鲜热备,
+            #  下次转发重新抢连)。清掉之后下一次请求要重新发现通道, 常常先吃
+            # 4~10 秒全灭 —— 用户体感就是"刚才还能打开, 现在又慢"。
+            # 现在只有热备里真有没过期的替补才换; 没有就继续用这个还活着的,
+            # 真死了由下面 2 秒试连/抢连自然淘汰。
+            _alt = [x for x in _hot_get(key) if not _ip_expiring(x)]
+            if _alt:
+                avg = _avg_life()
+                log('预防性换 IP: %s 已撑 %d 秒(这类 IP 平均撑 %d 秒), 趁它还通着先让位'
+                    % (cur, int(_ip_age(cur)), int(avg)))
+                cur = ''
 
         # 系统解析(直连)想进名单, 得先拿出"真能传数据"的证据 ——
         # 抢连比的是 TCP 握手快慢, 而 20.205.243.166 握手只要 0.12s(全场最快)、
@@ -2677,17 +2696,49 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             if x and x not in cand:
                 cand.append(x)
         # 热备池里的 IP 是 20 秒内刚验过的(体检名次可能已经过期 5 分钟)
-        for x in _hot_get(key):
-            if x not in cand:
-                cand.append(x)
+        # 【2026-10-25 四修·热备别把抢连名单占满】
+        # 原来热备 8 个全塞在候选最前面, 而抢连/轻探只看 cand[:6] ——
+        # 热备里只要死得多一点, 池子里明明有活的也轮不上, 当场"候选全军覆没"。
+        # 现在热备只先放 2 个(够快), 剩下让给池内名次, 多出来的热备排到后面。
+        _hot = [x for x in _hot_get(key) if x not in cand]
+        for x in _hot[:2]:
+            cand.append(x)
         rest = [x for x in pool.candidates()[:24] if x not in cand]
         rest.sort(key=lambda ip: _fail_rank(ip))   # 连着失败的往后靠
         # 摊到不同网段后再并发抢连: 一段全死还有别的段顶上
         cand += _pick_spread(rest, per_group=2, limit=6)
+        for x in _hot[2:]:
+            cand.append(x)
+        # 【2026-10-25 四修·池子被失败清空时，从全表直接补人】
+        # 每条全灭都会把 cand[:6] 从池子里 drop 掉。浏览器一开页就是十几条并发,
+        # 碰上线路抽风, 一两轮就能把 22 个"可用"全清光 —— 而重新体检要等 5 分钟。
+        # 本机 21:56 就是这样: 日志一路"候选 IP 全军覆没", 可同一秒手动按 IP 测
+        # 20.27.177.113 / 20.199.39.232 / 20.200.245.247 全是 200, 1.2~2.1 秒。
+        # 候选少于 8 个时从全表按网段补齐, 让轻探/抢连始终有真人可试, 不再等体检。
+        # 【2026-10-25 四修补】只数"池外新血": 热备哪怕挂着 8 个, 也可能全是死的,
+        # 池子被清空时 len(cand) 照样够 8, 原来就漏补了。现在按非热备候选计数。
+        _hset = set(_hot)
+        if len([x for x in cand if x not in _hset]) < 8:
+            try:
+                _full = (candidate_list() if key == 'github'
+                         else CANDIDATE_IPS_RAW_ALL if key == 'raw'
+                         else CANDIDATE_IPS_PAGES_ALL)
+            except Exception:
+                _full = []
+            for _x in _pick_spread([x for x in _full if x not in cand],
+                                   per_group=2, limit=12):
+                cand.append(_x)
         # 同样把"寿命将尽"的从候选里剔掉 —— 否则刚让它让位、转头又从热备/名次里
         # 把它捡回来, 预防就白做了。全都要过期时才不挑食(总得有个能连的)。
         young = [x for x in cand if not _ip_expiring(x)]
         if young:
+            # 【2026-10-25 二修·在用通道兜底】寿命将尽的都剔掉之后, 如果当前在用的
+            # 那个 IP 被剔掉了, 但它其实还连着, 就把它留在最前面 —— 抢连/轻探都只看
+            # 名单前几个, 放队尾等于没放。否则一旦"年轻"的候选恰好全是死的(常见:
+            # 刚换过 IP, 新名次还没实测), 抢连里连一个能用的都没有, 白白走一遍全灭
+            # 再退回系统解析。它真死了会在下面 2 秒/4 秒里被淘汰, 不会占着位子。
+            if cur and cur in cand and cur not in young:
+                young.insert(0, cur)
             cand = young
 
         # 【2026-10-24 新增·改法② 快速失败】
@@ -2705,7 +2756,14 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             _strong = [x for x in cand
                        if pool.tier_of(x)[0] == 'http'
                        and _now - pool.tier_of(x)[1] <= _FRESH_WINDOW]
-            if not _strong and not any(_kbps_of(x) for x in cand):
+            # 【2026-10-25 三修·"有台账"不等于"有快的"】
+            # 原来只要任意一个候选有吞吐记录就不进 fast, 可今晚实测池内台账是
+            # 22~43 KB/s —— 远低于 _KBPS_DIRECT_MIN(60), 根本不足以让它直连,
+            # 于是又回到"按握手抢连", 挑中握手快、正文不来的 IP, 用户就是打不开。
+            # 现在只有真有 ≥60 KB/s 的证据才算"有米下锅"; 否则照样轻探一轮,
+            # 用 GET / 的 2xx/3xx 找出此刻真能吐页面的那一个。
+            if not _strong and not any((_kbps_of(x) or 0) >= _KBPS_DIRECT_MIN
+                                       for x in cand):
                 fast = True
                 if _fast_log_ok(key):
                     log('%s 候选池近 %d 秒没有一个实测成过、吞吐台账也全过期 —— '
@@ -2773,6 +2831,49 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     _fail_note(_sip)
                     _kbps_forget(_sip)
 
+        # 【2026-10-25 四修·先试"刚验过能吐页面"的那条通道, 失败立刻换轻探】
+        # 抢连只比 TCP 握手快慢。今晚实测 11 个"体检可用"的 IP, 只有 4 个真能把整页跑完
+        # (20.200.245.247 0.86s / 20.27.177.113 1.56s / 48.204.201.5 2.13s /
+        #  20.199.39.232 2.41s), 其余 6 个握手都通、正文一个字节不来。握手快的死 IP
+        # 一抢就赢, 浏览器停在"正在打开…"——这就是用户说的"还是打不开"。
+        # 只要 90 秒内有真答过 2xx/3xx 的证据, 就先给它 1.2 秒直接连; 通了就复用。
+        # 【2026-10-25 再补】试不通时不要接着按握手抢连(那是又一轮抽奖), 直接把 fast
+        # 置真, 走下面的 GET / 轻探重新找一条此刻真能吐页面的; 两条路都走完才退回系统。
+        if not fast:
+            _trust, _trust_ts = '', 0.0
+            if cur and cur not in _tried and not _bad_edge(cur):
+                _t, _tt = pool.tier_of(cur)
+                if _t == 'http' and time.time() - _tt <= _FRESH_WINDOW:
+                    _trust, _trust_ts = cur, _tt
+            if not _trust:
+                for _x in cand:
+                    if _x in _tried or _bad_edge(_x):
+                        continue
+                    _t, _tt = pool.tier_of(_x)
+                    if (_t == 'http' and time.time() - _tt <= _FRESH_WINDOW
+                            and _tt > _trust_ts):
+                        _trust, _trust_ts = _x, _tt
+            if _trust:
+                _tried.add(_trust)
+                try:
+                    _s6 = socket.create_connection((_trust, port), timeout=1.2)
+                except OSError:
+                    _fail_note(_trust)
+                    _hot_drop(key, _trust)
+                    _kbps_forget(_trust)
+                    cand = [x for x in cand if x != _trust]
+                    fast = True
+                else:
+                    _note_route(key, _trust, sys_ips)
+                    _LAST_GOOD[key] = _trust
+                    _fail_clear(_trust)
+                    _ip_born(_trust)
+                    _sys_fail_reset(key)
+                    if _fast_log_ok('trust:' + key):
+                        log('%s 复用刚验过的通道 %s(证据 %d 秒前), 跳过握手抢连'
+                            % (label, _trust, int(time.time() - _trust_ts)))
+                    return _s6, _trust
+
         # 【2026-10-24 新增·fast 时先"实测"再转发】
         # fast 意味着这一池子近 90 秒没有任何一条 HTTP 证据、吞吐台账也全过期。
         # 老做法是直接拿 2 个 IP 做 TCP 抢连 —— 可 TCP 通了不代表页面通：
@@ -2808,13 +2909,36 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 if _x and _x not in _try and _fail_rank(_x) == 0:
                     _try.append(_x)
             if _try and _prescan_take():
+                # 【2026-10-25 四修·一轮问不到就再问一批】
+                # 21:59 冷启动实测: 池里 18/50 "可用", 轻探 6 个只有 1 个答话,
+                # 那个 185.199.x 还在转发途中死掉 —— 于是连吃两分钟"全军覆没",
+                # 而同一分钟手动按 IP 测, 20.29.134.23 / 20.27.177.113 都是 200。
+                # 6 个样本对这条时好时坏的线路来说太小, 一轮问不到并不代表池子空了。
+                # 现在第一轮没人答话就换**没问过**的下一批再问一次(仍然并发、仍然封顶),
+                # 并把第二轮的超时放宽到 2.2 秒 —— 这条线上 TTFB 1.9~2.4 秒的好 IP 不少。
+                _probed = set()
+                _cert = []
                 try:
-                    with ThreadPoolExecutor(max_workers=len(_try)) as _ex:
-                        _pr = dict(zip(_try, _ex.map(lambda x: pool._probe(x, timeout=1.5), _try)))
+                    _batch = _try
+                    for _rnd, _tmo, _hto in ((0, 1.5, 2.0), (1, 2.2, 2.6)):
+                        if not _batch:
+                            break
+                        _probed.update(_batch)
+                        with ThreadPoolExecutor(max_workers=len(_batch)) as _ex:
+                            _pr = dict(zip(_batch, _ex.map(
+                                lambda x, _t=_tmo, _h=_hto: pool._probe(
+                                    x, timeout=_t, http_timeout=_h),
+                                _batch)))
+                        _cert = sorted([(m[0], x) for x, m in _pr.items()
+                                        if m and m[1] == 'http'])
+                        if _cert:
+                            break
+                        if _rnd == 0:
+                            _batch = [x for x in cand if x not in _probed
+                                      and not _bad_edge(x)][:6]
                 finally:
                     _prescan_release()      # 探针批次一结束就交还闸门
-                _cert = sorted([(m[0], x) for x, m in _pr.items()
-                                if m and m[1] == 'http'])
+                _tried.update(_probed)
                 # 池内 IP 优先, 直连垫底(同一把尺子答了话才有资格排进来)
                 _cert.sort(key=lambda t: (1 if t[1] in _sys_now else 0, t[0]))
                 for _ms, _ip in _cert:
@@ -2835,6 +2959,38 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 # 问下来一个都不答话: 回 4xx 的那些已经被 _probe 就地拉黑，
                 # 别再让它们参与下面的抢连(它们握手最快，一抢就赢，赢了就是 400)。
                 cand = [x for x in cand if not _bad_edge(x)] or cand
+                # 【2026-10-25 四修·问过没答话的别挡路】它们 TCP 是通的,
+                # 抢连比的就是握手, 让它们留在前 6 个里 = 必然挑中一个打不开的。
+                # 没试过的排前面, 抢连才有意义。
+                cand = ([x for x in cand if x not in _probed]
+                        + [x for x in cand if x in _probed])
+            elif (pool.checks_http and not _LAST_GOOD.get(key)
+                  and _PRESCAN_BUSY[0]):
+                # 【2026-10-25 四修·别让同一个页面的其它连接盲抢】
+                # 浏览器开一个页就是十几条并发隧道, 而轻探是全局单闸门: 只有抢到闸门
+                # 的那一条能拿到"实测答话"的结论, 其余全按 TCP 握手抢连 —— 抢中的
+                # 偏偏是握手快、正文不来的那种。这里改为**等它的结论**(最多 3 秒),
+                # 结论一出就复用; 轻探结束还没结论再照旧抢连。
+                _wait_until = time.time() + 3.0
+                while time.time() < _wait_until:
+                    time.sleep(0.1)
+                    _lg = _LAST_GOOD.get(key)
+                    if _lg:
+                        try:
+                            _s5 = socket.create_connection((_lg, port), timeout=1.5)
+                        except OSError:
+                            _LAST_GOOD[key] = ''
+                            _fail_note(_lg)
+                            continue
+                        _note_route(key, _lg, sys_ips)
+                        _fail_clear(_lg)
+                        _ip_born(_lg)
+                        _sys_fail_reset(key)
+                        if _fast_log_ok('wait:' + key):
+                            log('%s 等到了同时在跑的轻探结论 %s, 复用它' % (label, _lg))
+                        return _s5, _lg
+                    if not _PRESCAN_BUSY[0]:
+                        break
 
         # 一批并发抢连(6 个): 谁先通就用谁。
         # 不做"分批重试" —— 每多一批就多叠加一轮超时, 实测分批版出现过 16 秒尖峰。
@@ -2847,6 +3003,14 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         sock, ip = self._connect_race(cand, port,
                                       timeout=2.0 if fast else 4.0,
                                       max_race=2 if fast else 6)
+        if sock is None and fast and not _LAST_GOOD.get(key) and len(cand) > 6:
+            # 【2026-10-25 四修·整段被掐时别只抽两个】
+            # 22:17 实测: 44 个官方 IP 里 TCP:443 只有 3 个还通(其余 SYN 直接丢,
+            # ping 却 0% 丢包), 而轻探那 12 个恰好全在死的里面 —— 于是"全军覆没"。
+            # fast + 手里一个可用通道都没有, 说明刚才那一轮证据全废了; 这时候
+            # 再"抽 2 个碰运气"命中率太低。改成广撒网: 前 16 个并发握一次手,
+            # 1.5 秒封顶, 谁先通就用谁(和上面同一套抢连, 只是把网撒宽)。
+            sock, ip = self._connect_race(cand, port, timeout=1.5, max_race=16)
         if sock is not None:
             _note_route(key, ip, sys_ips)
             _LAST_GOOD[key] = ip
@@ -3323,6 +3487,71 @@ def proxy_on():
     except ValueError:
         return False
     return host in ('127.0.0.1', 'localhost') and port == PANEL_PORT
+
+
+# ---------------------------------------------------- 开机态自愈（2026-10-26 巡检固化）
+#
+# 现场（本机 2026-10-26 早上实测）：重启把 FoxPath 连同 atexit 一起带走，注册表里留着
+#   AutoConfigURL=http://127.0.0.1:8788/pac、ProxyEnable=1，而 8787/8788 一个都没人听。
+#   浏览器还在用缓存的 PAC，于是 github 连到死端口、其它站点正常 —— 用户看到的就是
+#   "github 打不开"，而程序里一行日志都没有（v1.2.2 的还原只挂在 atexit 上）。
+# 再加一条：这台机器上「开机自启」从来没打开过（HKCU\Run 里没有 GitHubDirectFix），
+#   所以每次重启都会重新踩这个坑。
+def _write_run_mark():
+    """盖戳：记下"此刻有一个实例在跑，退出时会负责还原"。"""
+    try:
+        with open(RUN_MARK_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'pid': os.getpid(), 'app': str(APP_VERSION),
+                       'ts': time.time(), 'pac': _pac_url()}, f, ensure_ascii=False)
+    except Exception as e:
+        log('写运行戳失败(不影响加速本身): %s' % e)
+
+
+def _take_run_mark():
+    """读走并删掉上一次的戳；没有戳说明上次是正常退出（或第一次跑）。"""
+    try:
+        if not os.path.exists(RUN_MARK_FILE):
+            return None
+        with open(RUN_MARK_FILE, encoding='utf-8') as f:
+            d = json.load(f)
+        try:
+            os.remove(RUN_MARK_FILE)
+        except Exception:
+            pass
+        return d if isinstance(d, dict) else None
+    except Exception:
+        try:
+            os.remove(RUN_MARK_FILE)
+        except Exception:
+            pass
+        return None
+
+
+def startup_proxy(keep_off):
+    """本次启动对系统代理该做什么 —— 静默/常规两种模式共用一份口径（以前是两段复制粘贴）。"""
+    if keep_off:
+        log('按升级前的状态: 没有开启加速')
+        return
+    if not proxy_on():
+        enable_proxy()
+        return
+    # PAC 已经指向本程序 = 上次开着加速时进程没走到还原
+    if _BOOT_DIRTY[0]:
+        p = _BOOT_DIRTY[0]
+        log('!! 上次进程没有正常退出（被结束任务/断电/重启都是这样）—— 现场: pid=%s 版本=%s 时间=%s；'
+            '系统里留着指向 %s 的 PAC，本次启动已直接接管，不重复写注册表'
+            % (p.get('pid'), p.get('app'),
+               time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p.get('ts') or 0)), _pac_url()))
+    # 总闸可能被安全软件/策略关回 0：PAC 地址还指着我们，proxy_on() 为真，
+    # 老代码就不会再动 ProxyEnable —— 表现同样是"加速看着开着，实际一点没生效"。
+    cur = reg_get(REG_INTERNET, 'ProxyEnable')
+    if str(cur) != '1':
+        reg_set(REG_INTERNET, 'ProxyEnable', 1, 4)
+        notify_proxy_change()
+        log('已补开系统代理总闸 ProxyEnable=1（原来是 %s：PAC 指向本程序但总闸是关的，'
+            '多半被安全软件或组策略改回去了）' % ('(未设置)' if cur is None else cur))
+    if _load_backup() is None:
+        log('注意: 系统代理已指向本程序, 但没有还原备份 —— 退出时会直接清除该 PAC')
 
 
 def _exe_cmd(silent=True):
@@ -6270,6 +6499,9 @@ class PanelHandler(BaseHTTPRequestHandler):
                 'good': good[:10],
                 'enabled': proxy_on(),
                 'autostart': autostart_on(),
+                # 本次启动是不是"接上次的残留"起来的（上次没走还原）。面板暂时只在
+                # 日志里说明，这个字段留给以后的一键反馈/体检用。
+                'dirty_boot': bool(_BOOT_DIRTY[0]),
                 'last': time.strftime('%H:%M:%S', time.localtime(ts)) if ts else None,
                 # 有新版本时给面板一个提示字段(★ 只有远程严格大于本地才算, 2026-10-09)
                 'newver': (str(UPDATE.get('remote') or '')
@@ -6615,13 +6847,19 @@ def _tray_delete_icon(hwnd):
         pass
 
 def safe_quit():
-    """统一的干净退出: 还原系统代理 -> 摘托盘图标 -> 终止进程。"""
+    """统一的干净退出: 还原系统代理 + 撤运行戳 -> 摘托盘图标 -> 终止进程。
+
+    【2026-10-26 修】这里原来自己写了一遍 disable_proxy(), 然后 os._exit(0) ——
+    **os._exit 不走 atexit**, 所以刚加的"撤运行戳"那步(on_exit 里)在干净退出时
+    从来没被执行过: 明明是按面板的「退出并还原」或 /api/quit 正常退的,
+    下次启动照样 dirty_boot=true、照样打「上次进程没有正常退出」—— 等于新功能
+    天天在说谎, 真出事时没人当回事。改成直接复用 on_exit(), 还原代理与撤戳一次做完,
+    两条退出路径(托盘/接口)口径也不会再分叉。
+    """
     try:
-        if proxy_on():
-            log('程序退出, 还原系统代理')
-            disable_proxy()
-    except Exception:
-        pass
+        on_exit()
+    except Exception as e:
+        log('退出前还原异常: %s' % e)
     hwnd = _TRAY_HWND[0]
     if hwnd:
         _tray_delete_icon(hwnd)
@@ -6822,6 +7060,12 @@ def on_exit():
             disable_proxy()
     except Exception:
         pass
+    # 撤掉"我在跑"的戳 —— 走到这里说明还原流程真的执行过了。
+    # 没走到（被结束任务/断电/重启）时戳会留在盘上，下次启动据此说明残留的来历。
+    try:
+        os.remove(RUN_MARK_FILE)
+    except Exception:
+        pass
 
 
 def _enable_dpi_aware():
@@ -6878,6 +7122,9 @@ def main():
         else:
             log('静默模式: 已有实例在运行, 本次直接退出(不动系统代理)')
         return
+
+    # 单实例过了才动这个戳：第二次双击（走上面 return 的那条路）不能把在跑实例的戳吃掉。
+    _BOOT_DIRTY[0] = _take_run_mark()
 
     # 上一次升级留下的状态(用户 2026-10-09 要求: 不要丢状态):
     #   ① 面板上留一行"已自动升级到 vX.Y.Z"; ② 系统代理开关接着用升级前的选择;
@@ -6938,27 +7185,19 @@ def main():
             log('启动预体检失败(将交由 health_loop 稍后补): %s' % e)
     threading.Thread(target=_precheck, daemon=True).start()
 
+    _write_run_mark()                  # 代理与面板都已就位，从这里起"我在跑"这件事有人负责收尾
+
     if '--silent' in args:
         # 静默模式(开机自启用)以前**没有**注册退出还原 —— 这正是"程序关了,
         # PAC 却留在注册表里"的根因。现在两种模式都注册。
         atexit.register(on_exit)
-        if keep_off:
-            log('按升级前的状态: 没有开启加速')
-        elif not proxy_on():
-            enable_proxy()
-        elif _load_backup() is None:
-            log('注意: 系统代理已指向本程序, 但没有还原备份 —— 退出时会直接清除该 PAC')
+        startup_proxy(keep_off)
         log('静默模式, 每 5 分钟自动体检')
         while True:
             time.sleep(60)
     else:
         atexit.register(on_exit)
-        if keep_off:
-            log('按升级前的状态: 没有开启加速')
-        elif not proxy_on():
-            enable_proxy()
-        elif _load_backup() is None:
-            log('注意: 系统代理已指向本程序, 但没有还原备份 —— 退出时会直接清除该 PAC')
+        startup_proxy(keep_off)
         if _AUTO_UPGRADED[0]:
             # 原来开着的面板页每 3 秒轮询一次, 新实例起来后它会自己接上 ——
             # 不再重复开一个浏览器窗口, 免得打断用户。
