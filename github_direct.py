@@ -274,38 +274,76 @@ def _note_route(key, ip, sys_ips):
 # 整个站点卡死。这里记"全灭"的次数: 上一条请求池子和兜底一起死了, 说明
 # **这条链路此刻根本不通**, 下一条兜底时没必要再等满 10 秒 —— 压到 3 秒,
 # 让请求快速失败、让浏览器自己重试; 一旦连上就立刻恢复原来的宽松预算。
-_SYS_FAIL = {}              # key -> (连续全灭次数, 上次全灭的时刻)
+#
+# 【2026-10-26 修·账要按时间窗记, 不能"一连通就清零"】
+# 装机版今天的日志把老写法的漏洞暴露得很清楚(12:35~12:38 四分钟里 6 次):
+#   "连接 github.com 失败: timed out（兜底等了 10.0 秒, 连续第 1 次全灭）"
+# 次次都是"第 1 次"、次次都等满 10 秒。原因是这条线是**时好时坏**而不是全死:
+# 12:37:35 有一条请求"复用刚验过的通道"成功了 —— 按老规矩这一成功就把计数清零,
+# 于是紧接着那几条撞死的请求又各自重新交一遍 10 秒学费(四分钟里白等 60 秒)。
+# 现在改成记**时间戳**: 60 秒窗口内只要还有全灭的账, 预算就是 3 秒; 一次连通
+# 只抹掉最旧的两笔(链路确实在好转), 全抹干净才恢复 10 秒。
+_SYS_FAIL = {}              # key -> [全灭时刻, ...]（只留最近 _SYS_FAIL_WINDOW 秒内的）
 _SYS_FAIL_LOCK = threading.Lock()
-_SHORT_BUDGET_GAP = 30.0    # 上次全灭距今超过这个秒数, 就不算"连续"
+_SYS_FAIL_WINDOW = 60.0     # 记账窗口: 抽风一般持续几分钟, 60 秒内的账都还该起作用
+_SYS_FAIL_HOLD = 20.0       # 一次连通只作废"距今超过 20 秒"的账, 20 秒内的仍然算数
 _SYS_FAIL_SHORT_TIMEOUT = 3.0
 _SYS_FAIL_FULL_TIMEOUT = 10.0
 
 
+def _sys_fail_recent(key, now=None):
+    """窗口内还有几笔全灭的账(0 = 这段时间一直是通的)。顺手把过期的账剪掉。"""
+    if now is None:
+        now = time.time()
+    with _SYS_FAIL_LOCK:
+        lst = _SYS_FAIL.get(key)
+        if not lst:
+            return 0
+        keep = [t for t in lst if now - t <= _SYS_FAIL_WINDOW]
+        if keep:
+            _SYS_FAIL[key] = keep
+        else:
+            _SYS_FAIL.pop(key, None)
+        return len(keep)
+
+
 def _sys_fail_bump(key):
+    """记一笔"刚刚整条链路全灭", 返回窗口内累计的第几笔。"""
     now = time.time()
     with _SYS_FAIL_LOCK:
-        n, ts = _SYS_FAIL.get(key, (0, 0.0))
-        if now - ts > 180:
-            n = 0          # 隔了太久没动静(用户合盖/换网), 别拿旧账吓自己
-        _SYS_FAIL[key] = (n + 1, now)
-        return n + 1
+        lst = [t for t in _SYS_FAIL.get(key, []) if now - t <= _SYS_FAIL_WINDOW]
+        lst.append(now)
+        _SYS_FAIL[key] = lst
+        return len(lst)
 
 
 def _sys_fail_reset(key):
+    """连上了 —— 只作废"距今超过 _SYS_FAIL_HOLD 秒"的陈账, 20 秒内的仍然算数。
+
+    老写法在这里是 `_SYS_FAIL[key] = (0, now)` 直接清零, 于是时好时坏的链路永远
+    攒不起账: 今天 12:35~12:38 四分钟里 6 次"兜底等了 10.0 秒, 连续第 1 次全灭",
+    每一次都是刚被别的一条请求的成功清零过。现在一次成功最多让时间往前翻一页,
+    抹不掉刚刚那次全灭 —— 链路真恢复了(20 秒内没有新的全灭 + 又连通一次)才放宽。
+    """
+    now = time.time()
     with _SYS_FAIL_LOCK:
-        _SYS_FAIL[key] = (0, time.time())
+        lst = [t for t in _SYS_FAIL.get(key, []) if now - t <= _SYS_FAIL_WINDOW]
+        lst = [t for t in lst if now - t < _SYS_FAIL_HOLD]
+        if lst:
+            _SYS_FAIL[key] = lst
+        else:
+            _SYS_FAIL.pop(key, None)
+        return len(lst)
 
 
 def _sys_fail_budget(key):
-    """退回系统解析时最多等多久: 上一条请求已经全灭过了就压短。
+    """退回系统解析时最多等多久: 近期全灭过就压短。
 
-    门槛为什么定"上一次失败过"而不是"连着两次": 记的本来就是**整条链路全灭**
+    门槛为什么定"近期失败过"而不是"连着两次": 记的本来就是**整条链路全灭**
     (池子抢连 + 系统解析一起死)，一次就说明这条路径此刻不通，第二次再去等满
-    10 秒纯属重复交学费。任何一次连上就 `_sys_fail_reset` 恢复宽松预算。
+    10 秒纯属重复交学费。恢复期靠 `_sys_fail_reset` 的衰减逐步放宽。
     """
-    with _SYS_FAIL_LOCK:
-        n, ts = _SYS_FAIL.get(key, (0, 0.0))
-    if n >= 1 and time.time() - ts <= _SHORT_BUDGET_GAP:
+    if _sys_fail_recent(key) >= 1:
         return _SYS_FAIL_SHORT_TIMEOUT
     return _SYS_FAIL_FULL_TIMEOUT
 
@@ -322,6 +360,60 @@ def _fast_log_ok(key, gap=30.0):
             return False
         _FAST_LOG[key] = now
     return True
+
+
+# ------------------------------------------- 建连总时限 + 抢连闸门 (2026-10-26)
+# 【为什么要限总时长】
+# 本机 foxpath.log 12:35~12:38 那段抽风期里，一条打不开的请求要走完
+#   抢连(4 秒) → 广撒网 16 个(1.5 秒) → 两轮轻探(1.5+2.2 / 2.2+2.6) → 兜底(10 秒)
+# 端到端实测 **19.4 秒**才回一句"连不上"(AB 对照脚本 fp_ab_probe.py 第 14 轮)。
+# 浏览器的耐心远短于此：转 20 秒用户就认为"网页打不开"，关掉标签走人。
+# 现在给每次建连一个总预算，走完"最该试的那一手"就到点收摊、明确记一行
+# "建连到点放弃" —— 失败还是失败，但从 20 秒缩到 8 秒以内，用户点一下刷新
+# 就能赶上下一条刚被后台验活的通道。
+_CONNECT_DEADLINE = 8.0
+
+# 【为什么要给抢连上闸门】
+# _prescan 早就是全局单闸门(一轮只允许一批 HTTP 实测)，可**TCP 抢连不是**：
+# 浏览器开一个 GitHub 页面并发十几条 CONNECT，池子恰好没新鲜证据(fast)时，
+# 每条请求各自对 6 个(全灭后广撒网是 16 个)IP 发起握手 —— 一条页面就是
+# 90~250 个并发 SYN，全砸在同一条已经拥塞的国际链路上。10-11 记过的
+# "并发 14 个探测互相挤占带宽"是同一个坑，只是规模这次由浏览器决定。
+# 现在同一个池同时只放**一条**请求做抢连；其余的先等它的结论(最多 _RACE_WAIT
+# 秒，抢到刚验活的通道就复用)，等不到就只单独轻试一个 IP，不再放第二批 SYN。
+_RACE_LOCK = threading.Lock()
+_RACE_BUSY = {}        # key -> 占用时刻(用来识别"占用者挂了没交还")
+_RACE_STALE = 12.0     # 超过这么久没交还就当他已经不在了，闸门必须能自己解开
+_RACE_WAIT = 2.5       # 别人在抢连时，我最多等它的结论这么久
+_RACE_WAIT_SLICE = 0.1
+
+
+def _race_take(key):
+    """占住这个池的抢连名额；已经被别人占着就返回 False(不排队占坑，别拖)。"""
+    now = time.time()
+    with _RACE_LOCK:
+        since = _RACE_BUSY.get(key)
+        if since is not None and now - since < _RACE_STALE:
+            return False
+        _RACE_BUSY[key] = now
+        return True
+
+
+def _race_release(key):
+    with _RACE_LOCK:
+        _RACE_BUSY.pop(key, None)
+
+
+def _race_gate_left(key):
+    """名额什么时候能空出来(给人判断还要不要等); 没人占就是 0。"""
+    now = time.time()
+    with _RACE_LOCK:
+        since = _RACE_BUSY.get(key)
+        if since is None:
+            return 0.0
+        if now - since >= _RACE_STALE:
+            return 0.0
+        return max(0.0, _RACE_STALE - (now - since))
 
 
 # --------------------------------------------------------------- IP 寿命台账
@@ -2566,12 +2658,92 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         except Exception:
             pass
 
-    def _connect_race(self, ips, port, timeout=2.5, max_race=4):
+    # ---- 建连总时限(2026-10-26, 判据见上面 _CONNECT_DEADLINE 的说明) ----
+    def _dl_start(self, budget=None):
+        """给这次建连定一个总时限, 之后每一手都先看还剩几秒。"""
+        self._dl = time.time() + (budget or _CONNECT_DEADLINE)
+
+    def _dl_left(self):
+        """还剩多少秒。没设过预算(老调用、单元桩)就当不限, 行为跟改前一模一样。"""
+        dl = getattr(self, '_dl', 0.0)
+        return 999.0 if not dl else (dl - time.time())
+
+    def _dl_note(self, left, what, label):
+        if _fast_log_ok('dl:' + (label or ''), 15.0):
+            log('%s 建连只剩 %.1f 秒预算, 不够再%s —— 本次到点放弃, '
+                '浏览器可以直接重试(后台还在找通道)' % (label or '代理', left, what))
+
+    def _connect_race(self, ips, port, timeout=2.5, max_race=4, key='', label=''):
+        """带闸门、带总时限的抢连。真正的并发握手在 _connect_race_batch 里。
+
+        两件事(2026-10-26):
+          1) 同一个池同时只放一条请求做整批抢连。抢不到名额的不追加 SYN,
+             先等占用者的结论(最多 _RACE_WAIT 秒, 且不超过自己的预算), 等到
+             就复用那条刚验活的通道; 等不到就只单独轻试名单里第一个 IP。
+          2) 单次握手超时按剩余预算裁剪, 绝不让"4 秒抢连 + 10 秒兜底"叠成
+             十几秒 —— 实测过最长 19.4 秒才回一句连不上。
+        """
+        left = self._dl_left()
+        if left <= 0.3:
+            self._dl_note(left, '抢连', label)
+            return None, None
+        timeout = max(0.6, min(timeout, left - 0.2))
+        if not key:
+            return self._connect_race_batch(ips, port, timeout=timeout,
+                                            max_race=max_race)
+        if _race_take(key):
+            try:
+                return self._connect_race_batch(ips, port, timeout=timeout,
+                                                max_race=max_race)
+            finally:
+                _race_release(key)
+        # ---- 名额被别人占着: 不再放第二批 SYN ----
+        cand = [x for x in ips if x][:max_race]
+        if not cand:
+            return None, None
+        wait = min(_RACE_WAIT, max(0.0, self._dl_left() - 1.0))
+        t_end = time.time() + wait
+        while time.time() < t_end:
+            lg = _LAST_GOOD.get(key)
+            if lg:
+                try:
+                    s = socket.create_connection((lg, port), timeout=1.2)
+                except OSError:
+                    _fail_note(lg)
+                    _LAST_GOOD[key] = ''
+                    break        # 它给的那条也不通, 别再等, 走自己轻试
+                _note_route(key, lg, [])
+                _fail_clear(lg)
+                _ip_born(lg)
+                _sys_fail_reset(key)
+                if _fast_log_ok('shared:' + key, 20.0):
+                    log('%s 复用了同时在跑的抢连结论 %s(没再放第二批握手)'
+                        % (label or key, lg))
+                return s, lg
+            if _race_gate_left(key) <= 0:
+                break            # 占用者已经收手(失败了), 不等了
+            time.sleep(_RACE_WAIT_SLICE)
+        one = cand[0]
+        try:
+            s = socket.create_connection((one, port),
+                                         timeout=min(1.2, max(0.5, self._dl_left() - 0.2)))
+        except OSError:
+            return None, None
+        _note_route(key, one, [])
+        _LAST_GOOD[key] = one
+        _fail_clear(one)
+        _ip_born(one)
+        _sys_fail_reset(key)
+        return s, one
+
+    def _connect_race_batch(self, ips, port, timeout=2.5, max_race=4):
         # 【2026-10-11 修·并发抢连(Happy Eyeballs)】
         # 原来是**串行**试候选: 撞上一个死 IP 就要干等它超时(3s)才换下一个,
         # 前面有几个死 IP 就是几倍超时 —— 实测 github 要 8.15 秒才返回 200。
         # 现在同时对前 N 个候选发起 TCP 连接, 谁先成功就用谁, 其余立刻关掉:
         # 死 IP 自己超时即可, 不再阻塞别人; 活的那个 200ms 就回来了。
+        # (2026-10-26 起这层的超时与并发由外层 _connect_race 按预算/闸门裁好
+        #  再传进来, 这一层本身只管握手, 所以单元桩可以直接压它。)
         ips = [x for x in ips if x][:max_race]
         if not ips:
             return None, None
@@ -2908,7 +3080,10 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             for _x in _sys_now[:1]:
                 if _x and _x not in _try and _fail_rank(_x) == 0:
                     _try.append(_x)
-            if _try and _prescan_take():
+            # 【2026-10-26 补·轻探也要看预算】一轮轻探最坏 1.5+2.0 秒。剩余预算
+            # 连一轮都跑不完就别起跑(注意顺序: 时间不够时不去占 _prescan 的闸门,
+            # 免得把坑占住又跑不完, 让别人干等)。
+            if _try and self._dl_left() >= 3.6 and _prescan_take():
                 # 【2026-10-25 四修·一轮问不到就再问一批】
                 # 21:59 冷启动实测: 池里 18/50 "可用", 轻探 6 个只有 1 个答话,
                 # 那个 185.199.x 还在转发途中死掉 —— 于是连吃两分钟"全军覆没",
@@ -2922,6 +3097,12 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     _batch = _try
                     for _rnd, _tmo, _hto in ((0, 1.5, 2.0), (1, 2.2, 2.6)):
                         if not _batch:
+                            break
+                        # 【2026-10-26 补·到点就不问第二轮】一轮最坏要 _tmo+_hto 秒,
+                        # 预算不够就到此为止 —— 第一轮已经并发问过 6 个, 再撒一批
+                        # 只是把这条请求拖过用户的耐心(装机实测叠到过 19.4 秒)。
+                        if _rnd and self._dl_left() < _tmo + _hto:
+                            self._dl_note(self._dl_left(), '再问第二轮轻探', label)
                             break
                         _probed.update(_batch)
                         with ThreadPoolExecutor(max_workers=len(_batch)) as _ex:
@@ -2971,7 +3152,9 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 # 的那一条能拿到"实测答话"的结论, 其余全按 TCP 握手抢连 —— 抢中的
                 # 偏偏是握手快、正文不来的那种。这里改为**等它的结论**(最多 3 秒),
                 # 结论一出就复用; 轻探结束还没结论再照旧抢连。
-                _wait_until = time.time() + 3.0
+                # 【2026-10-26 补】这一等也受建连总时限约束(留 1.2 秒给自己轻试一手)。
+                _wait_until = min(time.time() + 3.0,
+                                  time.time() + max(0.0, self._dl_left() - 1.2))
                 while time.time() < _wait_until:
                     time.sleep(0.1)
                     _lg = _LAST_GOOD.get(key)
@@ -3002,15 +3185,20 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         # 所以轻探 2 个、2 秒封顶。
         sock, ip = self._connect_race(cand, port,
                                       timeout=2.0 if fast else 4.0,
-                                      max_race=2 if fast else 6)
-        if sock is None and fast and not _LAST_GOOD.get(key) and len(cand) > 6:
+                                      max_race=2 if fast else 6,
+                                      key=key, label=label)
+        if (sock is None and fast and not _LAST_GOOD.get(key) and len(cand) > 6
+                and self._dl_left() > 1.8):
             # 【2026-10-25 四修·整段被掐时别只抽两个】
             # 22:17 实测: 44 个官方 IP 里 TCP:443 只有 3 个还通(其余 SYN 直接丢,
             # ping 却 0% 丢包), 而轻探那 12 个恰好全在死的里面 —— 于是"全军覆没"。
             # fast + 手里一个可用通道都没有, 说明刚才那一轮证据全废了; 这时候
             # 再"抽 2 个碰运气"命中率太低。改成广撒网: 前 16 个并发握一次手,
             # 1.5 秒封顶, 谁先通就用谁(和上面同一套抢连, 只是把网撒宽)。
-            sock, ip = self._connect_race(cand, port, timeout=1.5, max_race=16)
+            # 【2026-10-26 补】这一手要 1.5 秒, 预算不够就别撒 —— 宁可到点放弃,
+            # 也不要为了多一次机会把请求拖进"用户已经关了标签"的那一段。
+            sock, ip = self._connect_race(cand, port, timeout=1.5, max_race=16,
+                                          key=key, label=label)
         if sock is not None:
             _note_route(key, ip, sys_ips)
             _LAST_GOOD[key] = ip
@@ -3041,6 +3229,17 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         # 连续全灭过就把兜底的等待压到 3 秒(见 _sys_fail_budget 的说明),
         # 单条请求最坏从 ~14 秒降到 ~5 秒, 浏览器不至于整站卡死。
         _budget = _sys_fail_budget(key)
+        # 【2026-10-26 修·账要按时间窗记】装机版 12:35~12:38 四分钟里这一句印了
+        # 6 次"兜底等了 10.0 秒, 连续第 1 次全灭": 链路是**时好时坏**, 中间任何一条
+        # 请求复用通道成功都会把老账本清零, 于是下一次撞死又从头等满 10 秒。
+        # 现在 _SYS_FAIL 记的是时间戳(一次成功只抹最旧两笔), 60 秒内还有账就一直是
+        # 3 秒; 下面这句再把预算剪到这次建连的剩余时间里 —— 到点就不陪它等。
+        if self._dl_left() <= 0.3:
+            self._dl_note(self._dl_left(), '兜底等系统解析', label)
+            return None, None
+        _tmo = max(0.5, min(_budget, self._dl_left() - 0.2))
+        if _tmo < _budget:
+            self._dl_note(self._dl_left(), '等满兜底的 %d 秒' % int(_budget), label)
         # 【2026-10-24 三修·改法④c】退回系统解析之前, 最后拿实测问一句。
         # 起因是装机版 22:37:00 那一条日志 + 同一秒的一次实测:
         #   "候选 IP 全军覆没, 本次退回系统解析" → curl 拿到 **400 + 1440 字节**,
@@ -3073,18 +3272,24 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             log('%s 退回前实测: 系统解析到的 %s 全在实测拉黑期内(假前门)，'
                 '本次不给它转发，下次重新抢连' % (label, '、'.join(_sys_all[:2])))
             return None, None
-        if pool.checks_http and not fast and _budget >= _SYS_FAIL_FULL_TIMEOUT:
+        # 【2026-10-26 补·这发探针也要看预算】探针最多 1.5 秒, 但只剩 2 秒时不再问:
+        # 问完就没时间兜底了, 反而两头落空。够宽裕才问, 且超时按剩余裁剪。
+        if (pool.checks_http and not fast and _budget >= _SYS_FAIL_FULL_TIMEOUT
+                and self._dl_left() >= 2.0):
+            _p_tmo = max(0.6, min(1.5, self._dl_left() - 0.8))
             _sys_now = [x for x in _sys_all if not _bad_edge(x)]
             _p_ip = _sys_now[0] if _sys_now else ''
             if _p_ip:
                 _pm = None
                 try:
-                    _pm = pool._probe(_p_ip, timeout=1.5)
+                    _pm = pool._probe(_p_ip, timeout=_p_tmo)
                 except Exception:
                     _pm = None
                 if _pm and _pm[1] == 'http':
                     try:
-                        _s5 = socket.create_connection((_p_ip, port), timeout=2.0)
+                        _s5 = socket.create_connection(
+                            (_p_ip, port),
+                            timeout=max(0.5, min(2.0, self._dl_left())))
                     except OSError:
                         _fail_note(_p_ip)
                     else:
@@ -3101,16 +3306,20 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                         '本次不给它转发，下次重新抢连' % (label, _p_ip))
                     return None, None
         try:
-            _s3 = socket.create_connection((host, port), timeout=_budget)
+            _s3 = socket.create_connection((host, port), timeout=_tmo)
             _sys_fail_reset(key)
             return _s3, None
         except OSError as e:
             _n = _sys_fail_bump(key)
-            log('连接 %s 失败: %s（兜底等了 %.1f 秒, 连续第 %d 次全灭）' %
-                (host, e, _budget, _n))
+            log('连接 %s 失败: %s（兜底等了 %.1f 秒, 最近 %d 秒内第 %d 次全灭）' %
+                (host, e, _tmo, int(_SYS_FAIL_WINDOW), _n))
             return None, None
 
     def _connect(self, host, port):
+        # 【2026-10-26 新增·建连总时限】一次建连从进来到"放弃"最多花
+        # _CONNECT_DEADLINE 秒。下面所有贵的手(抢连/广撒网/两轮轻探/兜底)
+        # 都先看剩余预算, 不够就不做 —— 失败还是失败, 但不再拖到十几二十秒。
+        self._dl_start()
         # 【2026-10-10 修 声明不符】先卡域名：本代理只转发 GitHub 相关域名。
         # 对外写的是「只接管 GitHub 相关域名、不转发他人流量」，
         # 原来这里的兜底对任何 host 都建隧道，与声明冲突（docs/SECURITY.md 自己也列了这条）。
@@ -6725,17 +6934,44 @@ def start_panel():
 # 用户只能重启才重置。这里在**转发实际失败**时立刻触发一次全池重测(含 HTTP 预检,
 # 能把"TCP 通但 HTTP 4xx"的假活 IP 判死剔除), 带 60 秒冷却, 不等 5 分钟、不用用户重启。
 _RETEST_COOLDOWN_TS = [0.0]
+_RETEST_LOCK = threading.Lock()
+# 【2026-10-26 新增·自愈要给浏览器让路】
+# 装机版日志: 12:35:05 / 12:36:25 / 12:37:30 各来一次"连接级自愈: 立即全池重测",
+# 每一次都是 50(github) + raw + github.io 三个池同时全量重探 —— 而那一刻链路正
+# 在抽风, 用户的浏览器就卡在同一个页面上转圈。重测本身成了新的负担(跟 _prescan、
+# hot_refresh 记过的是同一个坑), 而且链路整体不通时连着两轮重测都捞不回人。
+# 现在按"上一轮真捞回几个"退让: 一个都没捞回就把间隔翻倍(60 → 120 → 240 → 封顶
+# 600 秒), 捞回 3 个以上立刻回到 60 秒。后台 health_loop 那 5 分钟一轮的照旧跑,
+# 面板上「立即重测」也照旧随时能按, 所以最坏只是"自愈慢一点", 不会失能。
+_RETEST_BACKOFF = [60.0]
+_RETEST_BACKOFF_MAX = 600.0
+_RETEST_REVIVE_MIN = 3      # 一轮重测至少捞回这么多才算"链路又活了"
+
+
+def _selfheal_job():
+    good = HEALTH.refresh(candidate_list())
+    raw_good = HEALTH_RAW.refresh(CANDIDATE_IPS_RAW_ALL)
+    pages_good = HEALTH_PAGES.refresh(CANDIDATE_IPS_PAGES_ALL)
+    n = [len(good or []), len(raw_good or []), len(pages_good or [])]
+    with _RETEST_LOCK:
+        if max(n) >= _RETEST_REVIVE_MIN:
+            _RETEST_BACKOFF[0] = 60.0
+        else:
+            _RETEST_BACKOFF[0] = min(_RETEST_BACKOFF_MAX, _RETEST_BACKOFF[0] * 2)
+        gap = _RETEST_BACKOFF[0]
+    log('连接级自愈完成: github/raw/pages 各捞回 %d/%d/%d 个, 下轮自愈间隔改为 %d 秒'
+        % (n[0], n[1], n[2], int(gap)))
+
+
 def trigger_selfheal():
     now = time.time()
-    if now - _RETEST_COOLDOWN_TS[0] < 60:
-        return
-    _RETEST_COOLDOWN_TS[0] = now
+    with _RETEST_LOCK:
+        gap = _RETEST_BACKOFF[0]
+        if now - _RETEST_COOLDOWN_TS[0] < gap:
+            return
+        _RETEST_COOLDOWN_TS[0] = now
     log('连接级自愈: 转发连续失败, 立即全池重测(不等5分钟)')
-    threading.Thread(target=lambda: (
-        HEALTH.refresh(candidate_list()),
-        HEALTH_RAW.refresh(CANDIDATE_IPS_RAW_ALL),
-        HEALTH_PAGES.refresh(CANDIDATE_IPS_PAGES_ALL),
-    ), daemon=True).start()
+    threading.Thread(target=_selfheal_job, daemon=True).start()
 
 
 def health_loop():
