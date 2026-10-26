@@ -4,7 +4,7 @@
 <h1>狐径 FoxPath</h1>
 
 <a href="https://gitcode.com/kele551/FoxPath/releases" title="点击去下载（GitHub + GitCode 合计 · 实时）"><img alt="Downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DFoxPath%26kind%3Ddownloads&style=flat-square" height="30"></a>
-<a href="https://gitcode.com/kele551/FoxPath" title="浏览量 · GitCode 合计 · 实时"><img alt="浏览量" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DFoxPath%26kind%3Dviews&style=flat-square" height="30"></a>
+<a href="https://gitcode.com/kele551/FoxPath" title="浏览量 · Gitee + GitCode 合计 · 实时"><img alt="浏览量" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DFoxPath%26kind%3Dviews&style=flat-square" height="30"></a>
 
 <a href="https://github.com/kele551/FoxPath/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
 <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?style=flat-square">
@@ -66,7 +66,7 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 
 | 步骤 | 做什么 |
 |---|---|
-| **① 下载** | [GitCode 发行页](https://gitcode.com/kele551/FoxPath/releases)（国内主源、直连快）或 [GitCode](https://gitcode.com/kele551/FoxPath/releases) / [GitHub Releases](https://github.com/kele551/FoxPath/releases)，拿 `FoxPath.exe`。代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像 |
+| **① 下载** | [GitCode 发行页](https://gitcode.com/kele551/FoxPath/releases)（国内主源、直连快）拿 `FoxPath.exe`；GitCode 也取不到再走 [GitHub Releases](https://github.com/kele551/FoxPath/releases)（镜像）。代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像 |
 | **② 运行** | 双击 `FoxPath.exe` → 浏览器自动弹出控制面板（首次启动等 15～20 秒，它在并发体检 IP） |
 | **③ 启用** | 面板点「启用加速」完事；不用了点「退出并还原」，系统设置恢复原样 |
 
@@ -75,8 +75,8 @@ GitHub 访问优化助手。本机网络分流 + PAC，不依赖域名解析，�
 > 想先看它长什么样：仓库里有一页[演示页](docs/demo/index.html)，内嵌 2 分 30 秒的演示视频
 > （**录制于 v1.0.7**，界面以实际版本为准；最新变化见 [release-notes.md](docs/release-notes.md)），点开即播。
 
-> **三个平台代码一致**：[GitCode](https://gitcode.com/kele551/FoxPath)（主源）· [GitHub](https://github.com/kele551/FoxPath)（镜像）· [AtomGit](https://atomgit.com/kele551/FoxPath)（代码镜像，只提供源码归档）。
-> **二进制发行包请从 GitCode（主）或 Gitee / GitHub（镜像）下载**；三个平台都收 Issue / PR。
+> **三个平台代码一致**：[GitCode](https://gitcode.com/kele551/FoxPath)（主源）· [GitHub](https://github.com/kele551/FoxPath)（镜像）· [AtomGit](https://atomgit.com/kele551/FoxPath)（自动镜像 GitHub，含发行版附件）。
+> **二进制发行包请从 GitCode（主）或 GitHub（镜像）下载**；三个平台都收 Issue / PR。
 
 ---
 
