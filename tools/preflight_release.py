@@ -20,7 +20,7 @@
   6. 收尾：注册表/升级源/缓存全部还原，不留垃圾
   7. 一致性警告（WARN，不阻断发布）：
      ① 工作区副本与仓库副本的 sha256 是否一致（M-10，两份漂移了就等于"仓库里写的检查项没跑"）
-     ② 两平台已发布的发行版附件 sha256 是否一致、是否等于本地候选（M-11，限速：Gitee 间隔 ≥3 秒）
+     ② 两平台已发布的发行版附件 sha256 是否一致、是否等于本地候选（M-11，限速：GitCode 间隔 ≥3 秒）
 
 用法：python tools/preflight_release.py [候选exe路径] [--dry-run] [--skip-remote] [--help]
 """
@@ -61,14 +61,18 @@ REG = r'Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 HID = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden']
 
 # ── 远端附件比对（M-11）用到的常量 ─────────────────────────────────────
+# 2026-10-26：主源从 gitee 迁到 gitcode（gitee 那边账号还在但仓库已停更，再拿它当
+# 校验对象只会得到一个"永远红"的假警报）。口径与 tools/publish.py 保持一致：
+# GitCode = 主源，GitHub = 镜像，两个都要能读到发行版附件。
 OWNER, PROJ = 'kele551', 'FoxPath'
 GH_API = 'https://api.github.com'
-GITEE_API = 'https://gitee.com/api/v5'
-GITEE_MIN_GAP = 3.0            # Gitee 请求间隔 ≥3 秒（别把平台抓急，那是会自找 451 的）
+GC_API = 'https://gitcode.com/api/v5'
+GC_MIN_GAP = 3.0               # GitCode 请求间隔 ≥3 秒（别把平台抓急，那是会自找 451 的）
 CORE_ASSETS = ('FoxPath.exe', 'version.json')
-# 令牌文件：需要时用环境变量 GITEE_TOKEN_FILE 指定（例如 GITEE_TOKEN_FILE=D:\某个目录\gitee_token）。
-# 不设也能跑：走匿名访问，只是 Gitee API 更容易被限速（脚本会如实报告，不静默放过）。
-GITEE_TOKEN_FILE = os.environ.get('GITEE_TOKEN_FILE', '')
+# 令牌：优先环境变量 GITCODE_TOKEN（直接是令牌）；再 GITCODE_TOKEN_FILE / 本机配置 /
+# 仓库内 .gitcode_token（已 gitignore）。不给也能跑：匿名读发行版就够，只是更容易被限速
+# （脚本会如实报告，不静默放过）。
+GC_TOKEN_FILE = os.environ.get('GITCODE_TOKEN_FILE') or os.path.join(REPO, '.gitcode_token')
 
 USAGE = """狐径发版前自检 —— 用法
 
@@ -319,36 +323,37 @@ def check_script_sync():
 
 
 # ── 网络小工具 + ①-c 远端附件比对（M-11）──────────────────────────────
-_GITEE_LAST = [0.0]
+_GC_LAST = [0.0]
 
 
-def _gitee_wait():
-    """Gitee 限速：**任何**一次 gitee 请求之间至少隔 3 秒（API 与附件下载都算）。
+def _gc_wait():
+    """GitCode 限速：**任何**一次 gitcode 请求之间至少隔 3 秒（API 与附件下载都算）。
 
-    2026-10-08 的教训：密集抓 Gitee 接口会自己把平台抓出 451，然后把假象当事实。
+    2026-10-08 的教训（当时是 gitee）：密集抓平台接口会自己把平台抓出 451，然后把假象当事实。
     """
-    wait = GITEE_MIN_GAP - (time.time() - _GITEE_LAST[0])
+    wait = GC_MIN_GAP - (time.time() - _GC_LAST[0])
     if wait > 0:
         time.sleep(wait)
 
 
-def _gitee_done():
-    _GITEE_LAST[0] = time.time()
+def _gc_done():
+    _GC_LAST[0] = time.time()
 
 
-def _gitee_json(path, timeout=30):
-    """Gitee API 统一入口（走 _gitee_wait 限速）。
+def _gc_json(path, timeout=30):
+    """GitCode v5 接口统一入口（走 _gc_wait 限速）。
 
-    令牌只从本机文件读、只放进请求参数，**任何情况下都不打印明文**（出错只报异常类型）。
+    令牌只从本机读、只放进查询参数，**任何情况下都不打印明文**（出错只报异常类型）。
     """
-    _gitee_wait()
-    tok = ''
-    try:
-        if os.path.exists(GITEE_TOKEN_FILE):
-            tok = io.open(GITEE_TOKEN_FILE, encoding='utf-8').read().strip()
-    except OSError:
-        tok = ''
-    url = GITEE_API + path + (('?' + urllib.parse.urlencode({'access_token': tok})) if tok else '')
+    _gc_wait()
+    tok = os.environ.get('GITCODE_TOKEN', '').strip()
+    if not tok:
+        try:
+            if os.path.exists(GC_TOKEN_FILE):
+                tok = io.open(GC_TOKEN_FILE, encoding='utf-8').read().strip()
+        except OSError:
+            tok = ''
+    url = GC_API + path + (('?' + urllib.parse.urlencode({'access_token': tok})) if tok else '')
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'FoxPath-preflight'})
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -356,19 +361,52 @@ def _gitee_json(path, timeout=30):
     except Exception as e:
         return None, type(e).__name__
     finally:
-        _gitee_done()
+        _gc_done()
 
 
-def _get_bytes(url, headers=None, timeout=600, tries=3):
+def _get_bytes(url, headers=None, timeout=60, tries=2, deadline=900, expect=0, label=''):
+    """把远端附件取回来自己算 sha256。
+
+    ⚠ 2026-10-26 这条曾经把整份自检拖死：原来是 `timeout=600, tries=3` + `r.read()` 一把梭。
+    `timeout` 只管**一次 recv**，`r.read()` 要等**整条响应**读完 —— 于是慢链路下
+    十几分钟一行不出，谁也分不清是在跑还是卡死（实测本机经代理从 GitHub 取 15 MB 只有
+    10~21 KB/s，一个附件能拖到 90 分钟）。现在：单次 60 s、总预算 900 s、
+    `read1` 边下边报进度，到点**明确失败并说清只取回多少字节**。
+    预算可用环境变量 FOXPATH_PREFLIGHT_DEADLINE 覆盖（默认值不放宽）。
+    """
+    deadline = int(os.environ.get('FOXPATH_PREFLIGHT_DEADLINE') or deadline)
     for i in range(tries):
+        t0 = time.time()
+        nxt = 15
         try:
             req = urllib.request.Request(
-                url, headers=headers or {'User-Agent': 'FoxPath-preflight'})
+                url, headers=headers or {'User-Agent': 'FoxPath-preflight',
+                                         'Accept-Encoding': 'identity'})
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.read()
+                buf = bytearray()
+                while True:
+                    chunk = (r.read1(262144) if hasattr(r, 'read1') else r.read(262144))
+                    if not chunk:
+                        break
+                    buf += chunk
+                    spent = time.time() - t0
+                    if spent >= nxt:
+                        print('    … %s 已取回 %.1f MB / %.1f MB（%.0f KB/s，%d s）'
+                              % (label or url[:60], len(buf) / 1048576.0,
+                                 expect / 1048576.0 if expect else 0,
+                                 len(buf) / max(spent, 1) / 1024.0, int(spent)))
+                        sys.stdout.flush()
+                        nxt = spent + 15
+                    if deadline and spent > deadline:
+                        print('    x %s 总时长预算 %d s 用尽：只取回 %d B / 需要 %d B'
+                              % (label or url[:60], deadline, len(buf), expect))
+                        return None
+                if buf:
+                    return bytes(buf)
         except Exception:
-            if i < tries - 1:
-                time.sleep(3)
+            pass
+        if i < tries - 1:
+            time.sleep(3)
     return None
 
 
@@ -379,23 +417,28 @@ def _asset_sha(data):
 def _remote_assets(tag):
     """取两个平台该 tag 的附件：{平台: {附件名: (sha256, 字节数)}}、{平台: [附件名]}、{平台: 错误}。"""
     got, names, errs = {}, {}, {}
-    # 平台自动生成的源码包（v1.0.6.zip / .tar.gz）不算"我们上传的附件"，比清单时忽略掉
-    auto = {tag + '.zip', tag + '.tar.gz', tag + '.tar.bz2'}
-    rel, err = _gitee_json('/repos/%s/%s/releases/tags/%s' % (OWNER, PROJ, tag))
+    # 平台自动生成的源码包（v1.0.6.zip / .tar.gz / .tar.bz2 / .tar）不算"我们上传的附件"，比清单时忽略掉
+    auto = {tag + '.zip', tag + '.tar.gz', tag + '.tar.bz2', tag + '.tar'}
+    # GitCode（主源）：匿名 GET /releases/tags/<tag> 就能读，附件的 browser_download_url
+    # 是 releases/download 直链（2026-10-26 实测）。这里**下载回来自己算 sha256**，
+    # 不采信平台给的 digest 字段——M-11 要防的就是"线上那份字节不对"。
+    rel, err = _gc_json('/repos/%s/%s/releases/tags/%s' % (OWNER, PROJ, urllib.parse.quote(tag)))
     if err or not rel:
-        errs['Gitee'] = err or '发行版不存在'
+        errs['GitCode'] = err or '发行版不存在'
     else:
         assets = rel.get('assets') or []
-        names['Gitee'] = [a.get('name') for a in assets if a.get('name') not in auto]
-        got['Gitee'] = {}
+        names['GitCode'] = [a.get('name') for a in assets if a.get('name') not in auto]
+        got['GitCode'] = {}
         for a in assets:
             if a.get('name') in CORE_ASSETS:
-                _gitee_wait()          # 附件下载同样限速 ≥3 秒
+                _gc_wait()          # 附件下载同样限速 ≥3 秒
                 try:
-                    got['Gitee'][a['name']] = _asset_sha(
-                        _get_bytes(a.get('browser_download_url') or ''))
+                    got['GitCode'][a['name']] = _asset_sha(
+                        _get_bytes(a.get('browser_download_url') or '',
+                                   expect=a.get('size') or 0,
+                                   label='GitCode %s' % a.get('name')))
                 finally:
-                    _gitee_done()
+                    _gc_done()
     # GitHub 侧走 api.github.com（一直通）+ 附件 assets API（会跳到 objects.githubusercontent.com），
     # 不依赖时通时断的 github.com 下载页。
     try:
@@ -413,7 +456,9 @@ def _remote_assets(tag):
                 got['GitHub'][a['name']] = _asset_sha(_get_bytes(
                     a.get('url') or '',
                     headers={'User-Agent': 'FoxPath-preflight',
-                             'Accept': 'application/octet-stream'}))
+                             'Accept': 'application/octet-stream'},
+                    expect=a.get('size') or 0,
+                    label='GitHub %s' % a.get('name')))
     except Exception as e:
         errs['GitHub'] = type(e).__name__
     return got, names, errs
@@ -435,18 +480,18 @@ def check_remote_assets(ver, cand_sha, vj_sha):
     """
     tag = 'v%s' % ver
     print()
-    print('①-c 远端附件比对（M-11：%s，限速 Gitee ≥3 秒/次，失败只警告）' % tag)
+    print('①-c 远端附件比对（M-11：%s，限速 GitCode ≥3 秒/次，失败只警告）' % tag)
     vjp = os.path.join(REPO, 'version.json')
     alt = {'version.json': hashlib.sha256(
         open(vjp, 'rb').read().replace(b'\r\n', b'\n')).hexdigest().upper()}
     got, names, errs = _remote_assets(tag)
-    for plat in ('Gitee', 'GitHub'):
+    for plat in ('GitCode', 'GitHub'):
         if plat in errs:
             check_warn('%s 能读到 %s 的发行版' % (plat, tag), False,
                        '%s（本次若为新版本、还没发布，属正常）' % errs[plat])
     for name, want, label in (('FoxPath.exe', cand_sha, '本地候选 exe'),
                               ('version.json', vj_sha, '本地 version.json')):
-        for plat in ('Gitee', 'GitHub'):
+        for plat in ('GitCode', 'GitHub'):
             if name not in (got.get(plat) or {}):
                 continue
             r = got[plat][name]
@@ -460,17 +505,17 @@ def check_remote_assets(ver, cand_sha, vj_sha):
             check_warn('%s / %s 指纹 == %s' % (plat, name, label), same,
                        '%s vs %s  %d B%s' % (r[0][:12], want[:12], r[1], note))
     for name in CORE_ASSETS:
-        a = (got.get('Gitee') or {}).get(name)
+        a = (got.get('GitCode') or {}).get(name)
         b = (got.get('GitHub') or {}).get(name)
         if a and b:
             check_warn('%s 两平台指纹一致' % name, a[0] == b[0],
                        '%s vs %s' % (a[0][:12], b[0][:12]))
-    ng = [n for n in (names.get('Gitee') or []) if n]
+    ng = [n for n in (names.get('GitCode') or []) if n]
     nh = [n for n in (names.get('GitHub') or []) if n]
     if ng and nh and set(ng) != set(nh):
-        print('     · 两平台附件清单不同：仅 Gitee 有 [%s]；仅 GitHub 有 [%s]'
+        print('     · 两平台附件清单不同：仅 GitCode 有 [%s]；仅 GitHub 有 [%s]'
               % (_names([n for n in ng if n not in nh]), _names([n for n in nh if n not in ng])))
-        print('       （Gitee 侧多一个中文名演示视频属**已知差异**，见 README「已知边界」；'
+        print('       （GitHub 侧的 exe 必须是 ASCII 名 FoxPath.exe，中文名会被平台破坏；'
               '平台自动生成的源码包不计入比较；核心附件两平台一致才算过）')
 
 

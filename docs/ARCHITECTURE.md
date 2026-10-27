@@ -35,7 +35,7 @@ FoxPath.exe (github_direct.py)
 | `version.json.sig` | **升级源的 Ed25519 签名**（128 个十六进制字符 = 64 字节）；与 `version.json` 同目录同名，客户端据此验签 | 发版时自动生成，**不要手改、不要入库**（每次改 version.json 都会过期） |
 | `build_exe.py` | PyInstaller 打包 → `FoxPath.exe`（文件名不带版本号，版本写进 exe 属性） | 改打包参数 |
 | `make_version_json.py` | 生成 `version.json`，并按 `--sign-key` 同时生成 `version.json.sig` | 发版链路 |
-| `publish_files.py` | 往 Gitee 仓库推送/更新的文件清单 | 增删随仓库发布的文件 |
+| `publish_files.py` | 往 GitCode 仓库推送/更新的文件清单 | 增删随仓库发布的文件 |
 | `tools/publish.py` | 一键发布：改版本号 → 打包 → 升级源 → 双平台提交/发行版 → 验真 | 发版链路 |
 | `tools/preflight_release.py` | **发版前自检闸门**（版本一致性、冷启动、完整升级演练、失败分支、还原） | 发版前必跑；新增检查项 |
 | `tools/compare_ips.py` | 把内置候选 IP 与 GitHub 官方 `meta` 网段对照（排查用） | 排查线路问题 |

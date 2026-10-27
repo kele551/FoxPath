@@ -4,15 +4,17 @@
 #   github_direct.py 只用 Python 标准库（socket / ssl / http.server / winreg / json ...），
 #   所以运行发布的 FoxPath.exe、或直接 `python github_direct.py` 都不需要装任何包。
 #
-# 只有"开发/发布用"的脚本才需要额外依赖，见下面两条 —— 它们不参与主程序运行，
-# 也不进 exe。想构建/发布时才装：
+# 只有"开发/发布用"的脚本才需要额外依赖，见下面这条 —— 它不参与主程序运行，也不进 exe。
+# 想构建时才装：
 #
 #   pyinstaller   —— 打包用（build_exe.py 调 `python -m PyInstaller`）
-#   requests      —— 发布流水线用（tools/publish.py，走 Gitee API / 下载回验）
 #
-# 用法（按需装，别一股脑全装）：
-#   pip install pyinstaller                     # 只打包
-#   pip install -r requirements.txt             # 打包 + 发布
+# 发布流水线 tools/publish.py **不需要装任何 Python 包**：2026-10-26 起改成纯标准库
+# （GitCode 走 urllib，GitHub 调本机登录态的 gh.exe）。以前这里写着要装 requests，
+# 是假的 —— 那个库在本机根本没装过，publish.py 却因为 import 它而在发版当天现挂。
+#
+# 用法：
+#   pip install pyinstaller                   # 只打包
+#   pip install -r requirements.txt           # 同上（就这一条）
 
 pyinstaller>=6.0        # 打包（build_exe.py）
-requests>=2.28          # 发布流水线（tools/publish.py）

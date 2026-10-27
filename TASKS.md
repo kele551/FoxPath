@@ -3,7 +3,7 @@
 > 这里的每一行都是**能独立做完、且有明确验收**的事。规则很简单：
 > **一次一件事 → 先看「涉及文件」→ 做完贴出「验收命令」的输出 → 把状态改成 `done`**。
 > 大改动先开 Issue 说方案；验收命令必须**真的跑过**。
-> 关联的 issue 写在下表 `issue` 列（**GitHub / Gitee 两侧同步维护；AtomGit 只镜像代码，不收 issue**）（带 `good first issue` 标签的适合第一次上手）。
+> 关联的 issue 写在下表 `issue` 列（**GitCode / GitHub 两侧同步维护；AtomGit 只镜像代码，不收 issue**）（带 `good first issue` 标签的适合第一次上手）。
 
 | id | 任务 | 难度 | 涉及文件 | 验收（跑什么） | issue | 状态 |
 |---|---|---|---|---|---|---|
@@ -14,6 +14,8 @@
 | F-05 | 发版时"自动改 README 版本号"的正则已失效（README 改用动态徽章），实际版本文字靠手改 | ★★ | `tools/publish.py` | 在临时副本上跑改版本逻辑，README 里「当前对外发布版本 **vX.Y.Z**」与 `docs/SECURITY.md` 都被改到；或自检里加一条"文档版本 == APP_VERSION"断言 | #6 | done |
 | F-06 | `docs/CODE_OF_CONDUCT.md` 是六份治理文档里唯一英文且无中文抬头/署名的 | ★ | `docs/CODE_OF_CONDUCT.md` | 首行有「狐径 FoxPath —— 作者：海风（kele551） · 仓库链接」，与其余五份同构（正文保留 Contributor Covenant 原文） | #7 | done |
 | F-07 | 演示页与演示视频文件名停在 v1.0.7（当前 v1.1.1），页面未注明录制版本 | ★ | `docs/demo/index.html` | 页面上注明「录制于 v1.0.7」，不让人误以为等于当前版本 | #8 | done |
+| F-08 | 候选 IP 池里没有 GitHub **上传**用的两个域（`uploads.github.com` / `objects.githubusercontent.com`），发版传附件时只能直连撞运气 | ★★ | `github_direct.py`（池常量）、`tests/` | 两个 host 都在池常量里；新增一条确定性测试（桩掉网络，不靠真连）断言它们在池内；`python -m py_compile github_direct.py` 与 `pytest tests -q` 全绿 | 无 | todo |
+| F-09 | 源码里还留两处老仓库字样的注释/面板标签（`github_direct.py` 约 2713、2782 行），且 `meta.json` 的回落地址里没有 GitCode | ★ | `github_direct.py` | 按 `tools/preflight_release.py` ⑦ 的判据全仓 0 命中；`meta.json` 回落顺序与 `version.json` 升级源口径一致（GitCode 主、GitHub 兜）；`python tools/preflight_release.py` 全绿 | 无 | todo |
 
 ## 验收时请顺手遵守的约定
 

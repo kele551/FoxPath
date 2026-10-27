@@ -14,7 +14,7 @@
   · 发布端（tools/publish.py、make_version_json.py）：用私钥给 version.json 签名
   · 客户端（github_direct.py）：用内置公钥验签，**验不过就拒绝这条升级源**
 
-这样即便 Gitee / GitHub 账号被盗、有人推了恶意 version.json + 恶意 exe，
+这样即便 GitCode / GitHub 账号被盗、有人推了恶意 version.json + 恶意 exe，
 没有私钥就签不出合法签名，客户端会直接拒绝。
 （能力边界：这挡的是"升级源被篡改"，**挡不住**维护者机器上的私钥本身被偷，
 也不等于 Windows 代码签名证书 —— 见 docs/SECURITY.md 与 docs/CODE_SIGNING_POLICY.md。）

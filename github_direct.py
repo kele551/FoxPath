@@ -95,7 +95,13 @@ RELAY_IDLE_TIMEOUT = 600
 #   · githubassets.com —— **保持 DIRECT，列 TODO**。它解析到 185.199.108.215
 #     （在官方 web 段 185.199.108.0/22 内），但证书是 *.githubassets.com，与 raw 池
 #     校验的 githubusercontent 证书不同；本机实测 TLS 194ms、本来就快，没必要动。
-PROXY_HOSTS = ('github.com', 'www.github.com', 'codeload.github.com')
+# 【2026-10-26 加·uploads.github.com】发布附件**上传**用的域以前不在这份清单里，浏览器一律直连，
+# 于是出现"页面能开、传附件却撞运气"（v1.2.3 发版当天实测：裸连 WinError 10060、走代理偶发 502）。
+# 收进来的判据和当年 codeload 用的是同一条：拿池里的 IP + SNI=uploads.github.com 发一次 GET /，
+# 实测 5 个地址（140.82.112.3 / 140.82.113.4 / 140.82.116.3 / 20.205.243.166 / 20.27.177.113）
+# TLS 全部握手成功并回 **301**（而不是 500 Domain Not Found）—— 说明这些服务器真的服务这个域。
+# api.github.com 仍然**故意不在**这个名单里：候选池全是 web 段地址，拿它连 api 是错的。
+PROXY_HOSTS = ('github.com', 'www.github.com', 'codeload.github.com', 'uploads.github.com')
 
 # 2026-10-09 用户要求：把 GitHub Pages 也纳入接管范围。
 # 页面挂在 *.github.io 上（用户名.github.io），用的还是 185.199.108.0/22 那一段，
@@ -2710,15 +2716,23 @@ def fetch_official_ips():
     """同步官方 IP 表。**三个源依次试**：
 
     1. api.github.com/meta —— 官方最准，但在联通/移动的部分线路上根本不通；
-    2. Gitee 上本项目仓库里的 meta.json —— 国内三网都能拉 Gitee，这是关键兜底；
+    2. GitCode 上本项目仓库里的 meta.json —— 国内三网都能拉 GitCode，这是关键兜底
+       （2026-10-26 实测 HTTP 200、1326 B、ips=12 web=40，与仓库里那份同尺寸）；
     3. GitHub raw 的同一份 meta.json。
 
     以前只有一个源（api.github.com），拉不到就只剩内置那十几个旧地址 ——
     这就是"某些运营商的用户用不了"的直接原因。
+
+    【2026-10-26 补上第 2 个源】注释里一直写着"三个源"，代码里其实只有两个，
+    而那两个（api.github.com 与 raw.githubusercontent.com）走的**是同一条国际链路**：
+    第 1 个断了，第 3 个多半也断 —— 等于国内线路的用户根本没有兜底。
+    GitCode 插在中间才是真兜底，所以它排在 GitHub raw 前面。
     """
     global CANDIDATES
     urls = (
         'https://api.github.com/meta',
+        # GitCode 没有裸 raw 直链，用它的 API raw 口（和升级源 version.json 同一个形状）
+        'https://gitcode.com/api/v5/repos/kele551/FoxPath/raw/meta.json?ref=main',
         'https://raw.githubusercontent.com/kele551/FoxPath/main/meta.json',
     )
     last_err = None
@@ -2756,7 +2770,7 @@ def fetch_official_ips():
             # 所以这里**故意不收集**；真实 IPv6 只从 DNS / meta.json 的 web6 来。
         # 审查 M-2: 这一份表到底解析出东西没有 —— 只有**真的解析出地址**才算同步成功。
         # 以前不管解析出几个, 都会把内置的 140.82.x.x 补进来凑数, 于是"接口 200 但表是
-        # 空的 / 字段被改名"也会被记成「已同步官方 IP 表」, 而且**不再往下试 Gitee 兜底**;
+        # 空的 / 字段被改名"也会被记成「已同步官方 IP 表」, 而且**不再往下试后面的兜底源**;
         # 用户那边的表现就是"同步成功却一个 IP 都不通"。现在空表直接换下一个源。
         if not ips and not v6s:
             last_err = '%s 里没有解析出任何 IP(字段缺失或被改写)' % url
@@ -2780,7 +2794,7 @@ def fetch_official_ips():
                 CANDIDATES.append(ip)
         _last_meta_ok[0] = time.time()
         _META_SOURCE[0] = ('官方' if 'api.github.com' in url else
-                           'Gitee' if 'gitee.com' in url else 'GitHub')
+                           'GitCode' if 'gitcode.com' in url else 'GitHub')
         log('已同步官方 IP 表(%s): 候选 %d 个(含 IPv6 %d 个)'
             % (_META_SOURCE[0], len(CANDIDATES),
                len([x for x in CANDIDATES if ':' in x])))
@@ -4177,7 +4191,7 @@ def autostart_on():
 #       交给一个独立小助手 (先让旧程序自己退出并还原代理 -> 覆盖 -> 再启动新的)。
 #       验签不过、没有 .sig、sha256 不符 —— 一律拒绝并保留旧版本, 绝不"先替换再校验"。
 # 不需要管理员权限: D:\Program Files 的 ACL 允许普通用户写(实测过)。
-# 升级源: 仓库里的 version.json, Gitee raw 优先、GitHub 兜底;
+# 升级源: 仓库里的 version.json, GitCode raw 优先、GitHub 兜底;
 #         测试时可在数据目录放一个 update_url.txt 指到本地文件。
 UPDATE_URLS = (
     # 2026-10-23: 按用户要求去掉 Gitee 兜底（老仓库地址一律不出现）；只留 GitCode + GitHub。

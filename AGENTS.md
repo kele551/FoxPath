@@ -46,12 +46,16 @@ python tools/preflight_release.py  # 发版前自检（发布前必须全绿）
 ## 平台（三个，代码一致）
 
 代码同时镜像到三处：**GitCode（主源）** / **GitHub（镜像）** / **AtomGit（代码镜像）**。
-**二进制发行包只发 Gitee 与 GitHub** —— AtomGit 目前没有附件上传接口（它的 Release 只提供源码归档）。
+二进制发行包发 **GitCode 与 GitHub** 两处（`tools/publish.py` 一条命令做完，含附件回读验真）；
+AtomGit 会在几分钟内把 GitHub 的发行版**连同附件**一起镜像过去 —— 2026-10-26 实测确认，
+早期"AtomGit 没有附件上传接口、只能发源码"的说法已经过期。
 
 ```powershell
-git push origin main --tags                     # Gitee（本仓库 origin 就是 Gitee）
+# 远端名字按本机 config 为准：gitcode=主源、github=镜像、atomgit=代码镜像
+# 注意：本仓库的 origin 仍指向已停更的老仓库（gitee），不要对它推送。
+git push gitcode main --tags                    # GitCode（主源）
 git push atomgit main --tags                    # AtomGit（令牌走 GIT_ASKPASS，不会出现在命令行）
-# GitHub 侧走工作区的纯 REST 工具（见维护者工作区工具说明）
+# GitHub 侧走本机登录态的 gh.exe（tools/publish.py 里已封好；直连不通时它自己会借代理）
 ```
 
 三个平台改完都要推，**内容必须逐字节一致**（判定方法：`git diff atomgit/main origin/main` 应为空）。
