@@ -3,8 +3,8 @@
 
 <h1>狐径 FoxPath</h1>
 
-<a href="https://gitcode.com/kele551/FoxPath/releases" title="点击去下载（GitHub + GitCode 合计 · 实时）"><img alt="Downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DFoxPath%26kind%3Ddownloads&style=flat-square" height="30"></a>
-<a href="https://gitcode.com/kele551/FoxPath" title="浏览量 · Gitee + GitCode 合计 · 实时"><img alt="浏览量" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DFoxPath%26kind%3Dviews&style=flat-square" height="30"></a>
+<a href="https://gitcode.com/kele551/FoxPath/releases" title="点击去下载（各平台发行版合计 · 实时）"><img alt="Downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DFoxPath%26kind%3Ddownloads&style=flat-square" height="30"></a>
+<a href="https://gitcode.com/kele551/FoxPath" title="浏览量 · 各平台访问计数合计 · 实时"><img alt="浏览量" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fkele551-badge.kele551.workers.dev%2F%3Frepo%3DFoxPath%26kind%3Dviews&style=flat-square" height="30"></a>
 
 <a href="https://github.com/kele551/FoxPath/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
 <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?style=flat-square">
@@ -16,10 +16,9 @@
 <a href="https://github.com/kele551"><img alt="Follow Author" src="https://img.shields.io/github/followers/kele551?style=flat-square&logo=github&label=follow%20author&color=blue"></a>
 
 <img alt="Category" src="https://img.shields.io/badge/分类-应用软件-blue?style=flat-square">
-<img alt="No Admin" src="https://img.shields.io/badge/管理员权限-不需要-brightgreen?style=flat-square">
-<img alt="No Hosts DNS" src="https://img.shields.io/badge/hosts·DNS-不改-brightgreen?style=flat-square">
-
-<img alt="Zero Deps" src="https://img.shields.io/badge/第三方依赖-零-green?style=flat-square">
+<img alt="Single File" src="https://img.shields.io/badge/形态-单文件exe-blue?style=flat-square">
+<img alt="Free" src="https://img.shields.io/badge/费用-免费无广告-brightgreen?style=flat-square">
+<img alt="No Tracking" src="https://img.shields.io/badge/用户数据-不采集不上传-green?style=flat-square">
 
 <a href="https://gitcode.com/kele551/FoxPath/releases"><img alt="Download from GitCode" src="https://img.shields.io/badge/%F0%9F%93%A5_%E4%B8%8B%E8%BD%BD-GitCode%E4%B8%BB%E6%BA%90-c71d24?style=flat-square&logo=gitee&logoColor=white&labelColor=3d4552"></a>
 <a href="https://github.com/kele551/FoxPath"><img alt="GitHub mirror" src="https://img.shields.io/badge/%F0%9F%90%99_%E6%BA%90%E7%A0%81-GitHub%E9%95%9C%E5%83%8F-24292f?style=flat-square&logo=github&logoColor=white&labelColor=3d4552"></a>
@@ -262,6 +261,8 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 ## 许可
 
 MIT
+
+**免费、无广告、不收费**；**不采集、不上传任何用户数据**：没有账号系统、没有统计上报、没有广告，运行日志只写本机数据目录（见 [COMPLIANCE.md](docs/COMPLIANCE.md)）。
 
 ---
 
