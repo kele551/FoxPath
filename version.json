@@ -1,13 +1,13 @@
 {
-  "version": "1.2.3",
-  "notes": "v1.2.3：① 候选池全灭后不再拿剩余时间赌直连（先看后台直连实测，不通就老实报错），并改为先在池里多转两轮；② 半途断流与握手失败分账，断流 IP 排序降权、两次请出池子；③ 面板第一格换成「网页实测」——读最近 3 分钟真实转发的结论，不再是「可用 N/50」。另修 4xx/5xx 假前门判位错误。",
+  "version": "1.2.4",
+  "notes": "v1.2.4：① 根治「每次发新版网页又打不开」——持久化体检缓存（启动即恢复候选池，空窗消除）+ 探测并发 12→24（首轮冷启动 0→25 约 16s）；② 断流/高丢包收口——握手换 IP 重试、断流续传、评分重排、自愈退让修正、滚动岗哨与轻量探活、静默检断流；面板 good_strong_n 由 ~8 升至 29（真机 24/24）。",
   "exe": {
-    "sha256": "61D8471B705BFF2F9C70CB40F3115613656A993874DFDB90D0F28E181351A240",
-    "url": "https://gitcode.com/kele551/FoxPath/releases/download/v1.2.3/FoxPath.exe",
-    "size": 8780615,
+    "sha256": "1611BC2399E26C161375A4B4E12FB57901078EB76372383315760B5B82E2DE0E",
+    "url": "https://gitcode.com/kele551/FoxPath/releases/download/v1.2.4/FoxPath.exe",
+    "size": 8813452,
     "mirrors": [
-      "https://gitcode.com/kele551/FoxPath/releases/download/v1.2.3/FoxPath.exe",
-      "https://github.com/kele551/FoxPath/releases/download/v1.2.3/FoxPath.exe"
+      "https://gitcode.com/kele551/FoxPath/releases/download/v1.2.4/FoxPath.exe",
+      "https://github.com/kele551/FoxPath/releases/download/v1.2.4/FoxPath.exe"
     ]
   }
 }

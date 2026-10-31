@@ -265,7 +265,7 @@ PAC 设置清掉，不起代理、不开面板。万一程序被强杀、或者�
 
 ## 版本记录
 
-> 当前对外发布版本 **v1.2.3**（2026-10-26）。主源 **GitCode** · 镜像 **GitHub**；自 2026-10-16 起代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像。完整逐版说明见 [CHANGELOG.md](docs/CHANGELOG.md) 与 [release-notes.md](docs/release-notes.md)。
+> 当前对外发布版本 **v1.2.4**（2026-10-31）。主源 **GitCode** · 镜像 **GitHub**；自 2026-10-16 起代码另在 [AtomGit](https://atomgit.com/kele551/FoxPath) 有镜像。完整逐版说明见 [CHANGELOG.md](docs/CHANGELOG.md) 与 [release-notes.md](docs/release-notes.md)。
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
