@@ -2758,7 +2758,8 @@ class Health(object):
         # 哪天 IPv6 通了/修好了, 下一轮体检自然把它们捡起来用)。
         if not local_has_ipv6():
             ips = [ip for ip in ips if ':' not in ip]
-        with ThreadPoolExecutor(max_workers=12) as pool:
+        # 并发探测(2026-10-31 由 12 提到 24, 进一步缩短首次填满池子的耗时)
+        with ThreadPoolExecutor(max_workers=24) as pool:
             res = list(pool.map(lambda ip: (ip, self._probe(ip, timeout)), ips))
         good = sorted([(i, m[0]) for i, m in res if m is not None
                        and not _bad_edge(i)], key=lambda x: x[1])
@@ -2833,6 +2834,39 @@ class Health(object):
         with self._lock:
             self._good = [(i, m) for i, m in self._good if i != ip]
 
+    def export_state(self):
+        """导出当前体检结果（供冷启动缓存落盘）。"""
+        with self._lock:
+            return {
+                'good': [[i, m] for i, m in self._good],
+                'tier': {i: [t, ts] for i, (t, ts) in self._tier.items()},
+                'last': self._last,
+            }
+
+    def import_state(self, data):
+        """灌入上次缓存的体检结果（仅作启动初始池，后台复测会刷新）。"""
+        if not isinstance(data, dict):
+            return
+        good = []
+        for pair in data.get('good', []) or []:
+            try:
+                i, m = pair[0], pair[1]
+                if isinstance(i, str) and isinstance(m, (int, float)):
+                    good.append((i, int(m)))
+            except Exception:
+                pass
+        tier = {}
+        for i, v in (data.get('tier', {}) or {}).items():
+            try:
+                if isinstance(v, (list, tuple)) and len(v) == 2:
+                    tier[i] = (v[0], float(v[1]))
+            except Exception:
+                pass
+        with self._lock:
+            self._good = good
+            self._tier = tier
+            self._last = float(data.get('last', 0.0) or 0.0)
+
 
 HEALTH = Health()
 HEALTH_RAW = Health(sni='raw.githubusercontent.com',
@@ -2843,6 +2877,71 @@ HEALTH_RAW = Health(sni='raw.githubusercontent.com',
 # http_path=None: 只验 TLS + 证书(拿 IP 直接 GET 根路径本来就不是 2xx/3xx, 会误杀好 IP)。
 HEALTH_PAGES = Health(sni='github.io', expect='github.io', http_path=None)
 CANDIDATES = list(CANDIDATE_IPS)
+
+# 【2026-10-31 新增·冷启动缓存】每次自动升级重启后，IP 候选池要从零探测约 1-2 分钟才填满，
+# 这期间系统代理已开却几乎无可用线路，用户一访问 GitHub 就选不到好 IP（"新版打不开"的元凶）。
+# 把最近一次体检结果存盘，启动先 load 旧缓存即满池，后台复测再刷新——彻底消灭冷启动空窗。
+HEALTH_CACHE = os.path.join(DATA_DIR, 'health_cache.json')
+HEALTH_CACHE_SCHEMA = 1
+_HEALTH_CACHE_MAX_AGE = 24 * 3600   # 只认 24h 内的缓存，太旧的当从零开始
+
+
+def save_health_cache():
+    """把三池当前体检结果原子写入磁盘缓存。"""
+    try:
+        data = {
+            'schema': HEALTH_CACHE_SCHEMA,
+            'saved_at': time.time(),
+            'pools': {
+                'github': HEALTH.export_state(),
+                'raw': HEALTH_RAW.export_state(),
+                'pages': HEALTH_PAGES.export_state(),
+            },
+        }
+        tmp = HEALTH_CACHE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        os.replace(tmp, HEALTH_CACHE)   # 原子替换，避免写到一半被读
+    except Exception as e:
+        log('保存体检缓存失败(忽略): %s' % e)
+
+
+def load_health_cache():
+    """启动时加载上次缓存作为初始候选池；缓存缺失/损坏/过旧则静默从零开始。"""
+    try:
+        if not os.path.exists(HEALTH_CACHE):
+            return
+        with open(HEALTH_CACHE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        log('读取体检缓存失败(从零开始): %s' % e)
+        return
+    if not isinstance(data, dict) or data.get('schema') != HEALTH_CACHE_SCHEMA:
+        log('体检缓存 schema 不符(从零开始)')
+        return
+    if time.time() - float(data.get('saved_at', 0) or 0) > _HEALTH_CACHE_MAX_AGE:
+        log('体检缓存过旧(>24h, 从零开始)')
+        return
+    cand = {
+        'github': set(candidate_list()),
+        'raw': set(CANDIDATE_IPS_RAW_ALL),
+        'pages': set(CANDIDATE_IPS_PAGES_ALL),
+    }
+    pools = data.get('pools', {}) or {}
+    for inst, key in ((HEALTH, 'github'), (HEALTH_RAW, 'raw'), (HEALTH_PAGES, 'pages')):
+        st = pools.get(key)
+        if not isinstance(st, dict):
+            continue
+        good = st.get('good', []) or []
+        tier = st.get('tier', {}) or {}
+        inst.import_state({
+            'good': [[i, m] for i, m in good if i in cand[key]],
+            'tier': {i: v for i, v in tier.items() if i in cand[key]},
+            'last': st.get('last', 0),
+        })
+    n = len(HEALTH.snapshot()[0])
+    if n:
+        log('已从体检缓存恢复初始候选池: github 可用 %d 个(后台将复测刷新)' % n)
 
 
 _last_meta_ok = [0.0]      # 上次成功拉到官方 IP 表的时间
@@ -8917,6 +9016,7 @@ def health_loop():
                 log('自愈成功(已运行%d分钟): 可用 %d 个, 最快 %s(%dms)'
                     % (up_min, len(good), good[0][0], good[0][1]))
 
+        save_health_cache()            # 每轮体检落盘，供下次冷启动直接使用
         time.sleep(CHECK_INTERVAL)
 
 
@@ -9245,6 +9345,7 @@ def main():
         log('升级前用户没有开启加速, 这里按原状态关掉, 不替他打开')
         disable_proxy()
 
+    load_health_cache()                # 启动先从磁盘缓存恢复候选池，消除冷启动空窗
     start_proxy()
     start_panel()
     tray_serve()                       # 常驻托盘(右键退出 / 左键开面板), 两种模式都挂
@@ -9291,6 +9392,7 @@ def main():
             hot_refresh('pages', HEALTH_PAGES)
             log('热备池就绪: github %d 个 / raw %d 个 / pages %d 个' % (
                 len(_hot_get('github')), len(_hot_get('raw')), len(_hot_get('pages'))))
+            save_health_cache()        # 启动预体检填满即落盘，下次冷启动直接满池
         except Exception as e:
             log('启动预体检失败(将交由 health_loop 稍后补): %s' % e)
     threading.Thread(target=_precheck, daemon=True).start()
