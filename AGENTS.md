@@ -5,7 +5,7 @@
 
 ## 这是什么
 
-**单文件程序**：`github_direct.py`（约 4700 行）打包成 `FoxPath.exe`。
+**单文件程序**：`github_direct.py`（约 9000 行）打包成 `FoxPath.exe`。
 在本机开一个小代理，只接管 GitHub 相关域名并直连"实测可用"的官方 IP；退出时还原系统设置。
 
 **功能边界（合规底线，改代码也不能越过）**：不改 `hosts`、不改系统 DNS、不需要管理员权限、
@@ -69,7 +69,7 @@ GitHub Issues 里带 `good first issue` / `help wanted` 标签的条目，每条
 
 ## English summary (for AI agents)
 
-- **What it is**: a **single-file** Windows app — `github_direct.py` (~4700 lines) packaged as `FoxPath.exe`.
+- **What it is**: a **single-file** Windows app — `github_direct.py` (~9000 lines) packaged as `FoxPath.exe`.
   It runs a small local proxy for GitHub-related domains only, connects to GitHub IPs verified by a real TLS
   handshake plus a throughput measurement, and restores system settings on exit.
 - **Run / verify**: `python github_direct.py` (use `--restore` to undo) · `python -m py_compile github_direct.py` ·

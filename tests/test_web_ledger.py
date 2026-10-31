@@ -36,16 +36,20 @@ SRC = os.path.join(REPO, 'github_direct.py')
 WANT_FUNCS = {'_web_record', '_web_rows', '_web_median_ms', '_web_counts',
               '_web_verdict', '_web_status', '_web_dl_budget', '_direct_is_dead',
               '_stall_note', '_stall_rank', '_stall_bytes', '_stall_clear',
-              '_pool_key_for'}
+              '_fail_rank', '_pool_key_for', 'sess_stats', 'sess_line', '_human_bytes',
+              '_rank_key', 'loss_of', '_kbps_of'}
 WANT_METHODS = {'_relay'}
 WANT_CONSTS = {'WEB_OK', 'WEB_STALL', 'WEB_REFUSED', 'WEB_BADGW',
                '_WEB_LEDGER', '_WEB_LOCK', '_WEB_WINDOW', '_WEB_MAX',
-               '_WEB_MIN_SAMPLES',
+               '_WEB_MIN_SAMPLES', '_SESS',
                '_STALL', '_STALL_LOCK', '_STALL_WINDOW', '_STALL_MIN_BYTES',
                '_STALL_DEMOTE_RANK', '_STALL_DROP_POOL',
                '_CONNECT_DEADLINE', '_CONNECT_DEADLINE_MAX',
                '_CONNECT_RETRY_ROUNDS', '_CONNECT_RETRY_MIN_LEFT',
-               '_CONNECT_RETRY_BACKOFF', '_DIRECT_PROBE_FRESH', '_DIRECT_OK'}
+               '_CONNECT_RETRY_BACKOFF', '_DIRECT_PROBE_FRESH', '_DIRECT_OK',
+               '_FAIL_CNT', '_FAIL_LOCK',
+               '_KBPS_TTL', '_LOSS', '_KBPS', '_LOSS_LOCK', '_KBPS_LOCK',
+               'STALL_WATCHDOG'}
 
 FAILS = []
 
@@ -159,6 +163,7 @@ def new_ns():
         'select': FakeSelect(),
         'socket': types.SimpleNamespace(),
         'RELAY_IDLE_TIMEOUT': 600,
+        'STALL_WATCHDOG': 15.0,
     }
     ns = load(env)
     ns['_CLOCK'] = clock
@@ -254,6 +259,32 @@ def main():
           (rec('raw', ns['WEB_OK'], 100.0, 1), ns['_web_counts']('github')[0]),
           (True, 0))
 
+    print('---- 2b) 本次会话总账(_SESS)：只加不减，面板第一行读它')
+    ns = new_ns()
+    rec = ns['_web_record']
+    check('干净会话一开始是零', ns['sess_stats'](),
+          {'tunnels': 0, 'bytes': 0, 'ok': 0, 'fail': 0})
+    check('没账时也是一行人话', ns['sess_line'](),
+          '本次会话转发 0 条隧道 · 搬回 0 B · 成 0 败 0')
+    rec('github', ns['WEB_OK'], 1000.0, 250000)
+    rec('github', ns['WEB_STALL'], 8000.0, 1000000)
+    rec('github', ns['WEB_REFUSED'], 8000.0, 0)
+    check('三条隧道、成败各算清', ns['sess_stats'](),
+          {'tunnels': 3, 'bytes': 1250000, 'ok': 1, 'fail': 2})
+    check('一行话把字节换算成人看得懂的', ns['sess_line'](),
+          '本次会话转发 3 条隧道 · 搬回 1.2 MB · 成 1 败 2')
+    # 总账与台账的分界就在这里：台账过窗口要丢，总账丢了就等于骗用户"这次没干活"。
+    ns['_WEB_LEDGER'].clear()
+    ns['_CLOCK'].t += 10000.0
+    check('台账过窗口清空，总账仍然留着', ns['sess_stats']()['tunnels'], 3)
+    check('台账空了就不下结论', ns['_web_verdict']('github')[0], 'unknown')
+    # 非 GitHub 域名(_pool_key_for 给空)与没登记的结局都不许进账 —— 否则面板那个数
+    # 会把用户自己的正常流量也算成"狐径帮搬的"。
+    check('key 为空时不记总账', rec('', ns['WEB_OK'], 100.0, 999999), False)
+    check('结局名不在四种之内不记', rec('github', 'whatever', 100.0, 999999), False)
+    check('上面这些都没动总账', ns['sess_stats'](),
+          {'tunnels': 3, 'bytes': 1250000, 'ok': 1, 'fail': 2})
+
     print('---- 3) ① 建连预算：跟着实测走，别在"成功本来就要 13 秒"时按 8 秒切')
     ns = new_ns()
     rec, clock = ns['_web_record'], ns['_CLOCK']
@@ -326,6 +357,10 @@ def main():
     check('半途断流 → 记断流（而且知道搬了 229000 字节）',
           (out['kind'], out['bytes_up'], out['stalled']),
           (ns['WEB_STALL'], 229000, True))
+    # 【2026-10-30 新增】让调用方知道"是被看门狗抓住的传输中静默"(与"对端主动断开"
+    # 区分开), 日志里要如实写这一笔, 便于事后看是哪种死法。
+    check('半途断流把"看门狗判定"标记传出去(日志据此标注死法)',
+          out['stalled_watchdog'], True)
     # 假前门：上游第一串就是 cleartext 的 4xx / 5xx
     ns, out, up, conn = relay_ns(['up'], (b'HTTP/1.1 400 Bad Request\r\n\r\n' + b'z' * 1400,))
     check('上游回 400 → badgw（2026-10-26 修：以前判的是第三位，400 全漏）',
@@ -354,14 +389,26 @@ def main():
     check('建连时限改为按实测调（不再写死 _CONNECT_DEADLINE）',
           'self._dl_start(_web_dl_budget(_pool_key_for(host)))' in src, True)
     check('候选排序把两本账一起算（断流 IP 也降权）',
-          'rest.sort(key=lambda ip: _fail_rank(ip) + _stall_rank(ip))' in src, True)
+          'rest.sort(key=_rank_key)' in src, True)
+    check('排序函数 _rank_key 合并握手失败/断流两本账(并叠加丢包/吞吐/断流字节)',
+          '_rank_key' in src and '_fail_rank(ip)' in src and '_stall_rank(ip)' in src
+          and '_stall_bytes(ip)' in src and 'loss_of(ip)' in src and '_kbps_of(ip)' in src,
+          True)
     check('_relay 的结局进了网页台账',
           "_web_record(_key, out['kind'], _conn_ms + out['first_ms'], out['bytes_up'])" in src,
           True)
     check('建连失败(502)也进台账 —— 否则"打不开"这一档永远没样本',
           "_web_record(_key, WEB_REFUSED, _conn_ms, 0)" in src, True)
-    check('断流不再白记：会请出池子并触发自愈',
-          "_hot_drop(_key, used)" in src and "if _n >= _STALL_DROP_POOL:" in src, True)
+    check('断流不再白记：0 字节这类"彻底搬不动"首次即踢，其余满阈值踢(都触发自愈)',
+          "_hot_drop(_key, used)" in src
+          and "_wd = bool(out.get('stalled_watchdog'))" in src
+          and "_drop = (_n >= _STALL_DROP_POOL) or _no_data" in src
+          and "if _drop:" in src, True)
+    # 【2026-10-30 实测决策·钉死】看门狗(stalled_watchdog)一旦也算进"首次即踢",
+    # 本机这批官方 IP 全是限速货 —— 每踢一个触发一次立即全池重测, 回收数一路掉
+    # (28→22→12)、面板被拖到间歇无响应, 反而更不稳。所以只让它进日志, 不让他请坐。
+    check('看门狗断流只进日志、不参与"首次即踢"(实测回退, 别再激进)',
+          "or _wd" not in src.split('_drop =')[1].split('\n')[0], True)
     check('/api/status 把网页实测端出去了', "'web': {k: _web_status(k)" in src, True)
     check('面板第一格读的是网页实测，不是可用 IP 数',
           'id="stWeb"' in src and src.index('id="stWeb"') < src.index('id="stHosts"'), True)
@@ -369,6 +416,41 @@ def main():
           "体检可用 '+strongN" in src, True)
     check('旧的第一格 id=stIp 已经不再留在模板里（JS 找不到会抛异常）',
           'id="stIp"' in src, False)
+    # ---- 2026-10-30 新增·选路评分改写（P0b）的行为不变量 ----
+    # 反馈包里"最快 20.207.73.82(366ms) 实测丢包 67%、140.82.113.3/112.3 丢包 100%"
+    # 仍被当成主力 —— 根因是丢包抽样此前只展示、不参与选路。_rank_key 把它接进来,
+    # 这里钉死两条: 丢包必降权、有新鲜吞吐的优先。
+    rank = ns['_rank_key']
+    tnow = ns['time'].time()
+    ip_bad = '203.0.113.66'     # 文档保留段, 不会是真候选
+    ip_good = '198.51.100.7'
+    ns['_LOSS'][ip_bad] = (100, tnow)
+    ns['_LOSS'][ip_good] = (0, tnow)
+    check('选路评分: 100% 丢包 IP 排在 0% 丢包 IP 之后(分值更高)',
+          rank(ip_bad) > rank(ip_good), True)
+    ns['_LOSS'].pop(ip_bad, None)
+    ns['_LOSS'].pop(ip_good, None)
+    ns['_FAIL_CNT'][ip_bad] = 1
+    ns['_FAIL_CNT'][ip_good] = 1
+    ns['_KBPS'][ip_good] = (120, tnow)
+    check('选路评分: 同失败账下, 有新鲜吞吐的 IP 排在没证据的前面',
+          rank(ip_good) < rank(ip_bad), True)
+    ns['_FAIL_CNT'].pop(ip_bad, None)
+    ns['_FAIL_CNT'].pop(ip_good, None)
+    ns['_KBPS'].pop(ip_good, None)
+    # ---- 2026-10-30 新增·断流降权（稳定不掉线的核心）----
+    # 反馈包里"搬了 229KB/278KB/89KB/527KB 就断流"的中途断流是 #1 失败模式; CONNECT
+    # 架构下无法透明续传, 治本是别再选中会断流的 IP。_rank_key 把一次断流罚到所有
+    # 干净 IP 之后, 0 字节断流(根本没开传)罚得更重。
+    _t2 = ns['time'].time()
+    ns['_STALL'][ip_bad] = [(_t2, 100000)]      # 搬了 100KB 后被掐
+    check('选路评分: 有过一次中途断流的 IP 排在零断流 IP 之后',
+          rank(ip_bad) > rank(ip_good), True)
+    _mid = rank(ip_bad)
+    ns['_STALL'][ip_bad] = [(_t2, 0)]          # 一个字节都没搬回来
+    check('选路评分: 0 字节断流比搬了一段才断的罚得更重',
+          rank(ip_bad) > _mid, True)
+    ns['_STALL'].pop(ip_bad, None)
     check('整份源码语法过', compile_ok(), True)
 
     print('\n%s  失败 %d 条' % ('全部通过' if not FAILS else '有失败', len(FAILS)))

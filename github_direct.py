@@ -69,16 +69,43 @@ except Exception:
     UPDATE_SIG_AVAILABLE = False
 
 APP_NAME = '狐径'
-APP_VERSION = '1.2.3'
+APP_VERSION = '1.2.4'
 # 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
 AUTHOR = '海风（kele551）'
 AUTHOR_ASCII = 'HaiFeng (kele551)'
 HOMEPAGE = 'github.com/kele551/FoxPath'
 PROXY_PORT = 8787
 PANEL_PORT = 8788
+# 【2026-10-30 学 FastGithub 的「端口被占就向上顺延」】以前 8787 被别的程序占了
+# （另一个代理、本机某服务、甚至 Hyper-V 动态保留段）就直接弹错误框退出 ——
+# 对用户来说等于"这软件跟别的东西不能共存"。现在按这份备用名单依次试。
+# 名单是**手挑的**，不是 bind(0) 拿随机端口：浏览器对"代理端口"也有一份
+# restricted-port 黑名单（1080 SOCKS、6665-6669 IRC、6379/11214/27017 这类），
+# 撞上就是 ERR_UNSAFE_PORT（桌面壁纸 2026-10 踩过同一坑），所以宁可写死一串。
+# 顺延只影响**新启动**的实例：PAC 由本程序实时生成，里面写的就是本次真正在听的端口。
+PROXY_PORT_ALTS = (8789, 8797, 8897, 18787, 28787)
+_PROXY_PORT = [PROXY_PORT]      # 运行时真正在听的端口，bind 成功后写定
 CHECK_INTERVAL = 300          # 5 分钟重测一轮
 # 转发通道的"空闲上限": 只要两端还有数据流动就一直续期, 不是总时长上限(审查 H-4)。
 RELAY_IDLE_TIMEOUT = 600
+# 【2026-10-30 改·稳定不掉线】传输中的"每读看门狗": 上游一旦在活跃传输里沉默满这么久
+# (默认 15 秒, 既没有 FIN 也没有任何字节), 就判断流、记另一本账、踢 IP、关连接 —— 浏览器
+# 收到半截连接会自动重试, 落到干净 IP 上。这是补上"大页面搬了一半卡死"这类静默挂死
+# (反馈包里 github.com 20~24 秒超时那几发): 之前中继只在双方静默满 600 秒才收摊, 上游
+# 不关连接只是沉默时, 中继一直卡在 select 等数据, 客户端 20 秒先超时放弃, 中继既没判死
+# 也没换 IP。15 秒对正常 GitHub 传输极宽松(哪怕慢速大文件也会在 15 秒内送出几 KB),
+# 不会误杀; 而对"搬了一半不动"的坏链路能在客户端放弃前先动手, 把失败变成一次无感重试。
+STALL_WATCHDOG = 15.0
+
+# 【2026-10-30 新增·握手阶段透明重试】
+# CONNECT 隧道里客户端握着自己那半边 TLS: 一旦 200 established 发出、客户端开始 TLS,
+# 中途换 IP 续传在架构上不可能(应用层数据不能重放)。但**握手阶段**(客户端发 ClientHello、
+# 等 ServerHello)可以透明换 IP —— 把 ClientHello 缓冲下来, 上游若静默/超时不应答就关掉它、
+# 换下一个候选、把同一份 ClientHello 重放过去, 客户端完全无感。这只兜得住"握手阶段就死"
+# 的 0 字节/静默上游类; 搬了一半被 RST 的中途断流只能靠选路别选中高丢包 IP 来规避
+# (见 _rank_key 与 _connect_pool 排序)。
+_TUNNEL_RETRY = 3          # 握手阶段最多换几个候选再放弃
+_TUNNEL_HS_TIMEOUT = 5.0   # 等上游 ServerHello 的时限, 超时即判死换人
 
 # PAC 只代理这几台主机；代理内部也用同一份名单，保证"PAC 会送来的"和
 # "代理愿意走 IP 池的"完全一致。githubassets / api.github.com 一律 DIRECT ——
@@ -260,6 +287,43 @@ def _fail_rank(ip):
         return _FAIL_CNT.get(ip, 0)
 
 
+# 【2026-10-30 新增·选路评分改写】
+# 老写法排序只看 _fail_rank + _stall_rank(见 _connect_pool 里那行 sort), 于是那种
+# "握手快、但丢包 67%/100%、正文搬不动/半途断流"的 IP 永远排在前头、每轮都抢赢 ——
+# 反馈包里"最快 20.207.73.82(366ms) 实测丢包 67%、140.82.113.3/112.3 丢包 100%"就是它。
+# 现在把**丢包抽样**和**实测吞吐**、**证据新鲜度**一起算进排序(丢包此前只展示不参与选路,
+# 见 2216 行注释; 这次把它接进来)。分值越小越优先。
+def _rank_key(ip):
+    if not ip:
+        return 1e9
+    # 握手/建连失败: 每欠一次 +1(这种 IP 连隧道都建不起来, 透明重试已兜过一遍,
+    # 仍失败就明确往后靠)
+    s = float(_fail_rank(ip))
+    stall = _stall_rank(ip)
+    if stall:
+        # 断流比单纯握手失败更坑用户: 建连成功、TLS 也握上了, 正文却搬不动或半途
+        # 被掐(本机实测 229KB / 278KB / 89KB / 527KB 那几发)—— 浏览器会卡在半路、
+        # 下载变砖, 比"直接打不开"还难受。一次就足够把它压到所有干净 IP 之后;
+        # 多一次再加码。CONNECT 架构下中途断流无法透明续传, 唯一的治本是别再选中它。
+        s += 10.0 * stall
+        _sb = _stall_bytes(ip)
+        # 最近一次连一个字节都没搬回来(<4KB, 近乎没开传): 几乎等于死 IP, 再追加重罚
+        if _sb >= 0 and _sb < _STALL_MIN_BYTES:
+            s += 20.0
+    loss, lts = loss_of(ip)
+    if loss is not None:
+        # 每 10% 丢包 +2 分; 100% 丢包直接 +20, 推到队尾(必断流/卡死的前兆)
+        s += (loss / 10.0) * 2.0
+    kbps = _kbps_of(ip)
+    if kbps:
+        # 实测越快越往前: 每快 60 KB/s 减 1 分(不低于 0)
+        s = max(0.0, s - kbps / 60.0)
+    # 既没吞吐台账、证据又旧(>2 倍吞吐 TTL)的往后靠, 逼着优先用刚验过的
+    if kbps is None and lts and (time.time() - lts) > _KBPS_TTL * 2:
+        s += 1.0
+    return s
+
+
 # ------------------------------------------------------- 这次是池子赢还是直连赢
 # 让"直连参与竞速"这件事在面板上看得见: 否则用户只看到快了, 不知道为什么快,
 # 出问题时也没法判断是池子选错了还是外面那条路本来就堵。
@@ -438,6 +502,10 @@ def _race_gate_left(key):
 #   badgw   —— 对面回 4xx/5xx 假前门(证书对、页面必定报错)
 WEB_OK, WEB_STALL, WEB_REFUSED, WEB_BADGW = 'ok', 'stall', 'refused', 'badgw'
 _WEB_LEDGER = {}           # key -> [(ts, kind, ms, nbytes)]  只留最近 _WEB_MAX 条
+# 【2026-10-30 学 FastGithub 的实时流量统计】本次会话的总账, 只加不减(不像台账那样过窗就丢)。
+# 面板「本次会话」那一格与一键反馈包都读它 —— 用户问得最多的其实不是"有几个 IP 活着",
+# 而是"你到底帮我干了多少活、有没有白忙"。
+_SESS = {'tunnels': 0, 'bytes': 0, 'ok': 0, 'fail': 0}
 _WEB_LOCK = threading.Lock()
 _WEB_WINDOW = 180.0        # 只按最近 3 分钟判定 —— 这条链路半衰期就几分钟, 老账会骗人
 _WEB_MAX = 60
@@ -466,7 +534,12 @@ def _pool_key_for(host):
 
 
 def _web_record(key, kind, ms=0.0, nbytes=0):
-    """记一笔真实转发的结局。key 为空(非 GitHub 域名)时不记, 免得脏了三池的账。"""
+    """记一笔真实转发的结局。key 为空(非 GitHub 域名)时不记, 免得脏了三池的账。
+
+    顺手给"本次会话"累一笔总账(_SESS) —— 这本账只加不减、不过窗口就过期，
+    为的是面板能回答"这次帮用户搬了多少东西"。放在这儿是因为这是转发结果
+    **唯一**的落点: 热路径不用新加锁(跟着 _WEB_LOCK 走), 也漏不了一笔。
+    """
     if not key or kind not in (WEB_OK, WEB_STALL, WEB_REFUSED, WEB_BADGW):
         return False
     now = time.time()
@@ -479,7 +552,37 @@ def _web_record(key, kind, ms=0.0, nbytes=0):
         stale = [r for r in rows if now - r[0] > _WEB_WINDOW]
         if stale:
             _WEB_LEDGER[key] = rows = rows[len(stale):]
+        _SESS['tunnels'] += 1
+        _SESS['bytes'] += int(nbytes or 0)
+        if kind == WEB_OK:
+            _SESS['ok'] += 1
+        else:
+            _SESS['fail'] += 1
     return True
+
+
+def sess_stats():
+    """本次会话的总账(给面板与反馈包)。字节只算隧道里从上游搬回来的那一段。"""
+    with _WEB_LOCK:
+        return dict(_SESS)
+
+
+def _human_bytes(n):
+    n = int(n or 0)
+    if n < 1024:
+        return '%d B' % n
+    if n < 1024 * 1024:
+        return '%.1f KB' % (n / 1024.0)
+    if n < 1024 * 1024 * 1024:
+        return '%.1f MB' % (n / 1024.0 / 1024.0)
+    return '%.2f GB' % (n / 1024.0 / 1024.0 / 1024.0)
+
+
+def sess_line():
+    """一行话: 这次会话搬了多少、成几次、败几次。"""
+    s = sess_stats()
+    return ('本次会话转发 %d 条隧道 · 搬回 %s · 成 %d 败 %d'
+            % (s['tunnels'], _human_bytes(s['bytes']), s['ok'], s['fail']))
 
 
 def _web_rows(key, now=None):
@@ -1074,7 +1177,9 @@ def _err_text(e):
 def _speed_download(use_proxy, max_bytes=65536, overall=20.0):
     """连 github 首页真下载最多 64KB, 量首字节与速度。
 
-    use_proxy=True 走本机狐径(对 127.0.0.1:PROXY_PORT 发 CONNECT), False 直连。
+    use_proxy=True 走本机狐径(对 127.0.0.1:proxy_port() 发 CONNECT), False 直连。
+    端口走 proxy_port() 而不是常量: 首选端口被占时本次实例会顺延时, 再连死的那个
+    编号就测不到自己(测速线程连的是隔壁程序, 数字全是假的)。
     下到一半超时不算失败 —— 照样如实记下"这么多秒只下了这么多", 因为那正是
     用户"转圈半天"的那一段, 记成失败反而看不到真相。
     """
@@ -1083,7 +1188,7 @@ def _speed_download(use_proxy, max_bytes=65536, overall=20.0):
     peer = ''
     try:
         if use_proxy:
-            raw = socket.create_connection(('127.0.0.1', PROXY_PORT), timeout=6.0)
+            raw = socket.create_connection(('127.0.0.1', proxy_port()), timeout=6.0)
             # create_connection 的 timeout 只管"连上"这一步, 连上之后 socket 又变回
             # 阻塞模式 —— 不给 recv 设超时的话, 对面不回就永远卡在这儿, 整个测速线程
             # 挂死(实测出现过: 一轮测速卡住, 直连那条一直没结果)。
@@ -2173,8 +2278,19 @@ _LOSS_TOP = 10
 
 
 def loss_probe_async(good):
-    """后台抽一轮丢包样本（同一时刻只跑一轮，跑不完不排队）。"""
-    ips = [ip for ip, _ms in (good or [])][:_LOSS_TOP]
+    """后台抽一轮丢包样本（同一时刻只跑一轮，跑不完不排队）。
+
+    入参可能是 github / raw / pages 三池合并的列表, 这里按 IP 去重, 免得重叠段
+    (CANDIDATE_IPS_RAW 本身就含 CANDIDATE_IPS) 被重复探测; 仍只取前 _LOSS_TOP 个。
+    """
+    seen = set()
+    ips = []
+    for ip, _ms in (good or []):
+        if ip not in seen:
+            seen.add(ip)
+            ips.append(ip)
+        if len(ips) >= _LOSS_TOP:
+            break
     if not ips:
         return
     with _LOSS_LOCK:
@@ -2303,6 +2419,11 @@ def feedback_text():
         '运行: %s' % py_txt,
         '时间: %s' % time.strftime('%Y-%m-%d %H:%M:%S'),
         '加速: %s' % ('已开启' if proxy_on() else '未开启'),
+        # 【2026-10-30 端口顺延】首选端口被别的程序占着时会自动换到备选端口。
+        # 反馈包里没有这个数就没法解释"PAC 里写的端口和 8787 对不上"。
+        '代理端口: %d%s' % (proxy_port(),
+                            '' if proxy_port() == PROXY_PORT
+                            else '（首选 %d 被占, 本次顺延）' % PROXY_PORT),
         '系统代理: PAC %s' % ('已指向本程序' if proxy_on() else '未接管'),
         '官方 IP 表: %s · 候选 %d 个（IPv4 %d / IPv6 %d）'
         % (_META_SOURCE[0] or '未同步(用内置表)', len(CANDIDATE_IPS),
@@ -2344,6 +2465,17 @@ def feedback_text():
         ) or '还没有样本'),
         '本次会话: PAC 命中 %d · 退回直连 %d' % (hits_snapshot()['pool'],
                                               hits_snapshot()['sys']),
+        # 【2026-10-30 新增】git / SSH / DoH 三块各一行 —— 这三样都是这次参考
+        # FastGithub 与 Steam302 之后加进来的，出问题时得能在反馈包里看出状态。
+        '本机 git: %s' % git_status_line_cached(),
+        '最近一次 git 接管/还原: %s' % (git_last_note() or '本次运行还没动过 git 配置'),
+        'SSH 通道: %s' % (' · '.join(
+            '%s %s(%s)' % (r.get('label') or '?',
+                           '通 %dms' % r['ms'] if r.get('ok') else '不通',
+                           (r.get('why') or '')[:40])
+            for r in ssh_result_public()['rows']) or '还没测过'),
+        'DoH 补池: %s' % (doh_status()['text'] or '本次运行还没触发过(只在池子见底时问)'),
+        sess_line(),
         '',
         '--- 日志尾部 50 行 ---',
     ]
@@ -2641,8 +2773,12 @@ class Health(object):
             # 今天装机版满屏 400，就是它带着 20.200.245.244 一路复活到转发名单最前面。
             if self._good and len(good) < len(self._good) // 2:
                 have = {i for i, _ in good}
+                # 本机若无 IPv6 出口, 上一轮残留的 IPv6 候选不许再被带回来 —— 否则它们
+                # 没经过本轮探测(被网关剔掉了)却仍混进候选, 一旦被选中就整段超时。
+                _no_v6 = not local_has_ipv6()
                 carried = [(i, m) for i, m in self._good
-                           if i not in have and not _bad_edge(i)]
+                           if i not in have and not _bad_edge(i)
+                           and (not _no_v6 or ':' not in i)]
                 for i, _m in carried:
                     t = self._tier.get(i)
                     if t:
@@ -2803,6 +2939,136 @@ def fetch_official_ips():
     return list(CANDIDATES)
 
 
+# ------------------------------------------------------------------ 干净解析（DoH）
+# 【2026-10-30 学 FastGithub 的「加密 DNS」与 Steamcommunity_302 的「DNS 重定向」】
+# 边界一个字不动：本程序**不改 hosts、不改系统 DNS、不要管理员权限**。这里做的是另一件
+# 事 —— 直接向公共 DNS 的 HTTPS 接口查一次，拿一份"没被本地解析污染过"的地址，然后
+# 照老规矩逐个实测，真握手成功的才进池，失败的一个都不留。
+#
+# 为什么值得加（本机当天的实测对照）：系统 DNS 历史上给 github.com 回过 2001::1 /
+# 78.16.49.15 这种污染地址（见上面 codeload 那段记录），而 dns.alidns.com 同一个查询
+# 当场给的是 20.205.243.166 —— 官方段表拉不到、系统 DNS 又在骗人的时候，这是唯一还能
+# 拿到真地址的路。FastGithub 用 dnscrypt-proxy 走同一目的，但那要多一个外部程序和端口。
+#
+# 两条硬约束（都是"不能断连接"逼出来的）：
+#   · 必须**显式绕开本机代理**（ProxyHandler({})）：查询请求要是不经意绕回狐径，
+#     而狐径又在等这份结果 —— 自己等自己就是死锁，症状是整个自愈卡住；
+#   · 拿回来的地址一律要过体检（TCP 443 + 证书 + HTTP 首包 2xx/3xx）才算数，
+#     DoH 说什么都不算证据。这样即使 DNS 给了个假地址，也只是白测一轮，不会污染池子。
+DOH_SERVERS = ('https://dns.alidns.com/resolve', 'https://doh.pub/resolve')
+DOH_TIMEOUT = 6.0
+DOH_COOLDOWN = 180.0      # 3 分钟内不重复问：自愈在连着触发时不许拿查询去轰炸公网
+DOH_MIN_GOOD = 2          # 池子里活着的地址少于这个数才值得去问一次
+DOH_MAX_IPS = 8           # 一次最多带几个新地址去体检，免得把体检时间拖长
+_DOH_TS = [0.0]
+_DOH_LOCK = threading.Lock()
+_DOH_SOURCE = ['']        # 上次真正答话的那台，面板与反馈包要如实报出来
+_DOH_LAST = [0.0, 0, '']  # 上次补池：时间 / 新增几个 / 一句话结论
+
+
+def _doh_opener():
+    """不经任何代理的一条 opener（DoH 查询专用，绝不能绕回本机代理）。"""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def doh_lookup(host, itype='A', timeout=DOH_TIMEOUT):
+    """向公共 DNS 的 HTTPS 接口要一份地址，返回 [ip, ...]。
+
+    任何一台问不到就换下一台；全都问不到返回 []，**不抛异常** —— 这条是旁路，
+    它失败只能让候选池少几个地址，不能把调用它的体检或自愈带崩。
+    """
+    out = []
+    opener = _doh_opener()
+    for base in DOH_SERVERS:
+        url = '%s?name=%s&type=%s' % (base, urllib.parse.quote(host), itype)
+        try:
+            req = urllib.request.Request(
+                url, headers={'Accept': 'application/dns-json',
+                              'User-Agent': 'foxpath-helper'})
+            with opener.open(req, timeout=timeout) as r:
+                d = json.loads(r.read().decode('utf-8', 'replace'))
+        except Exception:
+            continue
+        if not isinstance(d, dict):
+            continue
+        for a in (d.get('Answer') or []):
+            try:
+                if int(a.get('type') or 0) not in (1, 28):     # 只认 A 与 AAAA
+                    continue
+            except Exception:
+                continue
+            ip = str(a.get('data') or '').strip().rstrip('.')
+            # 复用手动 IP 那套校验(审查 M-14): 回环/内网/链路本地/组播一律不收。
+            if ip and not _manual_ip_reject(ip) and ip not in out:
+                out.append(ip)
+        if out:
+            _DOH_SOURCE[0] = (base.split('//')[1].split('/')[0])
+            break
+    return out
+
+
+def doh_refresh_pools(reason=''):
+    """查一次干净解析、把**实测通过**的地址并进候选池。返回一句话(可能为空)。
+
+    调用时机只有两处，都是"池子快见底"的时候：自愈流程里、以及体检后发现活着的太少。
+    带 DOH_COOLDOWN 闸门，免得链路抖动时反复去问公网。
+    """
+    now = time.time()
+    with _DOH_LOCK:
+        if now - _DOH_TS[0] < DOH_COOLDOWN:
+            return ''
+        _DOH_TS[0] = now
+    global CANDIDATES
+    added = []
+    tried = 0
+    for host, pool in (('github.com', HEALTH), ('raw.githubusercontent.com', HEALTH_RAW)):
+        ips = []
+        for itype in ('A', 'AAAA'):
+            for ip in doh_lookup(host, itype)[:DOH_MAX_IPS]:
+                if ip not in ips:
+                    ips.append(ip)
+        if not ips:
+            continue
+        fresh = [i for i in ips if i not in pool.candidates()]
+        if not fresh:
+            continue
+        tried += len(fresh)
+        good = []
+        try:
+            good = pool.refresh(fresh, timeout=4.0) or []
+        except Exception as e:
+            log('DoH 地址体检出错(%s): %s' % (host, e))
+        for ip, _ms in good:
+            added.append(ip)
+        log('DoH(%s) 给 %s 的 %d 个地址, 实测通过 %d 个: %s%s'
+            % (_DOH_SOURCE[0] or '?', host, len(fresh), len(good),
+               ', '.join(i for i, _ in good[:5]), '' if reason else ''))
+    if added:
+        CANDIDATES = list(dict.fromkeys(list(CANDIDATES) + list(added)))
+        log('DoH 补池完成: 新增 %d 个可用地址, 候选表现共 %d 个'
+            % (len(added), len(CANDIDATES)))
+    if added:
+        msg = 'DoH(%s) 补池: 新增 %d 个实测通过的地址' % (_DOH_SOURCE[0], len(added))
+    elif tried:
+        msg = 'DoH(%s) 给了 %d 个地址, 实测一个都没通过' % (_DOH_SOURCE[0], tried)
+    else:
+        msg = 'DoH 没问到新地址(两台都没答话, 或地址已在池里)'
+    _DOH_LAST[0] = now
+    _DOH_LAST[1] = len(added)
+    _DOH_LAST[2] = msg
+    return msg
+
+
+def doh_status():
+    """面板/反馈包用的 DoH 补池近况。没跑过就如实给"还没用过"。"""
+    at, n, msg = _DOH_LAST
+    return {'at': at, 'added': n, 'text': msg,
+            'last_age': int(time.time() - at) if at else None,
+            'servers': list(DOH_SERVERS),
+            'next_in': max(0, int(DOH_COOLDOWN - (time.time() - _DOH_TS[0])))
+                     if _DOH_TS[0] else 0}
+
+
 def dns_fallback_ips():
     """手上 IP 全死时的最后一条路: 问系统 DNS github.com 现在指向哪。
     DNS 给的多半也是死的, 但值得一试, 而且换了宽带/换了 DNS 就可能是活的。"""
@@ -2837,6 +3103,19 @@ def recover():
         CANDIDATES = list(dict.fromkeys(list(CANDIDATES) + list(ips)))
         log('自愈成功并已回写候选表: 候选 %d 个' % len(CANDIDATES))
         return good
+
+    # 【2026-10-30 新增一步·排在系统 DNS 之前】官方表不行就先问一次干净解析(DoH),
+    # 再退去问系统 DNS —— 顺序是有讲究的: 这条线恰恰是"系统 DNS 在骗人"的时候最有用,
+    # 反过来先问系统 DNS 拿到的多半还是那批污染地址(2001::1 那种), 白测一轮。
+    # 整步包在 try 里: 问不到只是少一个来源, 不许把自愈带崩。
+    try:
+        got = doh_refresh_pools('(自愈里)')
+        doh_good, _dts = HEALTH.snapshot()
+        if got and doh_good:
+            log('自愈靠 DoH 补上的地址起来了')
+            return doh_good
+    except Exception as e:
+        log('DoH 补池这一步出错(继续走系统 DNS): %s' % e)
 
     extra = [i for i in dns_fallback_ips() if i not in ips]
     if extra:
@@ -3144,7 +3423,10 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         # _stall_rank 是"连上了但正文搬不动/半途断流"。老写法只看前者, 于是那种
         # "TCP 0.1 秒赢下抢连、正文一个字节不来"的 IP 永远欠不到账, 每轮都抢赢、
         # 每次都把浏览器吊在半路(本机实测 229KB / 278KB 断流那两发就是它)。
-        rest.sort(key=lambda ip: _fail_rank(ip) + _stall_rank(ip))   # 两本账都往后靠
+        # 【2026-10-30 改·选路评分改写】两本账(_fail_rank/_stall_rank)只解决"已知坏 IP",
+        # 漏了"握手快但丢包高/吞吐差"的新坏 IP。改用 _rank_key: 在原来的基础上叠加
+        # 丢包抽样惩罚、实测吞吐加成、证据新鲜度, 把"快但不稳"的 IP 压到后面。
+        rest.sort(key=_rank_key)
         # 摊到不同网段后再并发抢连: 一段全死还有别的段顶上
         cand += _pick_spread(rest, per_group=2, limit=6)
         for x in _hot[2:]:
@@ -3681,32 +3963,167 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             log('连接 %s 失败: %s' % (host, e))
             return None, None
 
+    # 【2026-10-30 新增·握手阶段透明重试】
+    # CONNECT 隧道里客户端握着自己那半边 TLS: 一旦 200 established 发出、客户端开始 TLS,
+    # 中途换 IP 续传在架构上不可能(应用层数据不能重放)。但握手阶段(客户端发 ClientHello、
+    # 等 ServerHello)可以透明换 IP —— 把 ClientHello 缓冲下来, 上游若静默/超时不应答就关掉它、
+    # 换下一个候选、把同一份 ClientHello 重放过去, 客户端完全无感。这只兜得住"握手阶段就死"
+    # 的 0 字节/静默上游类; 搬了一半被 RST 的中途断流只能靠选路别选中高丢包 IP 来规避
+    # (见 _rank_key 与 _connect_pool 排序)。
+    def _handshake_phase(self, up, used, key, seed_client):
+        """握手阶段: 把客户端发来的数据(ClientHello 等)转发给上游, 等上游回首字节(ServerHello)。
+
+        返回 (hs, cb): hs 为成功字典或 None, cb 为这一阶段累计的客户端数据(供换 IP 后重放)。
+        hs 成功字典含 up_bytes(上游首段已收字节)/ first_ms(首字节耗时)/ bytes_up(上游首段字节数);
+        超时或出错(上游静默、一个字节都不给)hs 为 None。
+        """
+        conn = self.connection
+        _t_hs = time.time()
+        _cb = seed_client
+        _ub = b''
+        _got_first = False
+        _first_ms = 0.0
+        if _cb:                      # 换 IP 重放: 先把缓冲的客户端数据发给新上游
+            try:
+                up.sendall(_cb)
+            except OSError:
+                return None, _cb
+        _deadline = time.time() + _TUNNEL_HS_TIMEOUT
+        try:
+            up.settimeout(_TUNNEL_HS_TIMEOUT)
+            conn.settimeout(_TUNNEL_HS_TIMEOUT)
+        except Exception:
+            pass
+        while time.time() < _deadline:
+            r, _, e = select.select([conn, up], [], [conn, up], _TUNNEL_HS_TIMEOUT)
+            if e:
+                return None, _cb
+            if not r:
+                # 双方都静默满窗口: 客户端没发、上游也没应 = 静默上游, 判死
+                if not _got_first:
+                    return None, _cb
+                return {'up_bytes': _ub, 'first_ms': _first_ms,
+                        'bytes_up': len(_ub)}, _cb
+            for s in r:
+                try:
+                    data = s.recv(65536)
+                except OSError:
+                    return None, _cb
+                if not data:
+                    # 对端关连接: 上游先关且还没给首字节 = 死; 已给过首字节则当握手结束
+                    if s is up and not _got_first:
+                        return None, _cb
+                    return {'up_bytes': _ub, 'first_ms': _first_ms,
+                            'bytes_up': len(_ub)}, _cb
+                if s is conn:
+                    _cb += data
+                    try:
+                        up.sendall(data)
+                    except OSError:
+                        return None, _cb
+                else:
+                    if not _got_first:
+                        _first_ms = (time.time() - _t_hs) * 1000.0
+                        _got_first = True
+                    _ub += data
+                    # 拿到首字节即可结束握手阶段, 后续双向搬运交给 _relay
+                    return {'up_bytes': _ub, 'first_ms': _first_ms,
+                            'bytes_up': len(_ub)}, _cb
+        if not _got_first:
+            return None, _cb
+        return {'up_bytes': _ub, 'first_ms': _first_ms, 'bytes_up': len(_ub)}, _cb
+
+    def _connect_tunnel(self, host, port, key):
+        """建连 + 握手阶段透明重试。返回 (upstream, used_ip, hs) 或 (None, None, hs)。
+
+        hs 为 {} 表示"连候选都没有"(还没发过 200 established, 调用方干净回 502);
+        hs 为 {'committed': True} 表示"200 已发但所有候选握手阶段都死了"(调用方关客户端,
+        让浏览器自己重试 —— 下一轮 _connect 会因降权避开这批坏 IP);
+        否则 hs 含握手阶段的 up_bytes/first_ms/bytes_up, 交给 _relay 续传。
+        """
+        _attempts = 0
+        _cb = b''          # 客户端在握手阶段发来的数据(ClientHello 等), 换 IP 后重放用
+        while _attempts < _TUNNEL_RETRY:
+            _attempts += 1
+            up, used = self._connect(host, port)
+            if up is None:
+                return None, None, {}
+            if _attempts == 1:
+                # 必须先发 200 established: CONNECT 协议里客户端要先收到它才发 ClientHello,
+                # 而 ClientHello 是后面换 IP 重放必需的握手数据。
+                try:
+                    self.wfile.write(b'HTTP/1.1 200 Connection established\r\n\r\n')
+                    self.wfile.flush()
+                except Exception:
+                    try:
+                        up.close()
+                    except Exception:
+                        pass
+                    return None, None, {'committed': True}
+            hs, _cb = self._handshake_phase(up, used, key, _cb)
+            if hs is None:
+                # 上游握手阶段就死(0 字节/静默) —— 这是强负信号(连 TLS 都没应答), 立刻踢出
+                # 候选池, 逼着下一轮 _connect 换一个完全不同的 IP, 而不是在坏 IP 上反复空等
+                # 一个 _TUNNEL_HS_TIMEOUT。和"搬了一半才断"的时好时坏不同, 这种基本就是当下
+                # 死的, 踢掉不亏; 真活了体检会把它捞回来。
+                _stall_note(used, 0)
+                HEALTH.drop(used)
+                _hot_drop(key, used)
+                try:
+                    up.close()
+                except Exception:
+                    pass
+                _web_record(key, WEB_STALL, 0, 0)
+                trigger_selfheal()
+                continue
+            _ub = hs.get('up_bytes', b'')
+            if _ub:
+                try:
+                    self.connection.sendall(_ub)
+                except Exception:
+                    try:
+                        up.close()
+                    except Exception:
+                        pass
+                    return None, None, {'committed': True}
+            return up, used, hs
+        return None, None, {'committed': True}
+
     def _tunnel(self, target):
         host, _, p = target.partition(':')
         port = int(p or 443)
         self._read_headers()
         _key = _pool_key_for(host)
         _t0 = time.time()
-        up, used = self._connect(host, port)
+        # 握手阶段透明重试见 _connect_tunnel: 建连后先确认上游会应答 TLS(首字节), 不应答
+        # 就换新鲜 IP 重放同一份 ClientHello, 客户端无感。只兜得住"握手阶段就死"的 0 字节/
+        # 静默上游类; 搬了一半被 RST 的中途断流在 CONNECT 架构下无法透明续传, 只能靠选路
+        # 别选中高丢包 IP(见 _rank_key 与 _connect_pool 排序)来规避。
+        up, used, hs = self._connect_tunnel(host, port, _key)
         _conn_ms = (time.time() - _t0) * 1000.0
         if up is None:
-            self._send(502, b'Bad Gateway')
-            # 【2026-10-26 三点整改·③】建连就没成 = 用户体感"打不开", 记进网页台账。
-            _web_record(_key, WEB_REFUSED, _conn_ms, 0)
-            trigger_selfheal()
+            if hs is None:
+                # 连候选都没有: 还没发过 200 established, 干净回 502
+                self._send(502, b'Bad Gateway')
+                _web_record(_key, WEB_REFUSED, _conn_ms, 0)
+                trigger_selfheal()
+            else:
+                # 200 已发、所有候选握手阶段都死了: 关掉客户端, 让浏览器自己重试
+                # (下一轮 _connect 会因降权避开这批坏 IP)。不再发 502(会污染已建立的隧道)。
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+                _web_record(_key, WEB_REFUSED, _conn_ms, 0)
+                trigger_selfheal()
             return
         # 【2026-10-24】面板"本次会话"那一格：PAC 命中走候选池 / 退回系统解析各算一次。
         # 只统计**转发成功**的连接，失败的不算命中。
         hit_count(bool(used))
-        try:
-            self.wfile.write(b'HTTP/1.1 200 Connection established\r\n\r\n')
-            self.wfile.flush()
-        except Exception:
-            up.close()
-            return
         if used:
             log_conn('%s -> %s' % (host, used))
-        out = self._relay(up)
+        out = self._relay(up, init_first_ms=hs.get('first_ms', 0.0),
+                          init_bytes_up=hs.get('bytes_up', 0))
         # 【2026-10-26 三点整改·②③】这条隧道到底有没有把页面搬回来, 是网页台账
         # 唯一的原材料 —— 只有真实转发知道答案, 体检不知道(体检只看 GET / 答不答)。
         # 耗时按"建连 + 首字节"算: 浏览器等的就是这一段, 隧道后面挂多久是.keep-alive
@@ -3719,10 +4136,27 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             # 反过来也不因为"这次成了"就把账清零: 2026-10-26 已经吃过"一成功就清零"
             # 的亏(见 _SYS_FAIL 的修法), 时好时坏的链路只让账自己按窗口过期。
             _n = _stall_note(used, out['bytes_up'])
-            log('%s 断流: %s 这次搬了 %d 字节就停了(窗口内第 %d 次), 排序已降权%s'
+            # 【2026-10-30 改·稳定不掉线】两类"彻底搬不动"首次即踢, 不等第二次:
+            #   ① 一个字节都没搬回来(bytes_up==0): TLS 握上了却连响应首字节都不给;
+            #   ② 传输中被看门狗抓住"静默满 STALL_WATCHDOG 秒"(stalled_watchdog): 
+            #      搬了一段却卡死不动, 是反馈包里 github.com 大页面 20~24 秒超时那一类,
+            #      铁证级坏链路 —— 不踢的话浏览器重试还会再撞它一次。两类都只踢这一个
+            #      (不会清光候选; 真活了体检会捞回来)。其余"时好时坏"仍满 _STALL_DROP_POOL
+            #      次才踢, 避免把偶发抖动的好 IP 误杀。
+            _no_data = (out['bytes_up'] == 0)
+            _wd = bool(out.get('stalled_watchdog'))
+            # 【2026-10-30 实测回退】曾把 _wd 也算进"首次即踢", 结果每踢一个就触发一次
+            # 立即全池重测, 本机这批官方 IP 全是限速的勉强可用货色 —— 候选被不断踢出,
+            # 自愈回收数一路掉(28→22→12), 面板被重测负载拖到间歇无响应, 反而更不稳。
+            # 所以看门狗只负责"把失败在 15 秒内暴露出来"(不再静默挂到 600 秒),
+            # 排序压制交给 _rank_key(每次断流 +10)—— 足够把它挤下首选, 又不至于清空候选。
+            # 仍然保留: 0 字节断流(=彻底搬不动)立即踢, 其余满 _STALL_DROP_POOL 次才踢。
+            _drop = (_n >= _STALL_DROP_POOL) or _no_data
+            log('%s 断流: %s 这次搬了 %d 字节就停了(窗口内第 %d 次)%s%s'
                 % (host, used, out['bytes_up'], _n,
-                   '' if _n < _STALL_DROP_POOL else ', 请出候选池'))
-            if _n >= _STALL_DROP_POOL:
+                   ', 看门狗判定' if _wd else '',
+                   '' if not _drop else ', 请出候选池'))
+            if _drop:
                 HEALTH.drop(used)
                 _hot_drop(_key, used)
                 trigger_selfheal()
@@ -3731,14 +4165,16 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             HEALTH.drop(used)
             trigger_selfheal()
 
-    def _relay(self, up):
+    def _relay(self, up, init_first_ms=0.0, init_bytes_up=0):
         conn = self.connection
         pair = [conn, up]
         up_err = False
         stalled = False
-        _first_up = True
-        bytes_up = 0
-        first_ms = 0.0
+        stalled_watchdog = False   # 由"传输中静默满 STALL_WATCHDOG 秒"看门狗判定(铁证级坏链路)
+        # 握手阶段已拿到首字节就不算"首字节"(避免重复计时); 已搬的字节也要续上
+        _first_up = (init_first_ms <= 0.0)
+        bytes_up = init_bytes_up
+        first_ms = init_first_ms
         _t_relay = time.time()
         # 转发阶段由 select 统一管超时, 先把两端 socket 的超时都放宽到同一个空闲
         # 上限: 客户端那端带着 StreamRequestHandler 的 30 秒(self.timeout), 上游
@@ -3752,23 +4188,28 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 pass
         try:
             while True:
-                r, _, e = select.select(pair, [], pair, RELAY_IDLE_TIMEOUT)
+                r, _, e = select.select(pair, [], pair, STALL_WATCHDOG)
                 if e:
                     stalled = True
                     break
                 if not r:
-                    # 双方都静默满一个空闲上限才收摊, 而且写进日志 ——
-                    # 不再像以前那样不声不响地把流掐掉。
-                    log('转发空闲超过 %d 秒, 关闭这条连接(对端可能已放弃)' % RELAY_IDLE_TIMEOUT)
+                    # 传输中任一方沉默满 STALL_WATCHDOG 秒(既无 FIN 也无字节)即判死:
+                    # 活跃传输里 15 秒一字不来, 对 GitHub 而言就是"搬了一半不动"的坏链路,
+                    # 不等 600 秒的空闲上限 —— 在客户端自己超时放弃前先动手换 IP、关连接,
+                    # 浏览器收到半截连接会自动重试, 落到干净 IP 上。
+                    log('转发传输中静默超过 %.0f 秒(对端疑似卡死), 判断流并关闭'
+                        % STALL_WATCHDOG)
                     stalled = True
+                    stalled_watchdog = True
                     break
                 stop = False
                 for s in r:
                     try:
                         data = s.recv(65536)
                     except TimeoutError:
-                        # 3.10 起 socket.timeout 就是 TimeoutError
-                        log('转发等待数据超过 %d 秒, 关闭这条连接' % RELAY_IDLE_TIMEOUT)
+                        # 3.10 起 socket.timeout 就是 TimeoutError(正常情况下由上面
+                        # 的 select 看门狗先拦下, 这里是兜底)
+                        log('转发等待数据超过 %.0f 秒, 关闭这条连接' % STALL_WATCHDOG)
                         stalled = s is up or bytes_up > 0
                         stop = True
                         break
@@ -3836,7 +4277,8 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         else:
             kind = WEB_STALL
         return {'kind': kind, 'bytes_up': bytes_up, 'first_ms': first_ms,
-                'stalled': stalled, 'up_err': up_err}
+                'stalled': stalled, 'up_err': up_err,
+                'stalled_watchdog': stalled_watchdog}
 
 
 class ProxyServer(socketserver.ThreadingTCPServer):
@@ -3910,14 +4352,71 @@ def _port_taken(port, err, what):
     raise SystemExit(2)
 
 
-def start_proxy():
+def proxy_port():
+    """本次实例**真正在听**的代理端口（顺延之后可能与 PROXY_PORT 不同）。
+
+    凡是要把端口写进对外口径的地方（PAC、git 接管、面板、反馈包、running.json）
+    都必须走这个函数，不要再直接读 PROXY_PORT —— 否则顺延生效后 PAC 里写的
+    还是那个没人听的端口，症状正是"加速看着开着，一个字节都没转发"。
+    """
+    return int(_PROXY_PORT[0])
+
+
+def _port_is_live(port, timeout=0.25):
+    """这个本机端口上是不是**真有人在听**。
+
+    为什么不能只靠 bind 报不报错：ProxyServer 沿用 socketserver 的
+    allow_reuse_address=True（Windows 上是 SO_REUSEADDR），而 SO_REUSEADDR 在
+    Windows 允许绑到一个**别人正在听**的端口上而不报错 —— 于是 bind 成功、
+    我们以为自己是这个端口的主人，实际进来的连接全给隔壁那个程序接走。
+    桌面壁纸和狐径都记过这本账（"忙端口看起来是空的"）。先连一把最省事：
+    连得上去就说明端口有主，直接换下一个候选，不去抢它。
+    """
     try:
-        srv = ProxyServer(('127.0.0.1', PROXY_PORT), ProxyHandler)
-    except OSError as e:
-        # 审查 M-13: 先探"是不是自己的实例", 是就提示/复用, 而不是弹错退出
-        _port_taken(PROXY_PORT, e, '代理')
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            return s.connect_ex(('127.0.0.1', port)) == 0
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+    except Exception:
+        return False
+
+
+def _bind_proxy_server():
+    """按 首选 → 备用 的顺序把代理起起来。返回 (server 或 None, 端口或最后一个异常)。"""
+    last = None
+    for port in (PROXY_PORT,) + tuple(PROXY_PORT_ALTS):
+        if _port_is_live(port):
+            log('端口 %d 上已经有东西在听, 换下一个候选(不让它, 也不跟它抢)' % port)
+            last = OSError('port %d already in use' % port)
+            continue
+        try:
+            srv = ProxyServer(('127.0.0.1', port), ProxyHandler)
+        except OSError as e:
+            last = e
+            log('绑定 %d 失败(%s), 换下一个候选' % (port, e))
+            continue
+        _PROXY_PORT[0] = port
+        return srv, port
+    return None, last
+
+
+def start_proxy():
+    srv, port = _bind_proxy_server()
+    if srv is None:
+        # 审查 M-13 的老口径留着：_port_taken 会先问一句"8788 上是不是我们自己的
+        # 另一个实例"，是就安静复用(0)，全被占才算真冲突(弹窗 + 退出 2)。
+        _port_taken(PROXY_PORT, port, '代理')
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    log('代理已启动 127.0.0.1:%d' % PROXY_PORT)
+    if port == PROXY_PORT:
+        log('代理已启动 127.0.0.1:%d' % port)
+    else:
+        log('代理已启动 127.0.0.1:%d（首选端口 %d 被别的程序占着, 本次自动顺延 —— '
+            'PAC 里写的就是这个新端口, 加速照常生效）' % (port, PROXY_PORT))
 
 
 # ------------------------------------------------------------------- 开关
@@ -3943,8 +4442,10 @@ def _load_backup():
     return None
 
 
-def enable_proxy():
-    """启用加速, 返回 (ok, msg) —— 面板要按 ok 明确告诉用户成没成(审查 H-2)。
+def _enable_proxy_registry():
+    """启用加速(只管注册表那一段), 返回 (ok, msg) —— 面板要按 ok 明确告诉用户成没成(审查 H-2)。
+
+    对外请用 enable_proxy(): 那层会把「本机 git 接管」一起做完。
 
     整段「读原值 -> 写备份 -> 写注册表」在同一把 _REG_LOCK 里完成(审查 H-3):
     并发/连点时后一个请求会在前一个写完之后才判断, 不会拿我们自己的 PAC 当原值
@@ -4000,8 +4501,10 @@ def enable_proxy():
         return True, '加速已开启, 原系统代理设置已备份'
 
 
-def disable_proxy():
-    """停用并还原, 返回 (ok, msg) —— 失败原因要在面板上写清楚(审查 H-2)。
+def _disable_proxy_registry():
+    """停用并还原(只管注册表那一段), 返回 (ok, msg) —— 失败原因要在面板上写清楚(审查 H-2)。
+
+    对外请用 disable_proxy(): 那层会把「本机 git 接管」的还原一起做完。
 
     与 enable_proxy 共用同一把 _REG_LOCK(审查 H-3): 启用与还原不会交叉执行,
     否则"刚写好的还原备份"可能被并发的还原流程读成半截。
@@ -4094,6 +4597,649 @@ def proxy_on():
     return host in ('127.0.0.1', 'localhost') and port == PANEL_PORT
 
 
+# ---------------------------------------------------------- 本机 git 接管
+# 【2026-10-30 学 FastGithub：把 git clone / pull / push 一起纳进来】
+#
+# FastGithub 能让"浏览器和 git 同时通"，靠的是内核驱动透明拦截（WinDivert）——
+# 那要管理员权限，正是本项目明说不做的三件事之一。git 这边有一条等价但干净的路：
+# 它自己就支持**按 URL 前缀**配代理（http.<url>.proxy），写在当前用户的 ~/.gitconfig
+# 里，普通权限、随时可撤。本段接管的就是这几条键。
+#
+# 为什么值得做（本机 2026-10-30 现场）：这几条键历来是**手工**设的，程序根本不知道
+# 它们存在 —— 于是"狐径没在跑 + git 指着 127.0.0.1:8787"这个组合会把每一次 push
+# 直接打死（fatal: Failed to connect to 127.0.0.1 port 8787），而这恰恰是手工设完之后
+# 最容易出现的状态（本机当天下午就是这个样子：8787 没人听，五条键还钉在那儿）。
+# 接管之后这件事有了归属：写入与还原都挂在 enable/disable 上，于是面板按钮、退出、
+# /api/quit、--restore、开机自愈这五条路一条都不会漏 —— 这才是"不能断连接"的正解。
+#
+# 红线（沿用项目老规矩）：
+#   · 写之前先读原值存进 git-backup.json；原来没设过记成 None，还原时就 unset 掉；
+#   · 只动自己动得了的键：当前值是一个**外部代理**（不是 127.0.0.1）的，一律不覆盖；
+#   · 接管范围 = PAC 清单里 git 真会用到的那几个域；api.github.com 仍然不在其中
+#     （候选池全是 web 段，拿它连 api 是错的，见 tests/test_ip_sources.py 第 2 条）；
+#   · 但"名单外、值却指着狐径某个端口"的键（用户手工给 api.github.com / gist.github.com
+#     设过的那些）**认值得跟着走**：见 _git_residue_keys 上方那段——端口一顺延，把它们
+#     留在老端口上等于留下一枚定时炸弹，而程序又不知道它们存在，还原也就永远不会清。
+#   · 每一步都只写日志、不弹窗：接管失败绝不能把加速本身拖下水。
+GIT_TAKEOVER_DEFAULT = True
+GIT_PROXY_HOSTS = ('github.com', 'codeload.github.com', 'uploads.github.com',
+                   'raw.githubusercontent.com', 'objects.githubusercontent.com')
+GIT_KEY_TMPL = 'http.https://%s/.proxy'
+# "GitHub 一家"的后缀：值指着狐径端口时才有归属，gitlab.com 之类一律不碰。
+GIT_FAMILY_SUFFIXES = ('.github.com', '.githubusercontent.com', '.githubassets.com',
+                       '.github-attachment.com')
+GIT_KEY_REGEXP = r'^http\..*\.proxy$'      # 给 git --get-regexp 用
+GIT_KEY_RE = re.compile(r'^http\.(https?)://([^/]+)/\.proxy$', re.I)   # 把键拆回域名
+GIT_BACKUP_FILE = os.path.join(DATA_DIR, 'git-backup.json')
+_GIT_LOCK = threading.Lock()
+_GIT_NOTE = ['']           # 最近一次接管/还原的人话结论（面板那一格与反馈包都读它）
+# 面板每 3 秒轮一次 /api/status, 而"读 git 那 5 条键 + 扫一遍手工设的键"要起 6 个子进程
+# (约 0.1 秒)。直接现读会把 /api/status 从 2ms 拖成 100ms —— 所以缓存 30 秒,
+# 接管/还原后强制作废。
+_GIT_LINE_CACHE = ['', 0.0]
+_GIT_LINE_TTL = 30.0
+
+
+def _git_note(msg):
+    """记一句人话结论，同时作废面板那一行的缓存。
+
+    接管/还原的**每个**出口都走这里：日后新增一条 return 也只会忘记刷缓存
+    而不会真忘 —— 面板上继续显示 30 秒前的旧状态这种问题不该靠人记。
+    """
+    _GIT_NOTE[0] = msg
+    _GIT_LINE_CACHE[1] = 0.0
+    return msg
+
+
+def git_last_note():
+    """最近一次接管/还原的结论（没做过就是空串）。"""
+    return _GIT_NOTE[0]
+
+
+def git_takeover_on():
+    """要不要把本机 git 的 GitHub 流量也指过来（默认开）。"""
+    with SETTINGS_LOCK:
+        return bool(SETTINGS.get('git_takeover', GIT_TAKEOVER_DEFAULT))
+
+
+def set_git_takeover(on):
+    """开关 git 接管, 返回 (ok, 人话)。关掉时**顺手把已经接管的键还原**。"""
+    with SETTINGS_LOCK:
+        SETTINGS['git_takeover'] = bool(on)
+    ok = save_settings()
+    if on:
+        msg = '已开启 git 接管: 下次启用加速会把本机 git 的 GitHub 流量一起指过来'
+        log(msg)
+    else:
+        msg = '已关闭 git 接管'
+        log(msg)
+        try:
+            git_release()
+        except Exception as e:
+            log('!! 关闭 git 接管时还原失败: %s' % e)
+            msg += '（但还原失败, 请看日志）'
+    if not ok:
+        msg += '(设置没能写进磁盘, 重启后会回到默认值)'
+    return True, msg
+
+
+def _git_exe():
+    """找 git 可执行文件: 只认 PATH。找不到就不接管, 绝不去猜安装目录。"""
+    try:
+        import shutil
+        return shutil.which('git') or ''
+    except Exception:
+        return ''
+
+
+def _run_git(args, timeout=8.0):
+    """跑一条 `git --no-pager config --global ...`。返回 (rc, 输出)，rc=None 表示本机没 git。
+
+    creationflags=CREATE_NO_WINDOW(0x08000000) 是必须的：主程序是 --noconsole 的 exe，
+    少这一个 flag，每接管一次屏幕上就闪一个黑框（影视聚合当年为同样的问题单独改过）。
+    """
+    git = _git_exe()
+    if not git:
+        return None, ''
+    import subprocess
+    kw = {}
+    if os.name == 'nt':
+        kw['creationflags'] = 0x08000000
+    try:
+        p = subprocess.run([git, '--no-pager', 'config', '--global'] + list(args),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=timeout, **kw)
+        return (int(p.returncode or 0),
+                (p.stdout or b'').decode('utf-8', 'replace').strip())
+    except Exception as e:
+        return -1, '%s: %s' % (type(e).__name__, str(e)[:80])
+
+
+def git_target_url():
+    """要写进 git 配置的那个代理地址 —— 端口走 proxy_port(), 不是常量。"""
+    return 'http://127.0.0.1:%d' % proxy_port()
+
+
+def our_proxy_ports():
+    """狐径可能用过的全部端口（首选 + 顺延备选 + 当前实际在听的）。"""
+    ports = {PROXY_PORT, proxy_port()}
+    ports.update(PROXY_PORT_ALTS)
+    return ports
+
+
+def _is_our_proxy_url(v):
+    """这个值指的是**狐径自己**的代理端口吗（含顺延后的备选端口）。
+
+    只判"是不是 127.0.0.1"是不够的：本机 127.0.0.1 上可能跑着别的工具的代理,
+    那是用户自己的东西, 该一条都不动。而指向狐径候选端口的值是上一轮留下的、
+    或是过去手工设的 —— 把它当"原值"存进备份, 还原时就会把一个**可能已经没人
+    听的端口**写回 git, 程序一关 git 就断, 正是"不能断连接"要避免的那种收尾。
+    """
+    try:
+        u = urllib.parse.urlsplit(v or '')
+    except Exception:
+        return False
+    if (u.hostname or '').lower() not in ('127.0.0.1', 'localhost'):
+        return False
+    try:
+        return u.port in our_proxy_ports()
+    except Exception:
+        return False
+
+
+def _git_key_values():
+    """读回当前这几条键的值。返回 {'available': bool, 'keys': {键: 值或''}, 'why': str}。
+
+    rc 的三种含义要分清（git 自己的口径）：0 = 有值，1/5 = 这条键没设过，
+    其它（-1 超时、配置被锁、git 报错）= **读不出来**。最后一种绝不许当成"没设过"
+    往下走 —— 那样等于把可能有值的键当空的接管掉，还原时也没有原值可回。
+    """
+    keys = {}
+    for host in GIT_PROXY_HOSTS:
+        key = GIT_KEY_TMPL % host
+        rc, v = _run_git(['--get', key])
+        if rc is None:
+            return {'available': False, 'keys': {}, 'why': ''}      # 本机没有 git
+        if rc not in (0, 1, 5):
+            return {'available': False, 'keys': {},
+                    'why': '读不到 git 配置(rc=%s %s) —— 这一轮不动 git'
+                           % (rc, str(v)[:40])}
+        keys[key] = v if rc == 0 else ''
+    return {'available': True, 'keys': keys, 'why': ''}
+
+
+def _git_managed_keys():
+    """本程序会主动写入的那几条键。"""
+    return set(GIT_KEY_TMPL % h for h in GIT_PROXY_HOSTS)
+
+
+def _github_family(host):
+    """这个域是不是 GitHub 一家的（api.github.com / gist.github.com 也算）。"""
+    h = (host or '').lower().rstrip('.')
+    return any(h == s.lstrip('.') or h.endswith(s) for s in GIT_FAMILY_SUFFIXES)
+
+
+def _git_residue_keys():
+    """git 里**名单之外**、但值是"狐径某个端口"的 GitHub 键，返回 {键: 当前值}。
+
+    为什么单独认这一类（2026-10-30 真机实测抓出来的洞）：这台机器上手工设过
+    `http.https://api.github.com/.proxy` 和 `gist.github.com` 两条，值都是
+    127.0.0.1:8787。它们不在接管名单里（api 故意不进 IP 池），于是老写法既不会
+    在端口顺延后把它们带走，也不会在还原时清掉 —— 顺延一次，这两条就钉在别的
+    程序的端口上；程序一删，它们就钉在一个没人听的老端口上，gh/gist 相关操作
+    当场死掉，而且日志里一行记录都没有。
+
+    判据用**值**不用域名名单：值指着狐径用过的某个端口 = 这条本来就是为狐径设的，
+    有归属；值是本机 127.0.0.1 但端口不是我们的（别的工具）= 一条都不动。
+    域名也必须先是 GitHub 一家的，gitlab.com 之类即使指着我们端口也不归我们管。
+    """
+    rc, out = _run_git(['--get-regexp', GIT_KEY_REGEXP])
+    if rc != 0:                       # 1/5 = 一条都没有；其它 = 读不出，宁可不改
+        return {}
+    managed = _git_managed_keys()
+    found = {}
+    for line in (out or '').splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        key, val = parts[0].strip(), parts[1].strip()
+        if key in managed:
+            continue                  # 名单里的由主循环按原值记账处理
+        m = GIT_KEY_RE.match(key)
+        if not m or not _github_family(m.group(2)):
+            continue
+        if not _is_our_proxy_url(val):
+            continue
+        found[key] = val
+    return found
+
+
+def _git_backup_read():
+    try:
+        with open(GIT_BACKUP_FILE, encoding='utf-8') as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get('keys'), dict):
+            return d
+    except Exception:
+        pass
+    return None
+
+
+def _git_backup_write(d):
+    try:
+        with open(GIT_BACKUP_FILE, 'w', encoding='utf-8') as f:
+            json.dump(d, f, ensure_ascii=False)
+        return True
+    except Exception as e:
+        log('!! git 接管备份写不下去: %s' % e)
+        return False
+
+
+def _git_backup_drop():
+    try:
+        if os.path.exists(GIT_BACKUP_FILE):
+            os.remove(GIT_BACKUP_FILE)
+    except Exception:
+        pass
+
+
+def git_takeover():
+    """把 GIT_PROXY_HOSTS 这几条键指到本机代理。返回一句人话（空串 = 无事可做）。
+
+    幂等：已经是我们的值就跳过、也不会把它当"原值"记进备份（否则还原就是把
+    自己写回去, 永远还原不掉 —— enable_proxy 当年踩过的那条坑, 这里照同样口径防）。
+
+    除了名单里那五条，还会把名单外、但值明显是为狐径设的 GitHub 键一起带回当前端口
+    （_git_residue_keys）—— 判据是值而不是域名名单，理由写在那个函数的注释里。
+    """
+    if not git_takeover_on():
+        return ''
+    target = git_target_url()
+    with _GIT_LOCK:
+        st = _git_key_values()
+        if not st.get('available'):
+            msg = _git_note(st.get('why') or '本机 PATH 里没有 git, 没有接管')
+            if not st.get('why'):
+                log('本机 PATH 里找不到 git —— 跳过 git 接管(加速本身照常生效)')
+            else:
+                log('!! ' + msg)
+            return msg
+        backup = _git_backup_read() or {'keys': {}}
+        changed = 0
+        skipped = 0
+        claimed = 0
+        for key, cur in sorted(st['keys'].items()):
+            if cur == target:
+                # 已经指着我们就重写一遍(没必要)，但要**认领**它：上一轮被强杀留下的
+                # 键如果不进备份，这一轮"停用并还原"就不会清它 —— git 继续钉在一个
+                # 即将不再有人听的端口上，正是要避免的那种收尾。
+                if _claim_git_key(backup, key):
+                    claimed += 1
+                continue
+            if cur and not _is_our_proxy_url(cur):
+                skipped += 1
+                log('git 键 %s 的值不是狐径留下的(%s) —— 不覆盖, 这条保持原样' % (key, cur))
+                continue
+            # 走到这里只剩两种情况：键本来为空，或者指着狐径自己的某个端口
+            # （上一轮没还原干净、或过去手工设的）。两种都按"原值 = 没设过"记账,
+            # 于是还原是 --unset 而不是把一个可能已经没人听的端口当原值写回去。
+            if not _git_backup_write(_remember_git_backup(backup, key, None)):
+                return _git_note('备份写不进去, 为安全起见没有再修改 git 配置')
+            rc2, out2 = _run_git(['--replace-all', key, target])
+            if rc2 != 0:
+                log('!! 写 git 键 %s 失败(rc=%s): %s' % (key, rc2, out2[:80]))
+                continue
+            changed += 1
+            log('git 已接管 %s -> %s（原值: %s）'
+                % (key, target, cur or '(没设过)'))
+        # 名单外、但值明显是为狐径设的那几条（api.github.com / gist.github.com 一类）：
+        # 不带上它就会在端口顺延后钉死在一个没人听的老端口上，带上了又要能在还原时清掉
+        # —— 所以按"原值 = 没设过"记账，还原走 --unset（同上面那条口径）。
+        renovated = 0
+        for key, cur in sorted(_git_residue_keys().items()):
+            if cur == target:
+                if _claim_git_key(backup, key):
+                    claimed += 1
+                continue
+            if not _git_backup_write(_remember_git_backup(backup, key, None)):
+                return _git_note('备份写不进去, 为安全起见没有再修改 git 配置')
+            rc3, out3 = _run_git(['--replace-all', key, target])
+            if rc3 != 0:
+                log('!! 写 git 键 %s 失败(rc=%s): %s' % (key, rc3, out3[:80]))
+                continue
+            changed += 1
+            renovated += 1
+            log('git 顺带指过来 %s -> %s（原来指着 %s，这条是手工设的）'
+                % (key, target, cur))
+        if skipped and not changed:
+            return _git_note('没有接管: git 里这几条键是别的东西设的代理, 狐径不覆盖')
+        if changed or claimed:
+            backup['port'] = proxy_port()
+            backup['at'] = time.time()
+            if not _git_backup_write(backup):
+                return _git_note('备份写不进去, 为安全起见没有再修改 git 配置')
+        if changed:
+            msg = 'git 已接管 %d 条键(指向 %s)%s' % (
+                changed, target, '，含 %d 条手工设的' % renovated if renovated else '')
+            # 本机实测(2026-10-30 装机)：上一轮留下的键值已经等于 target 时会走认领，
+            # 若只报"接管 2 条"，用户看到 git 里有 7 条指着本机代理、结论却说 2 条，
+            # 会以为程序没管全 —— 认领条数必须一起报。
+            if claimed:
+                msg += '，另认领 %d 条本来就指着本机的' % claimed
+        elif claimed:
+            msg = 'git 本来就指着本机代理, 另认领 %d 条(停用并还原时会一起清掉)' % claimed
+        else:
+            msg = 'git 本来就指着本机代理, 本次没有改动'
+        log('git 接管: ' + msg)
+        return _git_note(msg)
+
+
+def _remember_git_backup(backup, key, cur):
+    """把"进入狐径管理之前"的原值记进备份, 返回备份本身。
+
+    同一个键只记**第一次**看到的值：反复启用/停用不能把上一轮的自己当成原值,
+    否则备份里存的就是狐径地址, 还原等于原地打转（同 enable_proxy 那道闸门一个道理）。
+    """
+    keys = backup.setdefault('keys', {})
+    if key not in keys:
+        keys[key] = cur or None
+    return backup
+
+
+def _claim_git_key(backup, key):
+    """认领一条"本来就指着本机代理"的键（原值记 None），返回是不是**新**认领的。
+
+    为什么不能直接跳过：那种键多半是上一轮被强杀/崩溃留下的。跳过它 = 备份里没有它
+    = 这一轮"停用并还原"不会清它 = git 继续钉在一个马上不再有人听的端口上。
+    反复启用时也不会重复记账（同一个键只认第一次），幂等性和 _remember_git_backup 一致。
+    """
+    keys = backup.setdefault('keys', {})
+    if key in keys:
+        return False
+    keys[key] = None
+    log('git 认领 %s（本来就指着本机代理, 停用并还原时会一起清掉）' % key)
+    return True
+
+
+def git_release(clean_orphan=False):
+    """把 git 配置还原成接管之前的样子。返回一句人话（空串 = 没东西可还原）。
+
+    两条路（顺序不能反）：
+      1) **有备份** —— 按备份逐项写回：原值是 None 就 --unset, 否则写回原值；
+         全部写回成功才撤备份, 有失败就把那几条留在备份里等下一次还原再试；
+      2) **没有备份** —— 平时什么都不动（"不是我们设的就不动"）。只有用户明确跑
+         `--restore` 自救时（clean_orphan=True）才清掉"指着狐径某个端口"的键 ——
+         那是被强杀/删程序留下的死端口残留, 留着比清掉更害人。判据用端口集合而不是
+         "当前端口", 因为端口会顺延：上一轮听 8787、这一轮顺延到 8789 时, 只查 8789
+         就永远清不掉 8787 的残留。
+    """
+    with _GIT_LOCK:
+        backup = _git_backup_read()
+        if backup and isinstance(backup.get('keys'), dict) and backup['keys']:
+            done = 0
+            left = {}
+            for key, orig in sorted(backup['keys'].items()):
+                if orig:
+                    rc, out = _run_git(['--replace-all', key, orig])
+                else:
+                    rc, out = _run_git(['--unset-all', key])
+                    if rc == 5:
+                        # git 的 5 = 这条键本来就不在 —— 目标已经达成, 按已还原处理。
+                        # 注意**只认 5**：以前这里是 `rc not in (0, 5)` 一律记成成功，
+                        # 那等于把"git 写不进去"(配置被锁、权限异常、文件被别的进程占着)
+                        # 也当成还原好了, 于是备份被撤、键继续钉在本机代理上,
+                        # 症状正是"狐径一关 git 就断"（tests/test_git_takeover.py 第 6 条抓到）。
+                        log('git 还原 %s: 键本来就不在, 按已还原处理' % key)
+                        rc = 0
+                if rc != 0:
+                    log('!! git 还原失败 %s(rc=%s): %s' % (key, rc, str(out)[:80]))
+                    left[key] = orig
+                    continue
+                done += 1
+                log('git 已还原 %s -> %s' % (key, orig or '(删掉, 回到没设过)'))
+            if left:
+                # 只把**没还原成**的那几条留在备份里, 下次退出 / --restore 会再试一轮。
+                # 全还原成才撤备份：失败时就撤, 等于把用户的原值丢了, 那几条键会永远
+                # 钉在本机代理上 —— 程序一关 git 就断, 正是要避免的那种收尾。
+                backup['keys'] = left
+                backup['at'] = time.time()
+                _git_backup_write(backup)
+                msg = ('git 已还原 %d 条, 另有 %d 条没做成(原值仍留着, 下次退出或 --restore 再试)'
+                       % (done, len(left)))
+            else:
+                _git_backup_drop()
+                msg = 'git 配置已还原 %d 条' % done if done else 'git 还原没做成, 详见日志'
+            log('git 还原: ' + msg)
+            return _git_note(msg)
+        if not clean_orphan:
+            return ''
+        hit = 0
+        cand = {}
+        st = _git_key_values()
+        cand.update(st.get('keys', {}))
+        cand.update(_git_residue_keys())      # 名单外手工设的那几条也一起清（见其函数注释）
+        for key, cur in sorted(cand.items()):
+            if _is_our_proxy_url(cur):
+                rc, out = _run_git(['--unset-all', key])
+                if rc == 0:
+                    hit += 1
+                    log('--restore: 清掉指向本程序的残留 git 键 %s' % key)
+        msg = ('--restore: 顺手清掉 %d 条指向本程序的 git 残留键' % hit) \
+            if hit else '--restore: git 配置里没有本程序留下的残留'
+        log(msg)
+        return _git_note(msg)
+
+
+def git_status_line():
+    """面板与反馈包共用的一行人话: 现在这几条键归谁管。"""
+    if not git_takeover_on():
+        return 'git 接管已关闭(设置里可打开)'
+    st = _git_key_values()
+    if not st.get('available'):
+        return st.get('why') or '本机没找到 git —— 没有接管'
+    target = git_target_url()
+    vals = list(st['keys'].values())
+    mine = sum(1 for v in vals if v == target)
+    stale = sum(1 for v in vals if v and v != target and _is_our_proxy_url(v))
+    other = sum(1 for v in vals if v and v != target and not _is_our_proxy_url(v))
+    fam = _git_residue_keys()                    # 名单外、为狐径手工设的那几条
+    fam_stale = sum(1 for v in fam.values() if v != target)
+    fam_ours = len(fam) - fam_stale
+    if mine == len(vals):
+        line = 'git 已全部接管(%d/%d 指向 %s)' % (mine, len(vals), target)
+        if fam_ours:
+            line += '，另带 %d 条手工设的' % fam_ours
+        if fam_stale:
+            line += '；还有 %d 条手工设的指着老端口, 停用并还原一次会一起清掉' % fam_stale
+        return line
+    if mine:
+        return 'git 部分接管(%d/%d 指向 %s, 另有 %d 条是别的代理)' % (
+            mine, len(vals), target, other)
+    if stale or fam_stale:
+        return 'git 指着狐径的旧端口(%d 条) —— 点「启用加速」会带回现在的端口' % (
+            stale + fam_stale)
+    return 'git 未接管(这几条键现在%s)' % ('有自己的值' if other else '都是空的')
+
+
+def git_status_line_cached():
+    """给 /api/status 用的版本: 30 秒内的重复请求直接回缓存。
+
+    面板每 3 秒轮一次, 而现读那 5 条键要起 5 个 git 子进程(实测约 0.1 秒) ——
+    /api/status 原本 2ms 返回, 不能为了这一行被拖慢几十倍; 更要紧的是它是
+    浏览器/其它程序判断"狐径还活着"的探针, 拖慢它等于给加速本身添堵。
+    """
+    now = time.time()
+    line, ts = _GIT_LINE_CACHE
+    if line and now - ts < _GIT_LINE_TTL:
+        return line
+    try:
+        line = git_status_line()
+    except Exception as e:
+        line = 'git 状态读不出来: %s' % e
+    _GIT_LINE_CACHE[0] = line
+    _GIT_LINE_CACHE[1] = now
+    return line
+
+
+def enable_proxy():
+    """启用加速 = 注册表那一段 + git 接管，两处一起做完（对外仍是这一个名字）。
+
+    git 接管挂在这里而不是挂在调用方，是为了"五条还原路径一条都不会漏"：
+    面板按钮、托盘退出、/api/quit、--restore、开机自愈全都经过 enable/disable_proxy，
+    写在调用方就得记五处, 漏一处就是"程序关了 git 却钉在死端口上"。
+    接管失败只写日志、只改那行人话, 绝不影响加速本身的成与败。
+    """
+    ok, msg = _enable_proxy_registry()
+    if ok:
+        try:
+            extra = git_takeover()
+            if extra:
+                msg = msg + '；' + extra
+        except Exception as e:
+            log('!! git 接管异常(不影响加速本身): %s' % e)
+    return ok, msg
+
+
+def disable_proxy():
+    """停用并还原 = 注册表还原 + git 还原。
+
+    注意 git 那段是**无条件**跑的：_disable_proxy_registry 有两条"系统代理不是狐径
+    设的, 保持原样"的早退分支(那是对的, 别人的设置不能覆盖), 但 git 那几条键如果
+    确实是我们写的, 就算走到那两条分支也必须还原 —— 留着就是死端口。
+    """
+    ok, msg = _disable_proxy_registry()
+    try:
+        extra = git_release()
+        if extra:
+            msg = msg + '；' + extra
+    except Exception as e:
+        log('!! git 还原异常(不影响系统代理本身): %s' % e)
+    return ok, msg
+
+
+# ------------------------------------------------------------ SSH 通道体检(只读)
+# 【2026-10-30 学 FastGithub 的"全协议支持(443/22/9418)"，但**不学它的做法**】
+# FastGithub 靠驱动把 22 端口也接了过去。本程序既不碰驱动，也**不碰用户已经写好
+# 的 ~/.ssh/config** —— 维护者 2026-10-26 就自己配过一段(以 github.com:22 为主、
+# `github.com-443` → ssh.github.com:443 当备胎)，而 ssh 是**先匹配先赢**：
+# 我们再往后追加一段 `Host github.com` 会被前面那段吃掉(等于没生效)，
+# 写到前面就是悄悄覆盖别人已经跑通的配置。两种都违反"不能断连接"。
+# 所以这里只量不写：把两条 SSH 通道各自的连通与耗时如实报在面板上，
+# 要配置就按"复制 SSH 片段"贴过去 —— 贴不贴由用户自己决定。
+SSH_TARGETS = (('github.com', 22, '22 端口'),
+               ('ssh.github.com', 443, '443 端口(官方备胎)'))
+SSH_PROBE_INTERVAL = 300
+SSH_BANNER_TIMEOUT = 5.0
+_SSH_RES = [{}]           # 最近一轮结果 {host:port: {'ok':bool,'ms':int,'why':str}}
+_SSH_TS = [0.0]
+_SSH_LOCK = threading.Lock()
+
+
+def _ssh_banner(host, port, timeout=SSH_BANNER_TIMEOUT):
+    """连上去读第一行。GitHub 的 SSH 服务一接通就回 "SSH-2.0-..."。
+
+    只读 banner：不参与认证、不带任何凭据、不写任何文件。
+    读到 SSH- 说明这条通道真的到了 GitHub 的 SSH 服务；
+    读到别的(例如某台透明网关的谎话)按不通处理，并在 why 里写清看到的东西。
+    """
+    t0 = time.time()
+    s = None
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.settimeout(timeout)
+        data = b''
+        while b'\n' not in data and time.time() - t0 < timeout:
+            c = s.recv(64)
+            if not c:
+                break
+            data += c
+        ms = int((time.time() - t0) * 1000)
+        head = (data.split(b'\n')[0] or b'').decode('latin1', 'replace').strip()
+        if head.startswith('SSH-'):
+            return {'ok': True, 'ms': ms, 'why': head[:40]}
+        return {'ok': False, 'ms': ms,
+                'why': ('对端不该是 SSH 服务, 实际收到: %s' % (head[:40] or '(空)'))}
+    except Exception as e:
+        return {'ok': False, 'ms': int((time.time() - t0) * 1000),
+                'why': '%s: %s' % (type(e).__name__, str(e)[:50])}
+    finally:
+        try:
+            if s is not None:
+                s.close()
+        except Exception:
+            pass
+
+
+def ssh_probe_once():
+    """把两条 SSH 通道各量一次，结果留在内存里给面板读。"""
+    out = {}
+    for host, port, label in SSH_TARGETS:
+        r = _ssh_banner(host, port)
+        r['label'] = label
+        r['host'] = host
+        r['port'] = port
+        out['%s:%d' % (host, port)] = r
+    with _SSH_LOCK:
+        _SSH_RES[0] = out
+        _SSH_TS[0] = time.time()
+    log('SSH 通道体检: 22 %s(%s) · 443 %s(%s)' % (
+        '通' if out['github.com:22']['ok'] else '不通',
+        out['github.com:22']['why'],
+        '通' if out['ssh.github.com:443']['ok'] else '不通',
+        out['ssh.github.com:443']['why']))
+    return out
+
+
+def ssh_result_public():
+    """给面板的副本: {'at': 时间戳, 'rows': [...], 'ran':  bool}。"""
+    with _SSH_LOCK:
+        res = dict(_SSH_RES[0] or {})
+        ts = _SSH_TS[0]
+    return {'at': int(ts) if ts else None,
+            'age': int(time.time() - ts) if ts else None,
+            'rows': [res['%s:%d' % (h, p)] for h, p, _l in SSH_TARGETS
+                     if ('%s:%d' % (h, p)) in res]}
+
+
+def ssh_probe_job():
+    """跑一轮 SSH 通道体检, 任何异常只写日志 —— 这是旁路, 不许把调用方带崩。"""
+    try:
+        ssh_probe_once()
+    except Exception as e:
+        log('SSH 通道体检出错(下一轮再试): %s' % e)
+
+
+def ssh_probe_loop():
+    """启动后先量一次, 之后每 SSH_PROBE_INTERVAL 秒一次 —— 纯旁路, 出错也不许把线程搞死。"""
+    time.sleep(8)
+    while True:
+        ssh_probe_job()
+        time.sleep(SSH_PROBE_INTERVAL)
+
+
+def ssh_snippet():
+    """可复制的 SSH 配置片段(不落盘、不自动写, 由用户自己贴进 ~/.ssh/config)。"""
+    return '\n'.join((
+        '# git 走 SSH 而不是 HTTPS 隧道池 —— 贴到 %USERPROFILE%\\.ssh\\config',
+        '# (没有这个文件就新建一个; 狐径不会替你写它)',
+        '',
+        'Host github.com',
+        '    HostName github.com',
+        '    User git',
+        '    StrictHostKeyChecking accept-new',
+        '    ServerAliveInterval 30',
+        '',
+        '# 22 不通时的备胎: GitHub 官方在 443 上提供的同一个 SSH 服务',
+        '# 用法: git remote set-url origin git@github.com-443:用户名/仓库.git',
+        'Host github.com-443',
+        '    HostName ssh.github.com',
+        '    Port 443',
+        '    User git',
+        '    StrictHostKeyChecking accept-new',
+        '',
+    ))
+
+
 # ---------------------------------------------------- 开机态自愈（2026-10-26 巡检固化）
 #
 # 现场（本机 2026-10-26 早上实测）：重启把 FoxPath 连同 atexit 一起带走，注册表里留着
@@ -4107,7 +5253,10 @@ def _write_run_mark():
     try:
         with open(RUN_MARK_FILE, 'w', encoding='utf-8') as f:
             json.dump({'pid': os.getpid(), 'app': str(APP_VERSION),
-                       'ts': time.time(), 'pac': _pac_url()}, f, ensure_ascii=False)
+                       'ts': time.time(), 'pac': _pac_url(),
+                       # 顺延生效后"实际端口"和 8787 就不一样了；下次启动读戳做判断、
+                       # 反馈包与排查都要看这个数, 不是看常量。
+                       'port': proxy_port()}, f, ensure_ascii=False)
     except Exception as e:
         log('写运行戳失败(不影响加速本身): %s' % e)
 
@@ -4241,7 +5390,8 @@ SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
 SETTINGS_LOCK = threading.Lock()
 AUTO_UPDATE_DEFAULT = True                 # 默认开（用户明确要求）
 NOTIFY_DEFAULT = True                      # 升级结果气泡, 默认开（同上）
-SETTINGS = {'auto_update': AUTO_UPDATE_DEFAULT, 'notify_bubble': NOTIFY_DEFAULT}
+SETTINGS = {'auto_update': AUTO_UPDATE_DEFAULT, 'notify_bubble': NOTIFY_DEFAULT,
+            'git_takeover': GIT_TAKEOVER_DEFAULT}
 AUTO_UPDATE_MAX_TRIES = 2                  # 同一个版本 24 小时内最多自动试几次
 AUTO_UPDATE_TRIES_FILE = os.path.join(DATA_DIR, 'update-tries.json')
 UPDATE_DONE_FILE = os.path.join(DATA_DIR, 'update-done.json')
@@ -4365,14 +5515,15 @@ def _update_get():
 def load_settings():
     """读设置(auto_update / notify_bubble 都默认 True)。读不到就用默认值, 不让设置文件挡住启动。"""
     d = {'auto_update': AUTO_UPDATE_DEFAULT,
-         'notify_bubble': NOTIFY_DEFAULT}       # 基准是默认值, 不是当前内存里的值
+         'notify_bubble': NOTIFY_DEFAULT,
+         'git_takeover': GIT_TAKEOVER_DEFAULT}   # 基准是默认值, 不是当前内存里的值
     try:
         with open(SETTINGS_FILE, encoding='utf-8') as f:
             raw = json.load(f)
         if isinstance(raw, dict):
             # 逐项读: 老版本的 settings.json 里没有 notify_bubble 时,
             # 它保持默认(开) —— 升级上来的用户不用手动去勾
-            for k in ('auto_update', 'notify_bubble'):
+            for k in ('auto_update', 'notify_bubble', 'git_takeover'):
                 if k in raw:
                     d[k] = bool(raw[k])
     except Exception:
@@ -6095,6 +7246,28 @@ details.logwrap[open]>summary:before{transform:rotate(90deg)}
         <p class="muted xs" style="margin-top:8px">只影响本机 PAC 这一份名单，随时可清除。</p>
       </section>
 
+      <!-- ⑥.5 本机 git 与 SSH（2026-10-30 参考 FastGithub 的全协议思路后新增）
+           git：用 per-URL 代理键接管，启用时写、停用时按备份还原，不需要管理员；
+           SSH：只量不写 —— ssh_config 先匹配先赢，自动写会覆盖用户已跑通的配置。 -->
+      <section class="card">
+        <div class="card-h">
+          <h2>本机 git 与 SSH</h2>
+          <span class="hint">git 跟着一起走 · SSH 只测不写</span>
+        </div>
+        <div class="set">
+          <div class="txt"><b>git 接管</b><span>启用加速时把 git clone / pull / push 一起指过来，停用即还原</span></div>
+          <div class="ctl"><button class="sw" id="gitTake" role="switch" aria-checked="false" title="git 接管"></button></div>
+        </div>
+        <div class="upd-note" id="gitLine">读取中…</div>
+        <div class="upd-note" id="sshLine">SSH 通道：还没测过（启动后约 8 秒自动量第一次，之后每 5 分钟）</div>
+        <div class="field" style="margin-top:8px">
+          <button class="btn ghost sm" id="btnSshRe">重测 SSH</button>
+          <button class="btn ghost sm" id="btnSshCopy">复制 SSH 片段</button>
+          <span class="msg" id="sshMsg" style="margin:0;align-self:center"></span>
+        </div>
+        <p class="muted xs" style="margin-top:8px">狐径不替你写 .ssh/config：SSH 配置是「先匹配先赢」，自动追加会被你已有的一段吃掉，写到前面等于悄悄覆盖已经跑通的设置。要哪段自己贴。</p>
+      </section>
+
       <!-- ⑦ 更多设置 -->
       <section class="card">
         <div class="card-h"><h2>更多</h2><span class="hint">按 <kbd>/</kbd> 跳到手动 IP，<kbd>Esc</kbd> 取消</span></div>
@@ -6123,6 +7296,8 @@ details.logwrap[open]>summary:before{transform:rotate(90deg)}
             <div id="speedTip"></div>
             <div id="routeTip"></div>
             <div id="chanTip"></div>
+            <div id="sessTip"></div>
+            <div id="dohTip"></div>
           </div>
           <pre class="log" id="log"></pre>
         </details>
@@ -6247,6 +7422,12 @@ function paintStatus(d){
   $('stateSub').textContent=on
     ?'系统代理已接管 · 只影响 GitHub 相关域名 · 不装证书、不改 hosts'
     :'系统代理没有被接管 · 点左边开关才会真正生效';
+  /* 端口顺延（2026-10-30）：首选 8787 被别的程序占着时会自动换到备选端口。
+     这行必须写出来 —— PAC 是面板现生成的、端口换了它也跟着换，但用户排查
+     "加速看着开着、一个字节都没转发"时，第一个怀疑的就是程序坏了。 */
+  if(d.port_shifted&&d.port){
+    $('stateSub').textContent+=' · 代理端口顺延至 '+d.port;
+  }
   $('hdrPill').className='pill '+(on?'ok':'');
   $('hdrPillText').textContent=on?'加速中':'未启用';
   $('ip').textContent=d.ip||'暂无可用 IP';
@@ -6378,11 +7559,13 @@ function paintStatus(d){
   }else{rtEl.textContent='';}
 
   paintChan(d);
+  paintLocal(d);
 
   /* 开关 / 升级相关 */
   setSw('auto',!!d.autostart);
   setSw('autoUpd',d.autoupd!==false);
   setSw('notifyBubble',d.notify!==false);
+  setSw('gitTake',d.git_on!==false);
   $('updAuto').textContent=d.upgraded||'';
   var lr=$('updLast');
   lr.textContent=d.lastres||'';
@@ -6446,6 +7629,59 @@ function paintChan(d){
     :'';
   el.textContent='通道重匹配（每 '+every+' 分钟）：'+parts.join(' ｜ ')+tail;
   el.style.color=(worst===0)?'var(--danger)':'';
+}
+
+/* ── 本机 git 与 SSH（2026-10-30 参考 FastGithub 的全协议思路后新增）──────
+   git 那一行读的是 ~/.gitconfig 里 github 那几条按键（http.https://…/.proxy）——
+   它决定 push 到底走不走狐径；SSH 那两行是**实测**结果（只读第一行 banner，
+   不参与认证、不写任何文件）。两块都只如实报：接管有开关可改，SSH 给可复制片段，
+   贴不贴由用户自己决定 —— 他的 ssh_config 是「先匹配先赢」，替他写就是覆盖。 */
+function paintLocal(d){
+  var on=!!d.enabled;
+  var gl=$('gitLine');
+  if(gl){
+    gl.textContent=d.git||'git 状态还没读到';
+    /* 加速开着而这几条键不归我们管 → push 走的还是原路，得点破 */
+    var bad=/未接管|没找到 git|读不出来|没做成/.test(d.git||'');
+    gl.className='upd-note'+((on&&d.git_on!==false&&bad)?' upd-err':'');
+  }
+  var sl=$('sshLine');
+  if(sl){
+    var ss=d.ssh||{}, rows=ss.rows||[];
+    if(!rows.length){
+      sl.textContent='SSH 通道：还没测过（启动后约 8 秒自动量第一次，之后每 5 分钟）';
+      sl.className='upd-note';
+    }else{
+      var parts=rows.map(function(r){
+        return r.label+' '+(r.ok?('通 '+r.ms+'ms'):('不通 · '+r.why));
+      });
+      var tail='';
+      if(rows.length>=2&&!rows[0].ok&&rows[1].ok){
+        tail=' —— 22 这条路不通，用 443 那条：点「复制 SSH 片段」贴进你的 ssh 配置';
+      }
+      var age=ss.age;
+      sl.textContent='SSH 通道：'+parts.join(' ｜ ')+tail
+        +(age==null?'':' · '+(age<90?(age+' 秒前'):(Math.round(age/60)+' 分钟前')));
+      sl.className='upd-note'+(rows.some(function(r){return r.ok;})?' upd-ok':'');
+    }
+  }
+  var st=$('sessTip');
+  if(st){
+    var s=d.sess||{};
+    st.textContent=(s.tunnels?d.sess_text:'')
+      +(s.tunnels?' —— 只算这次运行，重启清零；字节是从上游搬回来的那一段':'');
+  }
+  var dt=$('dohTip');
+  if(dt){
+    var dh=d.doh||{};
+    if(!dh.at){dt.textContent='';}
+    else{
+      var a=dh.last_age;
+      dt.textContent='干净解析(DoH)：'+(dh.text||'')
+        +' · '+(a<90?(a+' 秒前'):(Math.round(a/60)+' 分钟前'))
+        +' —— 只在候选池见底时问一次，问回来的地址照样要过体检才算数';
+    }
+  }
 }
 
 /* ── 线路体检那 4 行 ─────────────────────────────────────────────────── */
@@ -6825,6 +8061,35 @@ $('notifyBubble').onclick=function(){
     _say('updMsg',(r&&r.msg)||'已保存',6000,false); refresh();
   }).catch(function(){_say('updMsg','设置没有保存成功',8000,true);refresh();});
 };
+$('gitTake').onclick=function(){
+  var on=this.getAttribute('aria-checked')!=='true';
+  setSw('gitTake',on);          // 先按点击的样子画, 再由 refresh 用真实状态纠正
+  act('/api/gittakeover?on='+(on?1:0)).then(function(r){
+    _say('sshMsg',(r&&r.msg)||'已保存',9000,!!(r&&r.ok===false));
+    refresh(true);
+  }).catch(function(){
+    _say('sshMsg','设置没有保存成功, 现在显示的不一定是实际状态',9000,true);
+    refresh();
+  });
+};
+$('btnSshRe').onclick=function(){
+  var b=this; b.disabled=true;
+  act('/api/sshprobe').then(function(r){
+    _say('sshMsg',(r&&r.msg)||'已触发',9000,false);
+  }).catch(function(){
+    _say('sshMsg','面板没有响应, 这次没测成',9000,true);
+  });
+  /* 两条通道各有 5 秒超时, 后台跑 —— 按 3 秒/9 秒各刷一次就能等到结果 */
+  setTimeout(function(){b.disabled=false;refresh();},3000);
+  setTimeout(function(){refresh();},9000);
+};
+$('btnSshCopy').onclick=function(){
+  var b=this; b.disabled=true;
+  api('/api/ssh_snippet').then(function(d){
+    b.disabled=false;
+    copyText((d&&d.text)||'','SSH 片段已复制 —— 贴进你个人的 .ssh/config（Windows 在用户目录下）, 狐径不会替你写这个文件');
+  }).catch(function(){b.disabled=false; toast('面板没有响应，稍后再点');});
+};
 $('btnQuit').onclick=function(){
   if(!confirm('退出后 GitHub 将恢复原有连接方式，确定退出？')){return;}
   act('/api/quit').then(function(){
@@ -7059,7 +8324,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         path = self.path.split('?')[0]
         query = self.path.split('?')[1] if '?' in self.path else ''
         if path == '/pac':
-            self._send(200, (PAC_TEMPLATE % PROXY_PORT).encode('ascii'),
+            self._send(200, (PAC_TEMPLATE % proxy_port()).encode('ascii'),
                        'application/x-ns-proxy-autoconfig')
         elif path in ('/', '/ui'):
             self._send(200, PANEL_PAGE.encode('utf-8'))
@@ -7097,6 +8362,14 @@ class PanelHandler(BaseHTTPRequestHandler):
             # 【2026-10-24 新增】一键反馈包：只回一段文本，面板负责复制到剪贴板。
             # 不写共享文件、不上传（与「复制诊断信息」同一条隐私口径）。
             self._send(200, json.dumps({'ok': True, 'text': feedback_text()},
+                                       ensure_ascii=False).encode('utf-8'),
+                       'application/json; charset=utf-8')
+        elif path == '/api/ssh_snippet':
+            # 【2026-10-30 学 FastGithub 的全协议思路】SSH 这条路**只量不写**：
+            # 把可复制的配置回给面板，贴不贴由用户决定。原因在 ssh_snippet 上方：
+            # ssh_config 是"先匹配先赢"，自动追加会被用户已有的一段吃掉，
+            # 前置则是悄悄覆盖他已经跑通的配置 —— 两种都违反"不能断连接"。
+            self._send(200, json.dumps({'ok': True, 'text': ssh_snippet()},
                                        ensure_ascii=False).encode('utf-8'),
                        'application/json; charset=utf-8')
         elif path == '/api/status':
@@ -7196,6 +8469,23 @@ class PanelHandler(BaseHTTPRequestHandler):
                 'pac_hosts': list(PAC_HOSTS),
                 'lines': lines_status(),
                 'ips_detail': ips_detail(good),
+                # ── 【2026-10-30 参考 FastGithub / Steam302 之后新增】
+                #    全部是**新增字段**，上面那些一个都没改语义，老调用方不受影响。
+                # 代理实际在听的端口：首选 8787 被占时会自动顺延(见 start_proxy)，
+                # 不告诉用户"现在是几号端口"，顺延就变成了"面板说开了但浏览器连不上"。
+                'port': proxy_port(),
+                'port_shifted': proxy_port() != PROXY_PORT,
+                # 本次会话总账(隧道数/搬回的字节/成败) —— 面板要的那句人话
+                'sess': sess_stats(),
+                'sess_text': sess_line(),
+                # 本机 git 那几条键现在归谁管(30 秒缓存, 不让面板轮询去起子进程)
+                'git': git_status_line_cached(),
+                'git_on': git_takeover_on(),
+                'git_note': git_last_note(),
+                # SSH 两条通道的实测结果(只读 banner, 不写任何文件)
+                'ssh': ssh_result_public(),
+                # DoH 补池近况：上次什么时候、新增几个、结论一句话
+                'doh': doh_status(),
             }
             self._send(200, json.dumps(data, ensure_ascii=False).encode('utf-8'),
                        'application/json; charset=utf-8')
@@ -7259,7 +8549,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                 raw_good = HEALTH_RAW.refresh(CANDIDATE_IPS_RAW_ALL)
                 pages_good = HEALTH_PAGES.refresh(CANDIDATE_IPS_PAGES_ALL)
                 history_append(good, raw_good, pages_good)
-                loss_probe_async(good)
+                # 丢包抽样一并覆盖 raw / pages 池(主站池之外的段, 含 raw/pages 的
+                # IPv6 节点) —— 否则这些 IP 永远吃不到 _rank_key 的丢包惩罚, 死地址
+                # 一旦被"上一轮可用"带进候选就会反复被选中。函数内部已按 IP 去重。
+                loss_probe_async(list(good) + list(raw_good) + list(pages_good))
             threading.Thread(target=_retest_job, daemon=True).start()
             log('手动重测已触发(含 raw 与 github.io 池)')
         elif path == '/api/speedtest':
@@ -7316,6 +8609,24 @@ class PanelHandler(BaseHTTPRequestHandler):
                                  daemon=True).start()
         elif path == '/api/autostart':
             set_autostart('on=1' in query)
+        elif path == '/api/sshprobe':
+            # 【2026-10-30 新增】面板「重测 SSH」。两条通道各带 5 秒超时, 放后台跑,
+            # 不能让这条 HTTP 请求干等 10 秒(和 /api/retest 同一个处理方式)。
+            threading.Thread(target=ssh_probe_job, daemon=True).start()
+            resp = {'ok': True, 'msg': 'SSH 通道体检已触发, 约 5~10 秒后自动刷新'}
+        elif path == '/api/gittakeover':
+            # 【2026-10-30 新增】git 接管开关。打开时如果加速正在跑就**立刻**接管一次:
+            # 用户刚勾上就期待 git 一起通, 而不是等到下次点「启用加速」才生效。
+            on = 'on=1' in query
+            ok, msg = set_git_takeover(on)
+            if ok and on and proxy_on():
+                try:
+                    extra = git_takeover()
+                    if extra:
+                        msg = msg + '；' + extra
+                except Exception as e:
+                    log('!! git 接管异常(不影响加速本身): %s' % e)
+            resp = {'ok': ok, 'msg': msg}
         length = int(self.headers.get('Content-Length') or 0)
         if length:
             self.rfile.read(length)
@@ -7364,7 +8675,15 @@ def _selfheal_job():
     pages_good = HEALTH_PAGES.refresh(CANDIDATE_IPS_PAGES_ALL)
     n = [len(good or []), len(raw_good or []), len(pages_good or [])]
     with _RETEST_LOCK:
-        if max(n) >= _RETEST_REVIVE_MIN:
+        # 【2026-10-30 修·退让从来没生效过】这里原来写的是 max(n) >= 门槛,
+        # 意思是"三个池里有一个够数就算链路活了"。可 raw / pages 各自才 8 个 IP,
+        # 主池被掐到 0 个的时候它们照样随随便便捞回 4 个 —— max 永远达标, 于是
+        # 整整 106 轮自愈下轮间隔全是 60 秒, 翻倍封顶的退让一次都没走过(本机
+        # foxpath.log 实测)。链路整体抽风时这就是每分钟一轮 50 个 IP 的全量重探,
+        # 重探本身又踩在堵死的路上 —— 跟上面那行注释记的是同一个坑。
+        # 改成**只看主池**: github 主站是它真正要走的路, 主池捞不回人就说明链路
+        # 还堵着, 老老实实翻倍退让; raw / pages 顺带捞回来算白赚, 不当判据。
+        if n[0] >= _RETEST_REVIVE_MIN:
             _RETEST_BACKOFF[0] = 60.0
         else:
             _RETEST_BACKOFF[0] = min(_RETEST_BACKOFF_MAX, _RETEST_BACKOFF[0] * 2)
@@ -7380,8 +8699,123 @@ def trigger_selfheal():
         if now - _RETEST_COOLDOWN_TS[0] < gap:
             return
         _RETEST_COOLDOWN_TS[0] = now
-    log('连接级自愈: 转发连续失败, 立即全池重测(不等5分钟)')
+    # 【2026-10-30 改】这一句原本直接开全池重测。见 _light_retest 里的实测:
+    # 那等于把全量探测压到每 2~3 分钟一次, 面板被拖到连着 5 次不应答。
+    # 先只敲前排那几个 —— 够用就收工, 前排真的都不答话了再动全池。
+    _n = 0
+    try:
+        _n = _light_retest()
+        if _n >= _RETEST_REVIVE_MIN:
+            log('连接级自愈: 轻量探活捞回 %d 个, 够用, 不必全池重测' % _n)
+            return
+    except Exception as e:
+        log('轻量探活异常(改走全池重测): %s' % e)
+    log('连接级自愈: 前排只剩 %d 个答话, 立即全池重测(不等5分钟)' % _n)
     threading.Thread(target=_selfheal_job, daemon=True).start()
+
+
+# 【2026-10-30 新增·滚动岗哨】把"定期大扫除"改成"一直有人站岗"。
+#
+# 起因是一条倒挂: 体检周期 300 秒, 而本机实测单个 IP 的寿命只有 148~250 秒
+# (面板"IP 寿命基准"那一行), 新鲜窗口 _FRESH_WINDOW 更只有 90 秒。
+# 也就是说每个体检周期里有**七成时间**, 池子里挂着的"可用"标记其实是过期的
+# —— 用户刷新一下, 代理很可能把一个已经死掉的 IP 判成"最快", 于是第一个请求
+# 必然踩雷: 转圈、错误页, 手动再刷一次才通。这才是"开了加速还是打不开"的真身。
+#
+# 岗哨不替代体检: 体检负责"发现和清退"(50 个全扫、同步官方表、DoH 补池),
+# 岗哨只负责在体检的间隙里, 反复把**当前最可能要用的那几个**重新验一遍,
+# 让它们始终停在新鲜窗口以内 —— 用户刷新时手边随时有刚验过的 IP 可用。
+#
+# 名额是算过账的: 每 12 秒探 3 个 = 每分钟 15 次, 前 14 名轮一圈 56 秒,
+# 恰好小于 90 秒窗口, 不会出现"刚过期还没轮到"的空档。
+#
+# 这一组数是**试出来的**: 起初定的是 15 秒 / 2 个 / 前 8 名(每分钟 8 次),
+# 装机实测后 good_strong_n 从原来的 27 掉到平均 8.9 —— 因为原先那个 27
+# 根本不是常态, 是"每 2~3 分钟一次全池重测"刷出来的虚高。砍掉那些重测之后
+# 岗哨必须自己把新鲜度扛起来, 于是放宽到能维持前 14 名:
+# 15 次/分钟**均匀摊开**, 对比全池重测"一次并发 50 个"的突发峰值,
+# 不但总量相近, 而且不会某几秒把面板压到不应答。
+#
+# 它和 hot_refresh 里那句"够数也复验证据最旧的 1 个"(2026-10-24)不是重复劳动:
+# 那边管的是**热备池**(want=4, 而且是 _pick_spread 跨网段取样挑出来的),
+# 岗哨管的是**体检排行榜的前 8 名** —— 转发挑人时优先看的正是这份名次,
+# 而它恰好是热备取样的分散策略覆盖不到的那一批。
+# 两者也不用额外去重: 排序依据都是 tier 的证据时刻, 谁刚刚被探过就自然排到队尾,
+# 名额自动让给最陈旧的那个 —— 两套机制靠同一份时间戳自己协调开了。
+_PATROL_INTERVAL = 12.0     # 岗哨巡查间隔(秒)
+_PATROL_BATCH = 3           # 每轮探几个
+_PATROL_TOP = 14            # 只盯池子里排最前的这 N 个(转发最可能挑中的)
+
+
+def _patrol_once():
+    """岗哨一轮: 在池子前排里挑最久没验过的几个, 重新探一遍刷新它们的证据时刻。"""
+    good, _last, = HEALTH.snapshot()
+    cands = [ip for ip, _ms in good if not _bad_edge(ip)]
+    if not cands:
+        return []
+    # 只照顾排最前的几个(按延迟排序, 转发最爱挑的就是它们)。名额摊到 50 个上
+    # 等于每个都探不过来, 反而一个都不新鲜。
+    top = cands[:_PATROL_TOP]
+    # 最陈旧的先来 —— 这样轮一圈正好把整批压在新鲜窗口内, 而不是重复探同一个。
+    now = time.time()
+    top.sort(key=lambda ip: now - (HEALTH.tier_of(ip)[1] or 0.0), reverse=True)
+    batch = top[:_PATROL_BATCH]
+    for ip in batch:
+        # 探回来 = tier 的证据时刻在 _probe 内部就地刷新(panel 的"实测成过"和
+        # 转发的排位随即生效); 探不回来按 2026-10-11 的老规矩**不判死** ——
+        # 它只是不再新鲜, 会随窗口自己过期掉下去, 由转发自然避开。
+        # 绝不在这里 drop: 一次糟糕的探测就把前排清空, 是更早吃过的亏。
+        try:
+            HEALTH._probe(ip)
+        except Exception as e:
+            log('岗哨探活异常 %s: %s' % (ip, e))
+    return batch
+
+
+def _light_retest(want=6):
+    """轻量探活: 只敲主榜前 `want` 个, 返回还能答话的个数。
+
+    【2026-10-30 新增·先敲门，别一上来就拆整栋楼】
+    本机日志实测(22:04~22:15 那一段): 体检每 316 秒一轮, 而几乎每一轮之后都紧跟
+    一次 trigger_selfheal 的"全池重测" —— 全量探测被压到每 2~3 分钟一次。
+    代价直接写在面板上: 同样那一分钟里, 面板连着 12 次轮询有 5 次 RemoteDisconnected,
+    用户看到的就是"打开个界面转半天"。
+    可这些重测里绝大多数是无谓的 —— 每次照样捞回 27~29 个, 链路好得很。
+    所以先用**同一把尺子**(还是 _probe: TLS + 证书 + GET / 要 2xx/3xx)
+    只摸最可能被挑中的那几个, 够数就收工; 只有前排真的都不答话了才动全池。
+    """
+    good, _last = HEALTH.snapshot()
+    cands = [ip for ip, _ms in good if not _bad_edge(ip)][:want]
+    if not cands:
+        return 0
+    hits = []
+
+    def _chk(ip):
+        try:
+            if HEALTH._probe(ip, timeout=3.0) is not None:
+                hits.append(ip)      # list.append 是线程安全的
+        except Exception:
+            pass
+
+    try:
+        with ThreadPoolExecutor(max_workers=min(4, len(cands))) as ex:
+            list(ex.map(_chk, cands))
+    except Exception:
+        pass
+    return len(hits)
+
+
+def _patrol_loop():
+    # 起步先匀一会儿, 别跟刚上线的体检/热备凑在同一秒抢连接。
+    time.sleep(_PATROL_INTERVAL)
+    while True:
+        try:
+            _patrol_once()
+        except Exception as e:
+            # 岗哨自己绝不能把进程带崩 —— 它挂了只是回到"没有岗哨"的旧状态,
+            # 体检照常跑, 服务不许受影响(和体检线程同一条纪律)。
+            log('岗哨异常(下一轮再试): %s' % e)
+        time.sleep(_PATROL_INTERVAL)
 
 
 def health_loop():
@@ -7396,7 +8830,8 @@ def health_loop():
         # 【2026-10-24】每轮体检都落一行到 history.jsonl（面板延迟曲线的数据源;
         # 手动重测那次在 /api/retest 里也落）。丢包抽样只在体检后抽一轮，纯展示用。
         history_append(good, good_raw, good_pages)
-        loss_probe_async(good)
+        # 丢包抽样一并覆盖 raw / pages 池(见 /api/retest 处注释); 内部已按 IP 去重。
+        loss_probe_async(list(good) + list(good_raw) + list(good_pages))
         if need_meta or len(good) < 3:
             # 【2026-10-24 修】同步这件事**绝不能把体检线程带死**: 上面那条 /32 的
             # TypeError 就是这么发生的(它落在 try 之外)。同步失败只是"表旧一点",
@@ -7406,6 +8841,18 @@ def health_loop():
             except Exception as e:
                 log('官方 IP 表同步异常: %s（继续用现有表, 体检不中断）' % e)
             good = HEALTH.refresh(candidate_list())
+
+        # 【2026-10-30 新增·池子见底就去问一次干净解析】学 FastGithub 的"多 IP 来源":
+        # 官方段表全变旧、系统 DNS 又在骗人的时候, DoH 是第三条拿地址的路。
+        # 判据只有一条 —— 活着的太少(DOH_MIN_GOOD), 平时一次都不问; 又带 DOH_COOLDOWN
+        # 闸门, 链路抖动时也不会反复去敲公网。整步 try 包住: 它失败只许少几个地址,
+        # 不许把体检线程带死(和上面官方表同步同一条纪律)。
+        if len(good) < DOH_MIN_GOOD:
+            try:
+                doh_refresh_pools('(体检后只剩 %d 个)' % len(good))
+                good = HEALTH.refresh(candidate_list())
+            except Exception as e:
+                log('DoH 补池异常(体检继续): %s' % e)
 
         # 静默检查新版本 —— 启动后一次, 之后每 12 小时一次。
         # 2026-10-09 用户要求: 默认**自动升级、不弹确认框**; 关掉开关才回到"只提示"。
@@ -7704,6 +9151,11 @@ def on_exit():
         if proxy_on():
             log('程序退出, 还原系统代理')
             disable_proxy()
+        elif os.path.exists(GIT_BACKUP_FILE):
+            # 本次没在管系统代理, 但盘上有"上次被强杀"留下的 git 接管备份 ——
+            # 现在既然正常退出了, 就顺手把那份还原掉, 不让它一直把 git 钉在死端口上。
+            log('程序退出, 系统代理不归本程序管, 但发现上次留下的 git 接管备份 —— 单独还原')
+            git_release()
     except Exception:
         pass
     # 撤掉"我在跑"的戳 —— 走到这里说明还原流程真的执行过了。
@@ -7736,6 +9188,12 @@ def main():
     if ('--restore' in args) or ('--repair' in args):
         log('只做还原: 清理本程序的系统代理设置')
         disable_proxy()
+        # 再走一次"无备份也清残留"的口径: --restore 是用户明确来救急的,
+        # 这时候把指向本程序端口的 git 键清掉是对的(平时不这么做)。
+        try:
+            git_release(clean_orphan=True)
+        except Exception as e:
+            log('!! --restore 还原 git 时出错: %s' % e)
         return
 
     # 焊死历史坑: PAC 模板必须是纯 ASCII。带上中文注释后 encode('ascii') 会抛
@@ -7792,6 +9250,9 @@ def main():
     tray_serve()                       # 常驻托盘(右键退出 / 左键开面板), 两种模式都挂
     fetch_official_ips()
     threading.Thread(target=health_loop, daemon=True).start()
+    # 滚动岗哨: 每 15 秒把最可能要用的前几个 IP 重验一遍, 补上"体检周期比 IP 寿命
+    # 还长"造成的新鲜度空档(详见 _PATROL_INTERVAL 处的注释)。
+    threading.Thread(target=_patrol_loop, daemon=True).start()
     # 热备池守护: 20 秒补一次"刚验过、随时能顶上"的 IP, 让预防性换 IP 有米下锅
     threading.Thread(target=hot_loop, daemon=True).start()
     # 线路体检: 60 秒探一次"不走狐径时 github 通不通", 好如实告诉用户是谁的问题
@@ -7801,6 +9262,9 @@ def main():
     threading.Thread(target=speed_probe_loop, daemon=True).start()
     # DNS 预热: 提前备好常用域名的系统解析结果, 让"直连"在竞速里不输在起跑线
     threading.Thread(target=dns_warm_loop, daemon=True).start()
+    # 【2026-10-30 新增】SSH 通道体检(只读): 22 与 ssh.github.com:443 各自通不通,
+    # 报在面板上供用户决定要不要配 SSH —— 本程序不写 ~/.ssh/config。
+    threading.Thread(target=ssh_probe_loop, daemon=True).start()
     # 直连能力体检: 只有"真能传数据"的直连 IP 才给竞速资格, 免得握手快的坏 IP 抢到
     threading.Thread(target=sys_cap_loop, daemon=True).start()
     # 【2026-10-24 新增·每 10 分钟重匹配"跑得通的通道"】

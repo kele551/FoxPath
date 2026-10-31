@@ -124,12 +124,14 @@ def main():
     print("---- 6) 运行戳：写 -> 取走 -> 再取为空")
     ns = load({"os": os, "json": json, "time": time, "APP_VERSION": "1.2.2",
                "RUN_MARK_FILE": mark, "_pac_url": lambda: "http://127.0.0.1:8788/pac",
+               "proxy_port": lambda: 8789,      # 2026-10-30 端口顺延：戳里记的是实际端口
                "log": lambda m, debug=False: None})
     check("一开始没有", ns["_take_run_mark"](), None)
     ns["_write_run_mark"]()
     d = ns["_take_run_mark"]()
     check("取回的是 dict", isinstance(d, dict), True)
     check("里面 pid 是本次", d.get("pid") == os.getpid(), True)
+    check("里面记的是实际代理端口(不是写死的 8787)", d.get("port"), 8789)
     check("取过即删", os.path.exists(mark), False)
     check("再取为空", ns["_take_run_mark"](), None)
 

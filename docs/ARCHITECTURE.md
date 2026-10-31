@@ -7,16 +7,17 @@
 
 ## 一、一句话架构
 
-**整个程序就是一个 Python 文件**：`github_direct.py`（约 4700 行）—— 打包成单文件 `FoxPath.exe`。
+**整个程序就是一个 Python 文件**：`github_direct.py`（约 9000 行）—— 打包成单文件 `FoxPath.exe`。
 它在**本机**开一个小代理，只接管 GitHub 相关域名，直连"当前实测可用"的 GitHub 官方 IP；
 死掉的 IP 立刻踢掉、定时重测补回来；退出时把系统代理还原回去。
 
 ```
 FoxPath.exe (github_direct.py)
-   ├─ 小代理（只接管 github.com 等域名，其它流量一律直连）
+   ├─ 小代理（只接管 github.com 等域名，其它流量一律直连；8787 被占自动顺延）
    ├─ PAC：系统代理指向它自带的 PAC，按域名分流
    ├─ 线路体检：对候选 IP 真做 TLS 握手 + 短窗口实测吞吐，按吞吐排队
-   ├─ 控制面板：状态一览、开关、日志入口
+   ├─ 本机 git 接管：只改 ~/.gitconfig 里 http.<url>.proxy 这几条，退出还原；SSH 只读探测、不写配置
+   ├─ 控制面板：状态一览、开关、日志入口（含本次会话总账与 DoH 补池结论）
    └─ 退出还原：注册表里自己改过的值写回原样（--restore 可手动收尾）
 ```
 
@@ -42,8 +43,9 @@ FoxPath.exe (github_direct.py)
 | `docs/` | 治理文档（合规 / 安全 / 贡献 / 签名政策 / 行为准则 / 更新记录 / 发布说明） | 文档类改动 |
 | `使用说明.txt` | 随程序给用户看的说明书 | 面向用户的功能说明 |
 
-**本机状态**：主要落在 `%LOCALAPPDATA%\FoxPath\`（更新源配置、升级缓存、日志等）；
-程序**不在 exe 旁边放任何东西**。设过的东西（注册表代理项、PAC）在退出时还原。
+**本机状态**：主要落在 `%LOCALAPPDATA%\FoxPath\`（更新源配置、升级缓存、日志、系统代理备份
+`proxy-backup.json`、git 原值备份 `git-backup.json`）；程序**不在 exe 旁边放任何东西**。
+设过的东西（注册表代理项、PAC、git 的 `http.<url>.proxy`）在退出时还原。
 
 ---
 
@@ -56,6 +58,8 @@ FoxPath.exe (github_direct.py)
 | 改 PAC 规则 / 接管哪些域名 | PAC 生成段（原则：**只接管 GitHub 相关域名**，其余直连） |
 | 改控制面板的显示 | 面板构建与刷新段（状态、开关、日志入口） |
 | 改"退出还原"的范围 | 备份/还原注册表那几段（新写任何系统设置前，先想清楚怎么还原） |
+| 改 git 接管（键名单 / 按值认领 / 还原口径） | `github_direct.py` 的 `git_*` 段（`GIT_PROXY_HOSTS`、`_git_residue_keys`、`git_takeover` / `git_release`）；**只碰 `http.<url>.proxy`**，改完跑 `tests/test_git_takeover.py` |
+| 改端口顺延 / DoH 补池 / 会话统计 | 端口只动 `proxy_port()` 与备选名单 —— 所有对外口径都从它取，别在别处写死；DoH 在 `doh_*` 段（查询必须绕开本机代理，防自环）；会话总账在 `_web_record` / `_SESS`，别往转发热路径再加锁 |
 | 改升级/发布流程 | `tools/publish.py`、`make_version_json.py` |
 | 改升级**校验**逻辑（验签 / sha256 / 拒降级） | `github_direct.py` 的 `read_update_info` / `_verify_update_sig` / `_verify_download`；改完请跑 `tools/preflight_release.py`（①-e 节含"改一个字节必须验不过"的负例断言） |
 

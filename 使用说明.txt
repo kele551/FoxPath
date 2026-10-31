@@ -70,14 +70,30 @@
        这栏一个都没有 = 当前线路一个候选都不通, 程序会自己重拉官方 IP 表
        并回退系统 DNS。反馈问题时把这栏的数字一起贴上, 定位快很多。
 
-   [4] 日志
+   [4] 本机 git 与 SSH
+       git 接管       开关, 默认开。下面一行现状告诉你: git 里 GitHub 那几条
+                      代理键现在指着谁 (启用加速时指过来, 停用/退出时逐条还原;
+                      你或别的工具设的代理一律不覆盖)
+       SSH 通道       实测 github.com:22 与 ssh.github.com:443 的握手结果,
+                      只测、不参与登录、不改任何配置
+       - 重测 SSH       立刻再量一次
+       - 复制 SSH 片段   把要贴的几行给你, 贴不贴、贴哪儿由你决定
+                        (程序不会替你改 ~/.ssh/config)
+
+   [5] 日志
        就是 foxpath.log 的尾部, 自动滚到最新一行。
+       折起来的「更多」里还有: 本次会话搬了多少 (条数 / 字节 / 成 / 败)、
+       DoH 补池最近一次结论。
 
 
 3. 工作原理
-   - 本机监听 127.0.0.1:8787 作为 HTTP/HTTPS 代理
+   - 本机监听 127.0.0.1:8787 作为 HTTP/HTTPS 代理; 8787 被别的程序占着时
+     会自动顺延到备选端口, PAC / git / 面板里写的都是实际在听的那个端口
    - 代理 github.com / www.github.com / raw.githubusercontent.com /
      objects.githubusercontent.com, 其余域名 PAC 返回 DIRECT
+   - git 接管: 启用加速时把 ~/.gitconfig 里 GitHub 那几条
+     http.<url>.proxy 指到本机代理, 停用/退出时逐条还原;
+     清单外但值明明指着本程序端口的 GitHub 键也会跟着走, 还原时一起清掉
    - 每 5 分钟并发重测候选池, 入选条件是 TCP 443 握手 + TLS 证书校验 +
      HTTP 首包必须 2xx/3xx (429 限流也算活着 —— 说明对面确实是 GitHub)
      (有些 IP 证书是对的, 但只服务 API/CDN, 访问首页返回 400, 必须滤掉)
@@ -87,8 +103,12 @@
      就能直接发给作者定位问题; 自动探测全都不通时, 还能「手动指定 IP」救急
    - 候选全灭时依次自救: 重拉官方表 → 查系统 DNS → 放宽超时重测;
      三步都不通才回退系统解析 (等于没装本程序, 不会更糟)
+   - 候选池见底时用 DoH (阿里 dns.alidns.com / 腾讯 doh.pub) 绕开本机解析
+     问一次官方地址; 问回来的地址照样要过体检才算数 (3 分钟冷却)
+   - SSH 只读探测两条通道, 给可复制片段, 但不替你写 ~/.ssh/config
    - 正常退出和开机自启的静默模式都会还原系统代理; 还原备份固定在
-     %LOCALAPPDATA%\FoxPath\proxy-backup.json
+     %LOCALAPPDATA%\FoxPath\proxy-backup.json; git 原值备份在
+     %LOCALAPPDATA%\FoxPath\git-backup.json
 
 
 4. 出过问题想自救

@@ -23,6 +23,7 @@ import ast
 import os
 import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -275,6 +276,19 @@ def main():
         HEALTH_PAGES=types.SimpleNamespace(refresh=lambda lst: []),
         candidate_list=lambda: ['x'], CANDIDATE_IPS_RAW_ALL=['y'],
         CANDIDATE_IPS_PAGES_ALL=['z'])
+    # 轻量探活(_light_retest)要走的两个入口: snapshot 给一份 10 个的主榜,
+    # _probe 按 pools._live 控制"前几次调用答话"。这样才能真的测到
+    # "前排够数就不动全池"这条新规矩, 而不是靠 NameError 兜过去假装通过。
+    pools.HEALTH.snapshot = lambda: (
+        [('9.9.9.%d' % i, 100 + i) for i in range(1, 11)], 0.0)
+    pools._live = [9]
+    pools._probed = []
+
+    def _probe_light(ip, timeout=3.0):
+        pools._probed.append(ip)
+        return (120, 'http') if len(pools._probed) <= pools._live[0] else None
+
+    pools.HEALTH._probe = _probe_light
     job = make_job(ns, clock, pools, threading)
     job()
     check('一轮空手 → 120 秒', ns['_RETEST_BACKOFF'][0], 120.0)
@@ -295,9 +309,51 @@ def main():
     fired.clear()
     trig()
     check('抽风期内隔 90 秒不再重测（按退让后的间隔）', fired, [])
+    # 【2026-10-30 改】这句原本断言"超过间隔就该再试一轮"。加了轻量探活之后,
+    # "再试"分成了两级: 先只敲前排那几个, 够数就收工, 只有当它们也不答话了才动全池。
+    # 改它的依据不是想象 —— 本机 foxpath.log 22:04~22:15 实测: 体检每 316 秒一轮,
+    # 之后几乎必然紧跟一次全池重测, 而这些重测每次照样捞回 27~29 个(链路好得很),
+    # 代价却是面板连着 12 次轮询有 5 次 RemoteDisconnected。
     ns['_RETEST_COOLDOWN_TS'][0] = clock.t - 300.0
+    pools._probed = []
+    pools._live = [9]                      # 前排答话得很痛快
     trig()
-    check('超过间隔就该再试一轮', len(fired), 1)
+    check('超过间隔但前排够数 → 只做轻量探活，不动全池', len(fired), 0)
+    check('轻量探活只摸前 6 个，没惊动整榜', len(pools._probed), 6)
+
+    # 前排真的不答话了，才该请出全池重测
+    ns['_RETEST_BACKOFF'][0] = 60.0
+    ns['_RETEST_COOLDOWN_TS'][0] = clock.t - 300.0
+    pools._probed = []
+    pools._live = [0]                      # 前排全哑
+    trig()
+    check('前排全不答话 → 真的开工全池重测', len(fired), 1)
+
+    # 轻量探活自己出岔子，不许变成"从此不自愈"（fail-safe）
+    ns['_RETEST_COOLDOWN_TS'][0] = clock.t - 300.0
+    pools.HEALTH.snapshot = lambda: (_ for _ in ()).throw(RuntimeError('boom'))
+    fired.clear()
+    trig()
+    check('轻量探活自身异常 → 降级为全池重测（不许失能）', len(fired), 1)
+    pools.HEALTH.snapshot = lambda: (
+        [('9.9.9.%d' % i, 100 + i) for i in range(1, 11)], 0.0)
+
+    # 【2026-10-30 补】上面几档假连接池都是"三个池同进同退", 于是 max(n) 和 n[0]
+    # 判据结果一模一样 —— bug 就藏在这段盲区里。本机 foxpath.log 的真实形态恰恰
+    # 相反: 整份日志 106 轮自愈、"下轮间隔"全是 60 秒, 翻倍退让一次都没走过, 因为
+    # github 主池被掐到 0 个的时候, raw / pages 各自才 8 个 IP 却照常捞回 4 个,
+    # 老判据 max(n)=4 >= 3 就把闸门拽回 60 秒 —— 链路堵死时每分钟照样全池重探 50 个。
+    ns['_RETEST_BACKOFF'][0] = 60.0
+    pools.HEALTH.refresh = lambda lst: []            # 主池全灭
+    pools.HEALTH_RAW.refresh = lambda lst: ['r'] * 4  # 小池照样捞回
+    pools.HEALTH_PAGES.refresh = lambda lst: ['p'] * 4
+    job()
+    check('主池全灭、仅 raw/pages 各捞回 4 个 → 照样翻倍退让(不许被小池拽回 60 秒)',
+          ns['_RETEST_BACKOFF'][0], 120.0)
+    # 反过来: 主池一活就该立刻回到 60 秒(退让不能变成"放弃治疗")
+    pools.HEALTH.refresh = lambda lst: ['a', 'b', 'c']
+    job()
+    check('主池捞回 3 个 → 立刻回到 60 秒', ns['_RETEST_BACKOFF'][0], 60.0)
 
     print('---- 5) 源码级不变量（改回去要立刻发现）')
     src = open(SRC, encoding='utf-8').read()
@@ -368,13 +424,17 @@ def make_trigger(ns, clock, pools, real_threading):
                 # trigger_selfheal 只是把作业丢进线程，假 Thread 不会真跑它，
                 # 给个占位名字就行(不占的话 exec 出来的函数体取不到 _selfheal_job 会炸)。
                 '_selfheal_job': lambda: None,
-                'threading': types.SimpleNamespace(Thread=FakeThread)})
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == 'trigger_selfheal':
-            exec(compile(ast.Module(body=[node], type_ignores=[]), SRC, 'exec'), env)
-            return env['trigger_selfheal'], fired
-    FAILS.append('摘不到 trigger_selfheal')
-    return lambda: None, fired
+                'threading': types.SimpleNamespace(Thread=FakeThread),
+                # 轻量探活必须走真身: 早先漏掉它时 _light_retest 会 NameError,
+                # 被 trigger_selfheal 的 except 兜成"照样全池重测" —— 测试看着全绿,
+                # 其实一条都没验到新逻辑(#300 那句断言当时就是这么"假装通过"的)。
+                '_bad_edge': lambda ip: False,
+                'ThreadPoolExecutor': ThreadPoolExecutor})
+    _bodies = [n for n in tree.body
+               if isinstance(n, ast.FunctionDef)
+               and n.name in ('trigger_selfheal', '_light_retest')]
+    exec(compile(ast.Module(body=_bodies, type_ignores=[]), SRC, 'exec'), env)
+    return env['trigger_selfheal'], fired
 
 
 def compile_ok():
