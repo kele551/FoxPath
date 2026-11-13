@@ -43,22 +43,21 @@ python tools/preflight_release.py  # 发版前自检（发布前必须全绿）
 - PR / 回复里写清**你怎么验证的**：什么网络环境、测了哪些域名、退出后系统代理与注册表是否还原；
 - 涉及挑线路/体检逻辑的改动，请附上实测数据（连通率、吞吐），别只讲原理。
 
-## 平台（三个，代码一致）
+## 平台（GitCode 主源 / GitHub 镜像）
 
-代码同时镜像到三处：**GitCode（主源）** / **GitHub（镜像）** / **AtomGit（代码镜像）**。
-二进制发行包发 **GitCode 与 GitHub** 两处（`tools/publish.py` 一条命令做完，含附件回读验真）；
-AtomGit 会在几分钟内把 GitHub 的发行版**连同附件**一起镜像过去 —— 2026-10-26 实测确认，
-早期"AtomGit 没有附件上传接口、只能发源码"的说法已经过期。
+代码同时放在两处：**GitCode（主源）** / **GitHub（镜像）**；二进制发行包也发这两处
+（`tools/publish.py` 一条命令做完，含附件回读验真）。
+AtomGit 与 GitCode 是**同一平台的两个域名入口**（2026-11-11 用户确认），本机 `atomgit` 远端已删除，
+不要再添加；Gitee 全项目禁推（451），本机也没有 `gitee` / `origin` 指向它。
 
 ```powershell
-# 远端名字按本机 config 为准：gitcode=主源、github=镜像、atomgit=代码镜像
-# 注意：本仓库的 origin 仍指向已停更的老仓库（gitee），不要对它推送。
+# 远端名字按本机 config 实测为准（git remote -v）：gitcode=主源、github=镜像
+# 本仓库**没有 origin**，也没有 atomgit / gitee 远端（2026-11-13 实测），别照着老文档乱加。
 git push gitcode main --tags                    # GitCode（主源）
-git push atomgit main --tags                    # AtomGit（令牌走 GIT_ASKPASS，不会出现在命令行）
 # GitHub 侧走本机登录态的 gh.exe（tools/publish.py 里已封好；直连不通时它自己会借代理）
 ```
 
-三个平台改完都要推，**内容必须逐字节一致**（判定方法：`git diff atomgit/main origin/main` 应为空）。
+两个平台改完都要推，**内容必须逐字节一致**（判定方法：`git diff github/main gitcode/main` 应为空）。
 
 ## 任务从哪来
 

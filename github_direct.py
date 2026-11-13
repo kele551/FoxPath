@@ -69,7 +69,7 @@ except Exception:
     UPDATE_SIG_AVAILABLE = False
 
 APP_NAME = '狐径'
-APP_VERSION = '1.2.4'
+APP_VERSION = '1.2.5'
 # 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
 AUTHOR = '海风（kele551）'
 AUTHOR_ASCII = 'HaiFeng (kele551)'
@@ -96,6 +96,27 @@ RELAY_IDLE_TIMEOUT = 600
 # 也没换 IP。15 秒对正常 GitHub 传输极宽松(哪怕慢速大文件也会在 15 秒内送出几 KB),
 # 不会误杀; 而对"搬了一半不动"的坏链路能在客户端放弃前先动手, 把失败变成一次无感重试。
 STALL_WATCHDOG = 15.0
+
+# 【2026-11-13 新增·首字节更快撒手】上面那 15 秒只管"已经在搬字节"的传输阶段。
+# 浏览器真正的"转圈"发生在**首字节**这一段: 请求已经发完、上游一个字节都不回。
+# 本机 2026-11-13 实测(github.com 首页 10 次, 走本机代理):
+#   成功那 8 次首字节 1.01~9.33 秒(平均 4.24 秒); 失败那 2 次要到 7.45 / 12.23 秒才暴露;
+#   而浏览器自己约 10 秒就放弃 → 用户看到的是"转半天 → 白屏 → 手动刷新才出来"。
+# 所以首字节单独给 6 秒: 只切"明显不给"的那批(失败样本都在 7.5 秒之后), 又不会误杀
+# "再等两三秒就轮到"的慢连接(9.33 秒那发就是等出来的)。
+# 判死后**只降权、不清出候选池**(见 _tunnel 里的 _fb 分支): 这类 IP 是时好时坏,
+# 一棒子打死会把仅有的候选清光 —— 2026-10-30 把看门狗算进"首次即踢"时已经踩过这个坑。
+FIRST_BYTE_WAIT = 6.0
+
+# 【2026-11-13 记·试过把传输段收紧到 8 秒，实测否掉了，已回退 15 秒】
+# 想法: 浏览器自己对单连接约 10 秒放弃, 15 秒慢半拍, 收紧到 8 秒能更早换 IP。
+# 实测(14:5x, 线路恢复期, 走本机代理):
+#   ① raw.githubusercontent.com 的 github_direct.py(490,885 B) 下两次:
+#      第一次 8.2 秒、0 字节就断(正是 8 秒看门狗干的), 第二次 12.2 秒才整份下完;
+#   ② 同一时段首字节有 7.99 秒才回来、后面完全正常的一发。
+# 说明 8 秒会掐掉"慢但会来"的连接, 把本来能成的变成失败 —— 这是净损失, 不是优化。
+# 结论: 传输段维持 15 秒(正常 GitHub 传输不会静默 15 秒; 真卡死的那批本来也要等浏览器重试)。
+# 所以这里不再单独定义"传输段上限", 继续用上面的 STALL_WATCHDOG。
 
 # 【2026-10-30 新增·握手阶段透明重试】
 # CONNECT 隧道里客户端握着自己那半边 TLS: 一旦 200 established 发出、客户端开始 TLS,
@@ -360,6 +381,16 @@ _SYS_FAIL_HOLD = 20.0       # 一次连通只作废"距今超过 20 秒"的账, 
 _SYS_FAIL_SHORT_TIMEOUT = 3.0
 _SYS_FAIL_FULL_TIMEOUT = 10.0
 
+# 【2026-11-13 记·做过又撤掉的"熔断放行", 别再重做一遍】
+# 想法: 60 秒内满 3 次全灭就"熔断"90 秒, 熔断期内主站请求直接关连接, 让浏览器按 PAC 的
+# "; DIRECT" 走系统解析 —— 等于把用户"手动关掉加速"那一步自动化。
+# 撤掉的原因(装机实测 16:00~16:18):
+#   1) 一次都没触发: 并发十几条页面请求里只要有一条建连成功, _sys_fail_reset 就把熔断清掉,
+#      熔断几乎活不到下一条请求(日志里 30 分钟 0 次"熔断中");
+#   2) 就算触发也不解决问题: 本机直连 github.com 实测 21 秒超时, 放给 DIRECT 只是把"代理里
+#      等 6~15 秒"换成"浏览器里等 21 秒", 体感反而更糟 —— 用户当天报"越修越糟糕"。
+# 结论: 放行这条路不成立, 提速只能靠"挑一条真跑得完的通道"(见 _kbps_pick 前的断流否决)。
+
 
 def _sys_fail_recent(key, now=None):
     """窗口内还有几笔全灭的账(0 = 这段时间一直是通的)。顺手把过期的账剪掉。"""
@@ -384,7 +415,7 @@ def _sys_fail_bump(key):
         lst = [t for t in _SYS_FAIL.get(key, []) if now - t <= _SYS_FAIL_WINDOW]
         lst.append(now)
         _SYS_FAIL[key] = lst
-        return len(lst)
+    return len(lst)
 
 
 def _sys_fail_reset(key):
@@ -797,6 +828,16 @@ _KBPS_WIN_RATIO = 1.15     # 池内取最快时要领先次快 15%, 否则可能
 # IP 寿命台账跑出来 148~227 秒(面板"IP 寿命基准"那一行), 而体检周期最长 5 分钟 ——
 # 窗口取到寿命的一半以内, 才不会把"上一轮活着、这一轮早死了"的 IP 算成能打开页面。
 _FRESH_WINDOW = 90.0
+
+# 【2026-11-13 新增】"复用刚验过的通道"这条快路自己的窗口, 比 _FRESH_WINDOW 收得更紧。
+# 依据(本机 foxpath.log 2026-11-13):
+#   15:38:41 复用刚验过的通道 172.182.252.133(证据 19 秒前), 跳过握手抢连
+#   15:38:43 在用 IP 172.182.252.133 复检已不通, 提前下岗
+#   → 这条请求被一路拖到 15 秒静默看门狗才断, 用户体感就是"网页卡着不动";
+#   而同一分钟手动关开加速(= 清掉这份信任)之后, 轻探 498ms 就找到活的通道。
+# 链路抽风时 90 秒前的证据根本不算证据。一次页面打开十几个并发请求都在 20 秒内跑完,
+# 所以 25 秒足够覆盖同一波; 超过就重验一次 —— 重验只花 1.5~2 秒, 比撞死路便宜。
+_TRUST_FRESH = 25.0
 
 # 【2026-10-24 新增·"证书对、页面不给你"的那类 IP，实测拉黑】
 # 起因：装机版跑起来后 github.com 满屏 400（"Bad request · GitHub"），可狐径自己一路绿灯。
@@ -1315,6 +1356,10 @@ _SYS_CAP = {}          # host -> {'ip','ok','kbps','bytes','cost','ts'}
 _SYS_CAP_TTL = 120.0   # 证据有效期: 超过这个时间没复测就先不采信
 _SYS_WIN_RATIO = 1.25  # 直连要快过候选池 25% 才值得换, 否则两边抖来抖去反而不稳
 _SYS_MIN_KBPS = 60     # 直连自己低于这个速度就没必要绕开池子(60KB/s 约等于能开但会转圈)
+# 【2026-11-13 新增】"换边"的绝对下限: 低于这个速度换过去也是转圈, 不值得为它切路径。
+# 判据本身用相对比较(快 15% 就换), 见 _wins_by_evidence 里那段说明 —— 整段限速时
+# 绝对值永远达不到 60, 老判据会让直连(39 KB/s)输给池子(9 KB/s), 用户一直等最慢的那条。
+_SYS_SWAP_MIN_KBPS = 12
 
 
 def _cap_test(host, ip, window=2.5, max_bytes=262144, min_ok=8192, deadline=8.0,
@@ -1469,8 +1514,15 @@ def _wins_by_evidence(s, p):
     if s.get('ip') == p.get('ip'):
         return False                     # 对手是自己, 这轮对比不作数
     sp, pp = s.get('kbps', 0), p.get('kbps', 0)
-    if sp < _SYS_MIN_KBPS:
-        return False                     # 直连自己也不快, 没必要绕开池子
+    # 【2026-11-13 改·相对优先】原来这里有一道绝对门槛: 直连自己不到 _SYS_MIN_KBPS(60)
+    # 就一律判"没必要绕开池子"。前提是"池子够快", 可本机今天整段被限速, 实际是
+    # 直连 20.6.7.17 有 39 KB/s、池内 20.87.245.0 只有 9 KB/s —— 直连快 4 倍, 却被这道
+    # 门槛判成"不换", 于是每条请求都留在最慢的那条通道上等页面, 用户体感就是"超慢"。
+    # 现在改成"谁明显快就用谁": 直连只要比池子快 _SYS_WIN_RATIO(15%)、且自己有 12 KB/s
+    # 以上(低于这个换过去也是转圈), 就该换。60 那条绝对线只保留在"直连自己也不快、
+    # 池子更快"的判断里 —— 由下面的相对比较自然覆盖。
+    if sp < _SYS_SWAP_MIN_KBPS:
+        return False                     # 直连自己连 12 KB/s 都不到, 换过去也是转圈
     return sp >= pp * _SYS_WIN_RATIO
 
 
@@ -1516,6 +1568,38 @@ def _cap_verdict(s, p):
 #   并发压到 2、单窗 2 秒、每池每轮最多 8 个样本、三个池错开 3 秒 ——
 #   实测并发 14 个探测会自己把国际链路挤拥塞(转发退化到 7~10 秒), 那样就本末倒置了。
 _CHAN_INTERVAL = 600.0    # 用户要的 10 分钟一轮
+
+# 【2026-11-13 新增·连续断流就立刻重匹配一轮】
+# 用户原话:"要手动关闭加速, 再打开才有效"。关开这个动作本身没有魔力 —— 它等于把信任表、
+# 在用通道、全灭账全部清掉, 让软件重新验一遍"此刻谁真能跑完整页"。用户要的就是这个结果。
+# 后台本来每 10 分钟就做一轮真下载重匹配(每轮下 196 KB, 约等于 GitHub 首页大小), 这里给它
+# 加一个"被唤醒"的开关: 连续断流/全灭时不等那 10 分钟, 立刻重跑一轮 —— 把用户的手动动作
+# 自动化。节流 120 秒: 一轮要下 8 × 196 KB, 太频繁会自己把国际链路挤拥塞(见上面 _CHAN_INTERVAL
+# 那段成本红线的注释, 那是踩过坑写死的)。
+_CHAN_WAKE = threading.Event()
+_CHAN_LAST = [0.0]          # 上一轮重匹配开始的时刻(节流用)
+_CHAN_WAKE_GAP = 120.0      # 两次重匹配之间至少隔 120 秒
+
+# 【2026-11-13 新增·并发建连排队】浏览器开一个页面会同时发起五六条连接, 十来条一起"抢连"
+# 会把同一批官方 IP 挤死(本机实测并发 10 条只成 3 条)。这里限制"同时在建连"的条数。
+# 【2026-11-13 二次校准】一开始定 3, 结果首页/仓库页(上百个请求)大量排队超时被"快速放手"
+# (日志里 17:07 就出现"建连排队超过 6 秒…本次快速放手"), 反而把页面打残。
+# 浏览器对同一域名本来就是 6 并发, 所以上限取 6: 跟浏览器一样宽, 又不至于无限挤。
+_CONNECT_PARALLEL = 6       # 同时在建连的条数上限(= 浏览器同域并发数)
+_CONNECT_QUEUE_WAIT = 10.0  # 排队超过这么多秒就拿不到号: 不押了, 快速回 502 让浏览器重试
+_CONNECT_SEM = threading.BoundedSemaphore(_CONNECT_PARALLEL)
+
+
+def request_rescan(reason=''):
+    """请后台立刻重匹配一轮"跑得通的通道"(带 120 秒节流)。返回是否真的叫醒。"""
+    now = time.time()
+    if now - _CHAN_LAST[0] < _CHAN_WAKE_GAP:
+        return False
+    _CHAN_LAST[0] = now
+    if _fast_log_ok('rescan', 30.0):
+        log('请后台立刻重匹配通道(%s), 不等 10 分钟' % (reason or '连续失败'))
+    _CHAN_WAKE.set()
+    return True
 _CHAN_MIN_KBPS = 40       # 低于这个速度谈不上"跑得通": 首页勉强刷出来、图片开始转圈的分界
 _CHAN_FALLBACK_KBPS = 8   # 全线拥塞时的底线: 至少真传得到字节, 才值得为它换岗
 _CHAN_SAMPLES = 8         # 每池每轮最多真下载几个 IP(再多就是自己挤自己)
@@ -1733,6 +1817,7 @@ def channel_loop():
         time.sleep(5)
     time.sleep(20)     # 体检刚跑完也缓一口, 让它派出去的探测先散场
     while True:
+        _CHAN_LAST[0] = time.time()     # 记下本轮开始时刻, 给 request_rescan 的节流用
         empty = 0
         for key, pool, host in (('github', HEALTH, 'github.com'),
                                 ('raw', HEALTH_RAW, 'raw.githubusercontent.com'),
@@ -1745,7 +1830,10 @@ def channel_loop():
                 log('通道重匹配异常(%s): %s' % (key, e))
             time.sleep(3)   # 三个池错开, 别让下载挤在同一秒互相拖慢
         # 三个池都空手而归, 说明启动体检还没出名单 —— 别死等 10 分钟, 2 分钟后再试
-        time.sleep(120 if empty == 3 else _CHAN_INTERVAL)
+        # 【2026-11-13 新增】期间若被 request_rescan 叫醒(连续断流), 立刻重跑一轮, 不等满钟点。
+        _wait = 120 if empty == 3 else _CHAN_INTERVAL
+        if _CHAN_WAKE.wait(_wait):
+            _CHAN_WAKE.clear()
 
 
 def dns_warm_loop():
@@ -3257,7 +3345,26 @@ PAC_TEMPLATE = """function FindProxyForURL(url, host) {
     // gist.github.com is NOT taken over yet: with SNI=gist.github.com every
     // official IP got a reset during the handshake, so another IP cannot help.
     // githubassets stays DIRECT (already fast; different certificate).
-    if (%s ||
+    //
+    // 2026-11-13: avatars/camo go back to DIRECT. User saw "home page opens,
+    // project page is very slow". A repo page pulls a dozen avatars at once;
+    // each one took a slot of the connect queue (3 by default) and pushed the
+    // main HTML to the back of the line. Measured here: a 27KB avatar was
+    // 0.73s DIRECT vs 0.74s through the proxy, so DIRECT is not slower. They are
+    // only images: worst case a broken icon, never a blank page. Keep the proxy
+    // slots and bandwidth for github.com itself and for raw/objects downloads.
+    if (host === "avatars.githubusercontent.com" ||
+        host === "camo.githubusercontent.com") {
+        return "DIRECT";
+    }
+    // 2026-11-13: github.githubassets.com (a repo page loads ~128 JS/CSS files
+    // from it) joins the proxy list too. Same 8 files in parallel measured
+    // 21.3s DIRECT vs 10.5s through the proxy, and it resolves to
+    // 185.199.108.215 - the same 185.199.108.0/22 range as raw. Left DIRECT,
+    // those 128 files hold the browser's connection slots for half a minute,
+    // which is exactly the "project page is stuck" the user reports.
+    if (host === "github.githubassets.com" ||
+        %s ||
         host === "github.io" || dnsDomainIs(host, ".github.io")) {
         return "PROXY 127.0.0.1:%%d; DIRECT";
     }
@@ -3602,7 +3709,14 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         # 谁最快就直连谁, 握手速度不再参与裁决。
         # 余量: 跨到直连那条路要快 25%(换路径代价大、防两边抖动来回切),
         # 池内只需领先 15%。赌输的代价可控 —— 超时 2.5 秒就回落抢连。
-        best, second = _kbps_pick(cand)
+        # 【2026-11-13 新增·断过流的别当"快"用】
+        # 本机 16:14~16:15 实测: 台账写着 20.205.243.166 有 156 KB/s(那是 69 KB 小样本量出来的),
+        # 可它连着 5 次"搬了 3724 / 76677 字节就停", 每次都跳过轻探直接撞上去, 浏览器更快白屏 ——
+        # 用户看到的就是"越修越打不开"。小样本吞吐只证明"能起跑", 不证明"能跑完一页"。
+        # 5 分钟内断过流的 IP 直接从"按吞吐直连"的名单里剔掉, 让它回去走轻探/抢连;
+        # 全都断过流才退回原名单(总得有人试)。
+        _stallfree = [x for x in cand if _stall_rank(x) == 0]
+        best, second = _kbps_pick(_stallfree or cand)
         if best and best[1] >= _KBPS_DIRECT_MIN:
             need = _SYS_WIN_RATIO if best[0] in sys_ips else _KBPS_WIN_RATIO
             if second is None or best[1] >= second[1] * need:
@@ -3660,20 +3774,38 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         # 只要 90 秒内有真答过 2xx/3xx 的证据, 就先给它 1.2 秒直接连; 通了就复用。
         # 【2026-10-25 再补】试不通时不要接着按握手抢连(那是又一轮抽奖), 直接把 fast
         # 置真, 走下面的 GET / 轻探重新找一条此刻真能吐页面的; 两条路都走完才退回系统。
-        if not fast:
+        # 【2026-11-13 修·全灭窗口内跳过"复用旧通道"】
+        # 60 秒内有过全灭 = 这条链路正在抽风, 此刻"信任"的那条通道大概率已经死了
+        # (依据见 _TRUST_FRESH 上方那段本机日志)。这时候跳过复用、直接走下面的轻探,
+        # 用 GET / 现问一条**此刻真能吐页面**的 —— 这正是用户手动关开加速换来的效果
+        # (关开等于清掉这份信任, 于是必然重新验一次), 现在让它自动发生, 不必再手动操作。
+        if not fast and _sys_fail_recent(key) == 0:
             _trust, _trust_ts = '', 0.0
             if cur and cur not in _tried and not _bad_edge(cur):
                 _t, _tt = pool.tier_of(cur)
-                if _t == 'http' and time.time() - _tt <= _FRESH_WINDOW:
+                if _t == 'http' and time.time() - _tt <= _TRUST_FRESH:
                     _trust, _trust_ts = cur, _tt
             if not _trust:
                 for _x in cand:
                     if _x in _tried or _bad_edge(_x):
                         continue
                     _t, _tt = pool.tier_of(_x)
-                    if (_t == 'http' and time.time() - _tt <= _FRESH_WINDOW
+                    if (_t == 'http' and time.time() - _tt <= _TRUST_FRESH
                             and _tt > _trust_ts):
                         _trust, _trust_ts = _x, _tt
+            if _trust:
+                # 【2026-11-13 新增·慢通道不复用】"刚验过"只说明它能吐页面, 不说明它快。
+                # 本机 2026-11-13 15:53 实测: 复用 20.87.245.0(吞吐台账 9 KB/s)跳过抢连,
+                # 结果首页 40 秒、仓库页 26.8 秒 —— 用户说的"超慢"有一半是这条慢通道造成的。
+                # 吞吐台账新鲜且低于 _CHAN_MIN_KBPS(40, 代码里定的"勉强刷出来、图片开始转圈"的
+                # 分界)就不复用, 改走下面的 GET / 轻探, 按"此刻真能吐页面"重新挑一条。
+                _tk = _kbps_of(_trust)
+                if _tk is not None and _tk < _CHAN_MIN_KBPS:
+                    if _fast_log_ok('slowtrust:' + key):
+                        log('%s 刚验过的通道 %s 只有 %d KB/s(低于 %d), 不复用, 重新找快的'
+                            % (label, _trust, _tk, _CHAN_MIN_KBPS))
+                    _trust = ''
+                    fast = True
             if _trust:
                 _tried.add(_trust)
                 try:
@@ -3770,7 +3902,11 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     _prescan_release()      # 探针批次一结束就交还闸门
                 _tried.update(_probed)
                 # 池内 IP 优先, 直连垫底(同一把尺子答了话才有资格排进来)
-                _cert.sort(key=lambda t: (1 if t[1] in _sys_now else 0, t[0]))
+                # 【2026-11-13 新增·按吞吐排队】原来只按 TTFB 毫秒排, 可"首字节快"不等于
+                # "传得动": 本机 15:53 实测有 TTFB 很快、整页 40 秒的通道(9 KB/s)。
+                # 吞吐台账新鲜的排前面, 没台账的仍按 TTFB 排 —— 至少不挑中那条最慢的。
+                _cert.sort(key=lambda t: (1 if t[1] in _sys_now else 0,
+                                          -(_kbps_of(t[1]) or 0), t[0]))
                 for _ms, _ip in _cert:
                     try:
                         _s4 = socket.create_connection((_ip, port), timeout=2.0)
@@ -4144,7 +4280,23 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         _cb = b''          # 客户端在握手阶段发来的数据(ClientHello 等), 换 IP 后重放用
         while _attempts < _TUNNEL_RETRY:
             _attempts += 1
-            up, used = self._connect(host, port)
+            # 【2026-11-13 新增·并发建连排队】
+            # 本机实测(16:27, 并发 10 条打 github.com 等): 只成功 3 条, 其余 7 条 15~21 秒后 502。
+            # 串行单条测是全绿的(1~3 秒), 差别就在并发: 浏览器一开页面就五六条连接同时进来,
+            # 每条都去"抢连 + 轻探", 十来条同时打同一批官方 IP, 互相挤 —— 谁都拿不到首字节,
+            # 一起死到超时。用户看到的就是"白屏 / 打不开"。
+            # 这里给"建连"这一段排队(默认 3 条并行), 只包住建连, 不含后面的传输:
+            # 一次拿 1~2 秒, 三条并行刚好把链路喂满又不互相踩; 拿不到号就快速放手让浏览器重试,
+            # 绝不在这里陪它等满十几秒。排队等 6 秒还拿不到号 = 本次不押, 直接回 502。
+            if not _CONNECT_SEM.acquire(timeout=_CONNECT_QUEUE_WAIT):
+                if _fast_log_ok('cqueue:' + key, 10.0):
+                    log('%s 建连排队超过 %.0f 秒(同时在建连的已满 %d 条), 本次快速放手'
+                        % (key, _CONNECT_QUEUE_WAIT, _CONNECT_PARALLEL))
+                return None, None, {}
+            try:
+                up, used = self._connect(host, port)
+            finally:
+                _CONNECT_SEM.release()
             if up is None:
                 return None, None, {}
             if _attempts == 1:
@@ -4206,6 +4358,8 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 self._send(502, b'Bad Gateway')
                 _web_record(_key, WEB_REFUSED, _conn_ms, 0)
                 trigger_selfheal()
+                # 【2026-11-13 新增】连不上 = 通道可能整段换了, 请后台立刻重匹配(带节流)
+                request_rescan('%s 连不上' % host)
             else:
                 # 200 已发、所有候选握手阶段都死了: 关掉客户端, 让浏览器自己重试
                 # (下一轮 _connect 会因降权避开这批坏 IP)。不再发 502(会污染已建立的隧道)。
@@ -4215,6 +4369,7 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     pass
                 _web_record(_key, WEB_REFUSED, _conn_ms, 0)
                 trigger_selfheal()
+                request_rescan('%s 握手全灭' % host)
             return
         # 【2026-10-24】面板"本次会话"那一格：PAC 命中走候选池 / 退回系统解析各算一次。
         # 只统计**转发成功**的连接，失败的不算命中。
@@ -4244,21 +4399,32 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             #      次才踢, 避免把偶发抖动的好 IP 误杀。
             _no_data = (out['bytes_up'] == 0)
             _wd = bool(out.get('stalled_watchdog'))
+            # 【2026-11-13 新增·首字节超时只降权、不踢】首字节 6 秒没来 ≠ 这个 IP 废了:
+            # 本机 2026-11-13 实测有"9.33 秒才回首字节、后面整页完全正常"的样本,
+            # 一棒子踢掉会把仅有的候选清光(2026-10-30 把看门狗算进"首次即踢"时踩过同一个坑)。
+            # 这一类只走原账: _stall_note 已经 +1 降权(排序把它压到后面), 满
+            # _STALL_DROP_POOL 次才请出池子 —— 真正"时好时坏"的才会被淘汰。
+            _fb = bool(out.get('first_byte_dead'))
             # 【2026-10-30 实测回退】曾把 _wd 也算进"首次即踢", 结果每踢一个就触发一次
             # 立即全池重测, 本机这批官方 IP 全是限速的勉强可用货色 —— 候选被不断踢出,
             # 自愈回收数一路掉(28→22→12), 面板被重测负载拖到间歇无响应, 反而更不稳。
             # 所以看门狗只负责"把失败在 15 秒内暴露出来"(不再静默挂到 600 秒),
             # 排序压制交给 _rank_key(每次断流 +10)—— 足够把它挤下首选, 又不至于清空候选。
             # 仍然保留: 0 字节断流(=彻底搬不动)立即踢, 其余满 _STALL_DROP_POOL 次才踢。
-            _drop = (_n >= _STALL_DROP_POOL) or _no_data
+            _drop = (_n >= _STALL_DROP_POOL) or (_no_data and not _fb)
             log('%s 断流: %s 这次搬了 %d 字节就停了(窗口内第 %d 次)%s%s'
                 % (host, used, out['bytes_up'], _n,
-                   ', 看门狗判定' if _wd else '',
+                   (', 首字节 %.0f 秒超时' % FIRST_BYTE_WAIT) if _fb
+                   else (', 看门狗判定' if _wd else ''),
                    '' if not _drop else ', 请出候选池'))
             if _drop:
                 HEALTH.drop(used)
                 _hot_drop(_key, used)
                 trigger_selfheal()
+                # 【2026-11-13 新增·断流也要重匹配】搬不动和"连不上"是同一件事的两面:
+                # 这条链路能连、传不完一页。等 10 分钟的钟点太慢, 让后台立刻重跑一轮真下载
+                # 重匹配(带 120 秒节流), 相当于把用户"手动关开加速"换成自动的。
+                request_rescan('%s 断流 %d 字节' % (host, out['bytes_up']))
         if out['kind'] == WEB_BADGW and used:
             log('上游返回 4xx/5xx, 剔除假活 IP %s 并触发自愈' % used)
             HEALTH.drop(used)
@@ -4270,11 +4436,18 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         up_err = False
         stalled = False
         stalled_watchdog = False   # 由"传输中静默满 STALL_WATCHDOG 秒"看门狗判定(铁证级坏链路)
+        # 【2026-11-13 新增·首字节更快撒手】是哪一段判死的(首字节超时 / 传输中看门狗),
+        # 上层要分开处理: 首字节超时只降权, 传输中看门狗才走原来的账。
+        first_byte_dead = False
         # 握手阶段已拿到首字节就不算"首字节"(避免重复计时); 已搬的字节也要续上
         _first_up = (init_first_ms <= 0.0)
         bytes_up = init_bytes_up
         first_ms = init_first_ms
         _t_relay = time.time()
+        # 【2026-11-13 新增】"客户端最后一次往上发"的时刻: 请求头/请求体还没发完之前,
+        # 上游本来就不该回字节, 这时候拿首字节超时去判它等于冤枉它(上传大文件会被误杀)。
+        # 只有客户端静下来(请求发完)之后, 上游还不给字节, 才是"这个 IP 这次不给"。
+        _client_last_up = _t_relay
         # 转发阶段由 select 统一管超时, 先把两端 socket 的超时都放宽到同一个空闲
         # 上限: 客户端那端带着 StreamRequestHandler 的 30 秒(self.timeout), 上游
         # 那端还是建连时 create_connection 留下的 5 秒 —— 大附件(raw /
@@ -4287,14 +4460,33 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 pass
         try:
             while True:
-                r, _, e = select.select(pair, [], pair, STALL_WATCHDOG)
+                # 【2026-11-13 新增·首字节更快撒手】首字节阶段的等待上限换成 FIRST_BYTE_WAIT,
+                # 而且只数"客户端已经静下来之后"的时间(见 _client_last_up): 请求还没发完时
+                # 上游不回字节是正常的, 不能算它头上。其余阶段等 STALL_WATCHDOG。
+                if _first_up and bytes_up == 0:
+                    _waited = time.time() - max(_t_relay, _client_last_up)
+                    if _waited >= FIRST_BYTE_WAIT:
+                        log('首字节 %.0f 秒没来(请求已发完), 判断这次不给了, '
+                            '关连接让浏览器换 IP 重试' % FIRST_BYTE_WAIT)
+                        stalled = True
+                        first_byte_dead = True
+                        break
+                    _wait = max(0.05, FIRST_BYTE_WAIT - _waited)
+                else:
+                    # 传输段沿用 STALL_WATCHDOG(15 秒); 曾试 8 秒, 实测会掐掉慢连接, 已回退。
+                    _wait = STALL_WATCHDOG
+                r, _, e = select.select(pair, [], pair, _wait)
                 if e:
                     stalled = True
                     break
                 if not r:
+                    # 阶段不同, "到点"的含义也不同: 首字节阶段回上面重新算剩余时间(没到点就继续等),
+                    # 传输阶段这才是真的沉默满 STALL_WATCHDOG, 判死。
+                    if _first_up and bytes_up == 0:
+                        continue
                     # 传输中任一方沉默满 STALL_WATCHDOG 秒(既无 FIN 也无字节)即判死:
                     # 活跃传输里 15 秒一字不来, 对 GitHub 而言就是"搬了一半不动"的坏链路,
-                    # 不等 600 秒的空闲上限 —— 在客户端自己超时放弃前先动手换 IP、关连接,
+                    # 不等 600 秒的空闲上限 —— 在浏览器自己超时放弃前先动手换 IP、关连接,
                     # 浏览器收到半截连接会自动重试, 落到干净 IP 上。
                     log('转发传输中静默超过 %.0f 秒(对端疑似卡死), 判断流并关闭'
                         % STALL_WATCHDOG)
@@ -4306,9 +4498,11 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                     try:
                         data = s.recv(65536)
                     except TimeoutError:
-                        # 3.10 起 socket.timeout 就是 TimeoutError(正常情况下由上面
-                        # 的 select 看门狗先拦下, 这里是兜底)
-                        log('转发等待数据超过 %.0f 秒, 关闭这条连接' % STALL_WATCHDOG)
+                        # 3.10 起 socket.timeout 就是 TimeoutError(正常情况下由上面的
+                        # select 看门狗先拦下, 这里是兜底): socket 超时设的是空闲上限
+                        # RELAY_IDLE_TIMEOUT, 不是看门狗值, 别把两个数混着报。
+                        log('转发等待数据超过 %.0f 秒(空闲上限), 关闭这条连接'
+                            % RELAY_IDLE_TIMEOUT)
                         stalled = s is up or bytes_up > 0
                         stop = True
                         break
@@ -4340,6 +4534,10 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                         bytes_up += len(data)
                     elif s is up:
                         _first_up = False
+                    elif s is conn and data:
+                        # 【2026-11-13 新增】客户端还在往上发(请求体没发完) —— 首字节计时
+                        # 从这一刻重新起算, 免得把"上传大文件"误判成"上游不给首字节"。
+                        _client_last_up = time.time()
                     if not data:
                         stop = True
                         break
@@ -4377,7 +4575,8 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             kind = WEB_STALL
         return {'kind': kind, 'bytes_up': bytes_up, 'first_ms': first_ms,
                 'stalled': stalled, 'up_err': up_err,
-                'stalled_watchdog': stalled_watchdog}
+                'stalled_watchdog': stalled_watchdog,
+                'first_byte_dead': first_byte_dead}
 
 
 class ProxyServer(socketserver.ThreadingTCPServer):
@@ -5438,7 +5637,7 @@ def autostart_on():
 # 做法: 升级源 version.json 先过 **Ed25519 验签** -> 下载到 <exe>.new -> 校验 sha256 ->
 #       交给一个独立小助手 (先让旧程序自己退出并还原代理 -> 覆盖 -> 再启动新的)。
 #       验签不过、没有 .sig、sha256 不符 —— 一律拒绝并保留旧版本, 绝不"先替换再校验"。
-# 不需要管理员权限: D:\Program Files 的 ACL 允许普通用户写(实测过)。
+# 不需要管理员权限: 安装目录的 ACL 允许普通用户写(实测过)。
 # 升级源: 仓库里的 version.json, GitCode raw 优先、GitHub 兜底;
 #         测试时可在数据目录放一个 update_url.txt 指到本地文件。
 UPDATE_URLS = (
@@ -5451,7 +5650,7 @@ UPDATE_URLS = (
 # 【2026-10-16 升级通道加固】内置的 Ed25519 **公钥**（离线生成，公开无妨、本来就要随程序分发）。
 # 升级源 version.json 必须带一份同目录的 `version.json.sig`（128 个十六进制字符 = 64 字节签名），
 # 用这把公钥验过才认；验不过 / 没签名 / 签名格式不对，一律**拒绝这条候选**（详见 _verify_update_sig）。
-# 没有私钥就签不出合法签名，所以即便 Gitee / GitHub 账号被盗、有人推了恶意 version.json + 恶意 exe，
+# 没有私钥就签不出合法签名，所以即便 GitCode / GitHub 账号被盗、有人推了恶意 version.json + 恶意 exe，
 # 客户端也不会装。私钥只在维护者机器上、绝不入库（见 docs/SECURITY.md）。
 # 能力边界（别夸大）：这挡的是"升级源被篡改"；挡不住维护者机器上的私钥本身被偷，
 # 也不等于 Windows 代码签名证书。
@@ -7552,9 +7751,15 @@ function paintStatus(d){
       if(a!=null&&b!=null){var dv=a-b;delta=' · 比上一轮 '+(dv>0?'+':(dv<0?'':'±'))+dv;}
     }
     wd.className=wcls;
+    // 【2026-11-13 新增·把"这不是坏了"说出来】down/flaky/slow 时用户会以为软件没在干活。
+    // 2026-11-13 实测: 同一分钟 curl 单发 3 次全败、浏览器整页却成了(391KB 完整);
+    // 失败几乎都发生在"首字节迟迟不来", 程序首字节 6 秒撒手换 IP 之后, 浏览器第二次
+    // 重试多半就成 —— 所以这句话是事实, 不是安慰。
+    var hint='';
+    if(w.code==='down'||w.code==='flaky'||w.code==='slow'){hint=' · 刷新一次通常就好(会自动换通道)';}
     wd.textContent=(w.detail||'最近 3 分钟没有真实网页请求')
       +' · 体检可用 '+strongN+'/'+(allN==null?'—':allN)
-      +'('+(tn.tls||0)+' 个仅验证书)'+delta;
+      +'('+(tn.tls||0)+' 个仅验证书)'+delta+hint;
     if(strongN===0&&okN>0){
       wd.className='d down';
       wd.textContent='池里 '+okN+' 个都没近期答过话 · '+esc(w.text||'')+'，只能靠兜底';

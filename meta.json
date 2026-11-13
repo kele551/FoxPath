@@ -1,5 +1,5 @@
 {
- "note": "狐径用的 GitHub 官方 IP 表快照。国内三网都能拉 Gitee，作为 api.github.com/meta 的兜底源（联通/移动拉不到官方接口时用）。",
+ "note": "狐径用的 GitHub 官方 IP 表快照。国内三网都能拉 GitCode，作为 api.github.com/meta 的兜底源（联通/移动拉不到官方接口时用）。",
  "updated": "2026-10-08",
  "web": [
   "192.30.252.0/22",

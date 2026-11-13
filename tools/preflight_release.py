@@ -91,11 +91,17 @@ USAGE = """狐径发版前自检 —— 用法
   · 结束时还原注册表与升级源，并把本机已装的狐径重新拉起来。
 
 判据: 红项（FAIL）一条都不许有 —— 有一条就不许发布；
+      跳过项（SKIP）不算通过、也不阻断退出码 —— 它表示"这次没验证到"（例如本机没有签名私钥，
+           完整升级演练跑不了）。有 SKIP 时结论不会打印"全绿"，退出码是 2，发布流水线照样中止；
+           发版前必须把条件补齐（$env:FOXPATH_ED25519_KEY='<私钥文件>'）再跑成 PASS；
       警告项（WARN）不阻断发布，但会在结尾单独列出，发布前应当看一眼。
+
+退出码: 0 = 全绿；1 = 有红项；2 = 无红项但有跳过项（未验证）。
 """
 
 results = []
 warnings = []
+skips = []
 
 
 def check(name, ok, detail=''):
@@ -113,6 +119,23 @@ def check_warn(name, ok, detail=''):
     warnings.append((name, bool(ok), detail))
     print('  [%s] %s%s' % ('PASS' if ok else 'WARN', name, ('  ' + detail) if detail else ''))
     return ok
+
+
+def check_skip(name, reason=''):
+    """跳过级检查：条件不具备（本机没有签名私钥、平台没发布过这东西…）时用它。
+
+    为什么要单独一级（2026-11-13）：
+      以前"没私钥"是直接记 FAIL，于是升级演练那 6 条连带全红 —— 每次自检都是
+      "23 项通过 / 8 项失败"，红项里混着"真问题"和"根本没跑"，人只能人工分辨，
+      闸门"红一条就不许发"这句话事实上失效了（分不清就不用分）。
+      SKIP 与 FAIL 必须分开：FAIL = 产品/文档真有问题；SKIP = 这次没验证到。
+
+    ⚠ 但 SKIP **不等于通过**：结论不会打印"全绿"，退出码是 2（未验证），
+      publish.py 的 returncode != 0 闸门照样挡住发布。发版前必须补跑并跑成 PASS。
+    """
+    skips.append((name, reason))
+    print('  [SKIP] %s%s' % (name, ('  ' + reason) if reason else ''))
+    return False
 
 
 def sh(args, cwd=None):
@@ -151,21 +174,35 @@ def patch_pe_timestamp(path):
 
 
 def finish():
-    """统一出口：打印汇总（红项 + 警告项）并给出结论。"""
+    """统一出口：打印汇总（红项 + 跳过项 + 警告项）并给出结论。
+
+    退出码：0 = 全绿；1 = 有红项（真问题）；2 = 没有红项但有跳过项（没验证到）。
+    publish.py 只认 returncode != 0，所以 2 照样挡住发布 —— SKIP 绝不能变成放行。
+    """
     print()
     print('=' * 62)
     bad_n = [n for n, ok, _ in results if not ok]
     warn_n = [(n, d) for n, ok, d in warnings if not ok]
-    print('自检结果: %d 项，通过 %d，失败 %d；警告 %d 项'
-          % (len(results), len(results) - len(bad_n), len(bad_n), len(warn_n)))
+    print('自检结果: %d 项，通过 %d，失败 %d，跳过 %d；警告 %d 项'
+          % (len(results), len(results) - len(bad_n), len(bad_n), len(skips), len(warn_n)))
     for n in bad_n:
         print('   FAIL -> %s' % n)
+    for n, r in skips:
+        print('   SKIP -> %s%s' % (n, ('  ' + r) if r else ''))
     for n, d in warn_n:
         print('   WARN -> %s%s' % (n, ('  ' + d) if d else ''))
     if warn_n:
         print('   （警告不阻断发布，但发布前请看一眼上面这些：通常意味着"远端还没传"或"两份脚本不同步"）')
-    print('结论: %s' % ('✅ 全绿，可以发布' if not bad_n else '❌ 有红项，禁止发布'))
-    sys.exit(0 if not bad_n else 1)
+    if bad_n:
+        print('结论: ❌ 有红项，禁止发布')
+        sys.exit(1)
+    if skips:
+        print('结论: ⏸ 没有红项，但有 %d 项**没验证到**（不是通过）—— 发版前必须把条件补齐再跑成 PASS；'
+              % len(skips))
+        print('      本次退出码 2，发布流水线同样会中止。')
+        sys.exit(2)
+    print('结论: ✅ 全绿，可以发布')
+    sys.exit(0)
 
 
 def reg_get():
@@ -531,9 +568,14 @@ PUBKEY_RE = re.compile(r"""UPDATE_PUBKEY\s*=\s*['"]([0-9a-fA-F]+)['"]""")
 _HEX128 = re.compile(r'[0-9a-fA-F]{128}')
 
 
-def _sign_drill_source(feedp):
-    """给演练的本地升级源签名：客户端现在强制验签，不签的话完整升级演练会因
-    「拿不到签名」整段红。私钥只从环境变量 / 本机私有配置读，绝不许硬编码路径。"""
+def _drill_key_path():
+    """找出升级演练用的 Ed25519 私钥文件路径；找不到返回 None。
+
+    只从环境变量 FOXPATH_ED25519_KEY / 本机私有配置 ~/.foxpath-publish.json 读，
+    **绝不在仓库里硬编码本机路径**（仓库内自检必须"克隆即可运行"）。
+    维护者本机的私钥保存在仓库之外，跑自检时这样给：
+        $env:FOXPATH_ED25519_KEY='<你的私钥文件绝对路径>'
+    """
     key = os.environ.get('FOXPATH_ED25519_KEY')
     if not key:
         try:
@@ -543,8 +585,21 @@ def _sign_drill_source(feedp):
         except Exception:
             key = ''
     if not key or not os.path.isfile(key):
+        return None
+    return key
+
+
+def _sign_drill_source(feedp):
+    """给演练的本地升级源签名：客户端现在强制验签，不签的话完整升级演练会因
+    「拿不到签名」整段红。私钥只从环境变量 / 本机私有配置读，绝不许硬编码路径。
+
+    调用到这里说明私钥已经在 ④ 段开头探到了（探不到就整节 SKIP，不会走到这儿）；
+    这里再失败（文件读坏、hex 不对、_ed25519 导入不了）就是真问题，照旧记 FAIL。
+    """
+    key = _drill_key_path()
+    if not key:
         check('演练需要签名私钥（设 FOXPATH_ED25519_KEY，或 ~/.foxpath-publish.json 的 ed25519_key）',
-              False, key or '(空)')
+              False, '(空)')
         return False
     try:
         if REPO not in sys.path:
@@ -780,181 +835,192 @@ try:
     # 前者本来就删掉重来；后者**必须备份还原** —— 否则用户面板那行「上次升级结果」
     # 会挂着演练造出来的假记录（真事：面板显示"升级到 v9.9.9 失败, 回滚后也没能自动启动"）。
     # _restore 已在上面 try 之前初始化，这里只往里追加（见那里的原因说明）。
-    _resf = os.path.join(DATA, 'update-result.json')
-    _logf2 = os.path.join(DATA, 'update.log')
-    for _p in (_resf, _logf2):
-        try:
-            if os.path.exists(_p):
-                _bak = os.path.join(TMP, os.path.basename(_p) + '.preflight-bak')
-                shutil.copy2(_p, _bak)
-                _restore.append((_bak, _p))
-        except Exception as _e:
-            print('     ⚠ 备份 %s 失败（演练结束后它可能被改写）: %s' % (_p, _e))
-    kill_app()
-    old = os.path.join(TMP, 'upgrade', 'FoxPath.exe')
-    shutil.rmtree(os.path.dirname(old), ignore_errors=True)
-    os.makedirs(os.path.dirname(old), exist_ok=True)
-    # 用【候选自己】当"旧版"：小助手脚本由正在运行的那个版本生成，
-    # 只有让候选来发起这次升级，才能验到候选里的加固逻辑。
-    oldsrc = CAND
-    if not os.path.exists(oldsrc):
-        check('找得到用于升级演练的 exe', False, oldsrc)
+    # 2026-11-13：缺签名私钥时**整节 SKIP**，不再让 ④⑤ 连带刷 6 条假红。
+    # 以前的做法是照样往下跑：客户端因为「拿不到签名」当场拒绝升级，于是
+    # 「读到有新版本」「exe 被换掉」「端到端成功」全红 —— 混在真问题里，闸门就失效了。
+    _DRILL_KEY = _drill_key_path()
+    if not _DRILL_KEY:
+        print('     ⚠ 缺签名私钥 —— ④⑤ 两节整体跳过，不启动任何进程（跳过 ≠ 通过）')
+        check_skip('④ 完整升级演练（检查更新 -> 立即升级 -> 换 exe -> 新版自己起来）',
+                   '缺签名私钥：客户端强制验签，演练源签不出来就跑不了；补 FOXPATH_ED25519_KEY 指向 64 字节 hex 私钥')
+        check_skip('⑤ 失败分支（升级源 sha256 故意写错，必须拒绝且不覆盖旧版）',
+                   '同上：未签名的升级源客户端根本不认，验不到「校验不过…已放弃」这条路')
     else:
-        shutil.copy2(oldsrc, old)
-        # 2026-10-09：不再改 PE 时间戳造"假新版"。**旧版 = 真实候选(1.0.7)，新版 = 真 9.9.9 测试版**，
-        # 两者内容与版本号都不同：sha256 判据、版本号确认、失败回滚三条路才都能真跑。
-        if not os.path.exists(NEW999):
-            new_sha = ''
-            check('找得到 9.9.9 测试版（先跑 tools\\造测试版-9.9.9.py）', False, NEW999)
-        else:
-            new_sha = sha(NEW999)
-            check_warn('升级演练的"旧版"与"新版"指纹不同（比 sha256 才有意义）',
-                       sha(old) != new_sha, 'old=%s new999=%s' % (sha(old)[:12], new_sha[:12]))
-        _new_name = os.path.basename(NEW999) or 'FoxPath-9.9.9-test.exe'
-        # 缺 9.9.9 测试版时**不能**在这里抛 FileNotFoundError：2026-10-26 实跑踩过 ——
-        # 脚本在 ⑤/⑥（清理与注册表还原）之前整个崩掉，系统的 PAC 就留在演练状态里了，
-        # 用户看到的是"自检没跑完 + 网页从此不通"。让它红着走完，比红着崩掉有用。
-        if new_sha:
-            shutil.copy2(NEW999, os.path.join(os.path.dirname(old), _new_name))
-        _srv, _base = _start_local_http(os.path.dirname(old))
-        feed = {'version': '9.9.9', 'notes': 'preflight',
-                'exe': {'sha256': new_sha, 'url': '%s/%s' % (_base, _new_name),
-                        'size': os.path.getsize(NEW999) if os.path.exists(NEW999) else 0}}
-        feedp = os.path.join(TMP, 'upgrade', 'version.json')
-        io.open(feedp, 'w', encoding='utf-8', newline='\n').write(
-            json.dumps(feed, ensure_ascii=False))
-        _sign_drill_source(feedp)
-        io.open(url_txt, 'w', encoding='utf-8').write('%s/version.json' % _base)
-        tmp_files.append(url_txt)
-        for f in (cache, os.path.join(DATA, 'update.log')):
+        _resf = os.path.join(DATA, 'update-result.json')
+        _logf2 = os.path.join(DATA, 'update.log')
+        for _p in (_resf, _logf2):
             try:
-                os.remove(f)
-            except OSError:
-                pass
-        subprocess.Popen([old, '--silent'], cwd=os.path.dirname(old))
+                if os.path.exists(_p):
+                    _bak = os.path.join(TMP, os.path.basename(_p) + '.preflight-bak')
+                    shutil.copy2(_p, _bak)
+                    _restore.append((_bak, _p))
+            except Exception as _e:
+                print('     ⚠ 备份 %s 失败（演练结束后它可能被改写）: %s' % (_p, _e))
+        kill_app()
+        old = os.path.join(TMP, 'upgrade', 'FoxPath.exe')
+        shutil.rmtree(os.path.dirname(old), ignore_errors=True)
+        os.makedirs(os.path.dirname(old), exist_ok=True)
+        # 用【候选自己】当"旧版"：小助手脚本由正在运行的那个版本生成，
+        # 只有让候选来发起这次升级，才能验到候选里的加固逻辑。
+        oldsrc = CAND
+        if not os.path.exists(oldsrc):
+            check('找得到用于升级演练的 exe', False, oldsrc)
+        else:
+            shutil.copy2(oldsrc, old)
+            # 2026-10-09：不再改 PE 时间戳造"假新版"。**旧版 = 真实候选(1.0.7)，新版 = 真 9.9.9 测试版**，
+            # 两者内容与版本号都不同：sha256 判据、版本号确认、失败回滚三条路才都能真跑。
+            if not os.path.exists(NEW999):
+                new_sha = ''
+                check('找得到 9.9.9 测试版（先跑 tools\\造测试版-9.9.9.py）', False, NEW999)
+            else:
+                new_sha = sha(NEW999)
+                check_warn('升级演练的"旧版"与"新版"指纹不同（比 sha256 才有意义）',
+                           sha(old) != new_sha, 'old=%s new999=%s' % (sha(old)[:12], new_sha[:12]))
+            _new_name = os.path.basename(NEW999) or 'FoxPath-9.9.9-test.exe'
+            # 缺 9.9.9 测试版时**不能**在这里抛 FileNotFoundError：2026-10-26 实跑踩过 ——
+            # 脚本在 ⑤/⑥（清理与注册表还原）之前整个崩掉，系统的 PAC 就留在演练状态里了，
+            # 用户看到的是"自检没跑完 + 网页从此不通"。让它红着走完，比红着崩掉有用。
+            if new_sha:
+                shutil.copy2(NEW999, os.path.join(os.path.dirname(old), _new_name))
+            _srv, _base = _start_local_http(os.path.dirname(old))
+            feed = {'version': '9.9.9', 'notes': 'preflight',
+                    'exe': {'sha256': new_sha, 'url': '%s/%s' % (_base, _new_name),
+                            'size': os.path.getsize(NEW999) if os.path.exists(NEW999) else 0}}
+            feedp = os.path.join(TMP, 'upgrade', 'version.json')
+            io.open(feedp, 'w', encoding='utf-8', newline='\n').write(
+                json.dumps(feed, ensure_ascii=False))
+            _sign_drill_source(feedp)
+            io.open(url_txt, 'w', encoding='utf-8').write('%s/version.json' % _base)
+            tmp_files.append(url_txt)
+            for f in (cache, os.path.join(DATA, 'update.log')):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            subprocess.Popen([old, '--silent'], cwd=os.path.dirname(old))
+            time.sleep(12)
+            check('旧版起来了', up())
+            post(PANEL + '/api/update/check')
+            time.sleep(3)
+            st, stt = get(PANEL + '/api/update/status')
+            check('读到「有新版本」', '9.9.9' in (stt or ''), (stt or '')[:90])
+            post(PANEL + '/api/update/start')
+            ok_swap = False
+            for i in range(36):
+                time.sleep(5)
+                # M-12：按 sha256 判"已换成新版"，不再拿文件大小比（新旧恰好同字节数就骗过去了）
+                if os.path.exists(old) and sha(old) == new_sha:
+                    ok_swap = True
+                    break
+            check('升级后 exe 被换成 9.9.9 测试版（= 升级动作本身成功）', ok_swap,
+                  '第 %d 秒' % ((i + 1) * 5) if ok_swap else '没换掉（sha256 与 9.9.9 测试版不符）')
+            # 等终态：要么新实例起来，要么小助手跑完重试并给出提示（约 2~3 分钟）。
+            print('     等升级小助手跑完（最多 6 分钟，每 20 秒报一次进度）…')
+            brought_up = None
+            logf = os.path.join(DATA, 'update.log')
+            for tick in range(18):
+                time.sleep(20)
+                if up():
+                    brought_up = tick * 20 + 1
+                    break
+                t0 = io.open(logf, encoding='utf-8-sig', errors='replace').read() if os.path.exists(logf) else ''
+                if '手动双击' in t0:
+                    print('     小助手已给出「请手动双击」提示（第 %d 秒）' % ((tick + 1) * 20))
+                    break
+                if tick % 3 == 2:
+                    print('       …%d 秒，最后一行：%s' % ((tick + 1) * 20,
+                                                        (t0.strip().split('\n') or [''])[-1][:70]))
+            logtxt = io.open(logf, encoding='utf-8-sig', errors='replace').read() if os.path.exists(logf) else ''
+            # 判据（2026-10-08 定）：杀软可能拦掉升级后的第一次启动，这我们控制不了；
+            # 能保证的是"要么自己起来，要么重试过、并且明确告诉用户双击一下"。
+            retried = logtxt.count('次启动新版本') >= 2
+            told_user = ('手动双击' in logtxt) or ('Popup' in logtxt)
+            if brought_up is not None:
+                check('★ 升级后自动重启：新版本自己起来了', True, '等了 %d 秒' % brought_up)
+            else:
+                check('★ 升级后自动重启：起不来时必须"重试过 + 明确提示用户"',
+                      retried and told_user,
+                      '重试=%s 提示=%s（本机装了火绒，实测常拦升级后的第一次启动）' % (retried, told_user))
+            # 判据（2026-10-09 更新）：小助手现在**按版本号确认成功**，日志写「已自动/手动升级到 vX」；
+            # 旧措辞「新版本已起来」、以及失败路径的「已自动回滚」「手动双击」一并认。
+            # ⚠ 取证据行时**绝不能假设一定存在**：曾经这里 [-1] 越界把整个自检崩掉，
+            #   而发版闸门把"自检崩了"当成"没通过"，白白中止了一次发版（2026-10-09 真事）。
+            # 判据（2026-10-09 再更新）：分两种正当结果 ——
+            #   A「成功」：新版起来后往**主日志**写「已自动/手动升级到 vX」；
+            #   B「演练固有的人工兜底」：演练里的"新版"其实是候选副本（只改了 PE 时间戳，
+            #     版本号仍是本版），新版小助手**按版本号确认成功**，于是必然走
+            #     "没升上去 -> 三步兜底 / 请用户手动双击"那条路。这是演练的假象，不是产品问题。
+            # 两种都认，但必须能说出个所以然；取证据行时**永不越界**（曾经 [-1] 越界把自检崩掉，
+            # 闸门把"自检崩了"当"没通过"，白白中止过一次发版）。
+            mainlog = os.path.join(DATA, 'foxpath.log')
+            maintxt = io.open(mainlog, encoding='utf-8-sig', errors='replace').read() if os.path.exists(mainlog) else ''
+            both = (logtxt or '') + '\n' + (maintxt or '')
+            lines = [l for l in both.split('\n') if l.strip()]
+            ok_marks = ('已自动升级到 v', '已手动升级到 v', '新版本已起来')
+            fb_marks = ('三步兜底', '手动双击', '已自动回滚', '没有生效(当前仍是')
+            hit_ok = [l for l in lines if any(m in l for m in ok_marks)]
+            hit_fb = [l for l in lines if any(m in l for m in fb_marks)]
+            detail = (('成功: ' + hit_ok[-1][:70]) if hit_ok else
+                      (('演练固有兜底: ' + hit_fb[-1][:70]) if hit_fb else
+                       ('两份日志共 %d 行，没有任何升级结果痕迹（把日志留下排查）' % len(lines))))
+            check('升级结果有痕迹（「已升级到 vX」或演练固有的「三步兜底/手动双击/回滚」）',
+                  bool(hit_ok or hit_fb), detail)
+            check('换上去的 exe 指纹 == 9.9.9 测试版', os.path.exists(old) and sha(old) == new_sha)
+            # 端到端最强判据：**正在跑的那个实例自报 9.9.9** —— 下载→校验→覆盖→新版起来→按版本号确认，全过。
+            _st9, _diag9 = get(PANEL + '/api/diag')
+            check('新版自报版本 = 9.9.9（升级链路端到端成功）',
+                  '狐径体检 v9.9.9' in (_diag9 or ''), (_diag9 or '').split('\n')[0][:70])
+
+        # ── 4 失败分支：sha 故意写错 ─────────────────────────────────────
+        print()
+        print('⑤ 失败分支：升级源 sha256 故意写错，必须拒绝且不覆盖')
+        kill_app()
+        bad = os.path.join(TMP, 'bad', 'FoxPath.exe')
+        for attempt in range(4):
+            try:
+                shutil.rmtree(os.path.dirname(bad), ignore_errors=True)
+                os.makedirs(os.path.dirname(bad), exist_ok=True)
+                shutil.copy2(CAND, bad)
+                break
+            except PermissionError:
+                print('     测试目录被占用，等 5 秒再试（第 %d 次）' % (attempt + 1))
+                kill_app()
+                time.sleep(5)
+        bad_sha = 'F' * 64
+        # 2026-10-09：这里必须用**比当前(9.9.9)更高**的版本号 —— 否则会被"拒绝降级"的新护栏
+        # 挡在下载之前，压根走不到"校验不过"那条路（那次演练报的就是这个假红）。
+        _srv2, _base2 = _start_local_http(os.path.dirname(bad))
+        feed2 = {'version': '9.9.10', 'notes': 'preflight-bad',
+                 'exe': {'sha256': bad_sha, 'url': '%s/FoxPath.exe' % _base2,
+                         'size': os.path.getsize(CAND)}}
+        feedp2 = os.path.join(TMP, 'bad', 'version.json')
+        io.open(feedp2, 'w', encoding='utf-8', newline='\n').write(json.dumps(feed2, ensure_ascii=False))
+        _sign_drill_source(feedp2)
+        io.open(url_txt, 'w', encoding='utf-8').write('%s/version.json' % _base2)
+        try:
+            os.remove(cache)
+        except OSError:
+            pass
+        sha_before = sha(bad)          # M-12：同样按 sha256 判"没被覆盖"，不看大小
+        subprocess.Popen([bad, '--silent'], cwd=os.path.dirname(bad))
         time.sleep(12)
-        check('旧版起来了', up())
         post(PANEL + '/api/update/check')
         time.sleep(3)
-        st, stt = get(PANEL + '/api/update/status')
-        check('读到「有新版本」', '9.9.9' in (stt or ''), (stt or '')[:90])
         post(PANEL + '/api/update/start')
-        ok_swap = False
-        for i in range(36):
-            time.sleep(5)
-            # M-12：按 sha256 判"已换成新版"，不再拿文件大小比（新旧恰好同字节数就骗过去了）
-            if os.path.exists(old) and sha(old) == new_sha:
-                ok_swap = True
-                break
-        check('升级后 exe 被换成 9.9.9 测试版（= 升级动作本身成功）', ok_swap,
-              '第 %d 秒' % ((i + 1) * 5) if ok_swap else '没换掉（sha256 与 9.9.9 测试版不符）')
-        # 等终态：要么新实例起来，要么小助手跑完重试并给出提示（约 2~3 分钟）。
-        print('     等升级小助手跑完（最多 6 分钟，每 20 秒报一次进度）…')
-        brought_up = None
-        logf = os.path.join(DATA, 'update.log')
-        for tick in range(18):
-            time.sleep(20)
-            if up():
-                brought_up = tick * 20 + 1
-                break
-            t0 = io.open(logf, encoding='utf-8-sig', errors='replace').read() if os.path.exists(logf) else ''
-            if '手动双击' in t0:
-                print('     小助手已给出「请手动双击」提示（第 %d 秒）' % ((tick + 1) * 20))
-                break
-            if tick % 3 == 2:
-                print('       …%d 秒，最后一行：%s' % ((tick + 1) * 20,
-                                                    (t0.strip().split('\n') or [''])[-1][:70]))
-        logtxt = io.open(logf, encoding='utf-8-sig', errors='replace').read() if os.path.exists(logf) else ''
-        # 判据（2026-10-08 定）：杀软可能拦掉升级后的第一次启动，这我们控制不了；
-        # 能保证的是"要么自己起来，要么重试过、并且明确告诉用户双击一下"。
-        retried = logtxt.count('次启动新版本') >= 2
-        told_user = ('手动双击' in logtxt) or ('Popup' in logtxt)
-        if brought_up is not None:
-            check('★ 升级后自动重启：新版本自己起来了', True, '等了 %d 秒' % brought_up)
-        else:
-            check('★ 升级后自动重启：起不来时必须"重试过 + 明确提示用户"',
-                  retried and told_user,
-                  '重试=%s 提示=%s（本机装了火绒，实测常拦升级后的第一次启动）' % (retried, told_user))
-        # 判据（2026-10-09 更新）：小助手现在**按版本号确认成功**，日志写「已自动/手动升级到 vX」；
-        # 旧措辞「新版本已起来」、以及失败路径的「已自动回滚」「手动双击」一并认。
-        # ⚠ 取证据行时**绝不能假设一定存在**：曾经这里 [-1] 越界把整个自检崩掉，
-        #   而发版闸门把"自检崩了"当成"没通过"，白白中止了一次发版（2026-10-09 真事）。
-        # 判据（2026-10-09 再更新）：分两种正当结果 ——
-        #   A「成功」：新版起来后往**主日志**写「已自动/手动升级到 vX」；
-        #   B「演练固有的人工兜底」：演练里的"新版"其实是候选副本（只改了 PE 时间戳，
-        #     版本号仍是本版），新版小助手**按版本号确认成功**，于是必然走
-        #     "没升上去 -> 三步兜底 / 请用户手动双击"那条路。这是演练的假象，不是产品问题。
-        # 两种都认，但必须能说出个所以然；取证据行时**永不越界**（曾经 [-1] 越界把自检崩掉，
-        # 闸门把"自检崩了"当"没通过"，白白中止过一次发版）。
-        mainlog = os.path.join(DATA, 'foxpath.log')
-        maintxt = io.open(mainlog, encoding='utf-8-sig', errors='replace').read() if os.path.exists(mainlog) else ''
-        both = (logtxt or '') + '\n' + (maintxt or '')
-        lines = [l for l in both.split('\n') if l.strip()]
-        ok_marks = ('已自动升级到 v', '已手动升级到 v', '新版本已起来')
-        fb_marks = ('三步兜底', '手动双击', '已自动回滚', '没有生效(当前仍是')
-        hit_ok = [l for l in lines if any(m in l for m in ok_marks)]
-        hit_fb = [l for l in lines if any(m in l for m in fb_marks)]
-        detail = (('成功: ' + hit_ok[-1][:70]) if hit_ok else
-                  (('演练固有兜底: ' + hit_fb[-1][:70]) if hit_fb else
-                   ('两份日志共 %d 行，没有任何升级结果痕迹（把日志留下排查）' % len(lines))))
-        check('升级结果有痕迹（「已升级到 vX」或演练固有的「三步兜底/手动双击/回滚」）',
-              bool(hit_ok or hit_fb), detail)
-        check('换上去的 exe 指纹 == 9.9.9 测试版', os.path.exists(old) and sha(old) == new_sha)
-        # 端到端最强判据：**正在跑的那个实例自报 9.9.9** —— 下载→校验→覆盖→新版起来→按版本号确认，全过。
-        _st9, _diag9 = get(PANEL + '/api/diag')
-        check('新版自报版本 = 9.9.9（升级链路端到端成功）',
-              '狐径体检 v9.9.9' in (_diag9 or ''), (_diag9 or '').split('\n')[0][:70])
-
-    # ── 4 失败分支：sha 故意写错 ─────────────────────────────────────
-    print()
-    print('⑤ 失败分支：升级源 sha256 故意写错，必须拒绝且不覆盖')
-    kill_app()
-    bad = os.path.join(TMP, 'bad', 'FoxPath.exe')
-    for attempt in range(4):
-        try:
-            shutil.rmtree(os.path.dirname(bad), ignore_errors=True)
-            os.makedirs(os.path.dirname(bad), exist_ok=True)
-            shutil.copy2(CAND, bad)
-            break
-        except PermissionError:
-            print('     测试目录被占用，等 5 秒再试（第 %d 次）' % (attempt + 1))
-            kill_app()
-            time.sleep(5)
-    bad_sha = 'F' * 64
-    # 2026-10-09：这里必须用**比当前(9.9.9)更高**的版本号 —— 否则会被"拒绝降级"的新护栏
-    # 挡在下载之前，压根走不到"校验不过"那条路（那次演练报的就是这个假红）。
-    _srv2, _base2 = _start_local_http(os.path.dirname(bad))
-    feed2 = {'version': '9.9.10', 'notes': 'preflight-bad',
-             'exe': {'sha256': bad_sha, 'url': '%s/FoxPath.exe' % _base2,
-                     'size': os.path.getsize(CAND)}}
-    feedp2 = os.path.join(TMP, 'bad', 'version.json')
-    io.open(feedp2, 'w', encoding='utf-8', newline='\n').write(json.dumps(feed2, ensure_ascii=False))
-    _sign_drill_source(feedp2)
-    io.open(url_txt, 'w', encoding='utf-8').write('%s/version.json' % _base2)
-    try:
-        os.remove(cache)
-    except OSError:
-        pass
-    sha_before = sha(bad)          # M-12：同样按 sha256 判"没被覆盖"，不看大小
-    subprocess.Popen([bad, '--silent'], cwd=os.path.dirname(bad))
-    time.sleep(12)
-    post(PANEL + '/api/update/check')
-    time.sleep(3)
-    post(PANEL + '/api/update/start')
-    time.sleep(20)
-    st, stt = get(PANEL + '/api/update/status')
-    # 2026-10-09：`/api/update/status` 里的 phase 是**易失**的 —— 之后任何一次"检查更新"
-    # 都会把它刷成 idle，演练里就这么读到过一次 idle（假红）。改判**主日志**里那条
-    # 「校验不过…已放弃」（持久、可复查），状态只作为补充信息打印。
-    _mlog = os.path.join(DATA, 'foxpath.log')
-    _mlogtxt = io.open(_mlog, encoding='utf-8-sig', errors='replace').read() if os.path.exists(_mlog) else ''
-    _badlines = [l for l in _mlogtxt.split('\n')
-                 if ('校验不过' in l) or ('校验失败' in l) or ('实际 FFFFFF' in l)]
-    check('校验失败被拒绝（主日志里有「校验不过…已放弃」）',
-          bool(_badlines) or ('failed' in (stt or '')) or ('校验' in (stt or '')),
-          (_badlines[-1].strip()[:90] if _badlines else ('状态: ' + (stt or '')[:80])))
-    check('旧版 exe 没被覆盖（sha256 未变）', sha(bad) == sha_before,
-          '%s -> %s' % (sha_before[:12], sha(bad)[:12]))
+        time.sleep(20)
+        st, stt = get(PANEL + '/api/update/status')
+        # 2026-10-09：`/api/update/status` 里的 phase 是**易失**的 —— 之后任何一次"检查更新"
+        # 都会把它刷成 idle，演练里就这么读到过一次 idle（假红）。改判**主日志**里那条
+        # 「校验不过…已放弃」（持久、可复查），状态只作为补充信息打印。
+        _mlog = os.path.join(DATA, 'foxpath.log')
+        _mlogtxt = io.open(_mlog, encoding='utf-8-sig', errors='replace').read() if os.path.exists(_mlog) else ''
+        _badlines = [l for l in _mlogtxt.split('\n')
+                     if ('校验不过' in l) or ('校验失败' in l) or ('实际 FFFFFF' in l)]
+        check('校验失败被拒绝（主日志里有「校验不过…已放弃」）',
+              bool(_badlines) or ('failed' in (stt or '')) or ('校验' in (stt or '')),
+              (_badlines[-1].strip()[:90] if _badlines else ('状态: ' + (stt or '')[:80])))
+        check('旧版 exe 没被覆盖（sha256 未变）', sha(bad) == sha_before,
+              '%s -> %s' % (sha_before[:12], sha(bad)[:12]))
 
 finally:
     print()
