@@ -302,7 +302,10 @@ def _push(remote, ref):
                               'push', remote, ref])
         if code != 0:
             print('   带代理也失败:', out.strip()[-200:])
-    remote_sha = (_git_raw(['git', 'ls-remote', remote, ref])[1].split() or ['', ''])[1:2]
+    # ls-remote 每行是「<sha>\t<ref>」：第一个字段才是 sha。
+    # 2026-11-13 修：原来取的是 split()[1:2]（ref 名），于是每次都在比对"refs/tags/v1.2.5"
+    # 和本地 sha，必然不等 → 明明推上去了却报"没生效"。
+    remote_sha = (_git_raw(['git', 'ls-remote', remote, ref])[1].split() or [''])[:1]
     if remote_sha and remote_sha[0] == want:
         print('   pushed %s -> %s（远端 sha %s… 与本地一致）' % (ref, remote, want[:10]))
         return True
