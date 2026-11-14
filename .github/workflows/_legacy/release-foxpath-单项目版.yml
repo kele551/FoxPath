@@ -1,0 +1,130 @@
+name: release
+
+# 这个工作流的用途：**把打包搬到 GitHub 的机器上**，本机只推几十 KB 源码。
+#
+# 起因：本机到 GitHub 的上行链路时好时坏（19 MB 附件曾卡掉一个半小时），
+# 而 runner 到 GitHub 是内网，不存在峰谷问题。所以让 exe 在云端产生、在云端上传。
+#
+# 它只做两件事：构建 FoxPath.exe；按需挂到一个 Release。
+# **它不生成 version.json、不签名** —— 签名私钥不出本机。
+# version.json 与 .sig 加起来不到 1 KB，本机改完直接 push 就行，
+# 根本不需要走大文件通道，也就没必要把发版私钥交给 GitHub。
+#
+# 手动触发（Actions 页面 Run workflow）：填 tag 就发到那个 Release，留空就只构建。
+# 默认建草稿 Release：不对外可见，确认无误再手动点发布。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布用的 tag（如 v1.2.6）。留空＝只构建、不上传'
+        required: false
+        default: ''
+      draft:
+        description: '先建草稿 Release（确认后再手动发布）'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Windows 构建 + 按需上传 Release
+    runs-on: windows-latest
+    timeout-minutes: 30
+    # GitHub 的 Windows runner 控制台默认 cp1252，构建脚本里的中文 print
+    # 会抛 UnicodeEncodeError 直接把 CI 弄红。强制 Python 用 UTF-8 输出。
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          # 与本地打包环境一致：Python 3.13
+          python-version: '3.13'
+
+      - name: 安装 PyInstaller
+        # 只有打包这一步需要 pyinstaller；发布出去的 exe 运行时零第三方依赖
+        run: python -m pip install --disable-pip-version-check "pyinstaller==6.22.3"
+
+      - name: 打包（仓库里的真实构建脚本）
+        run: python build_exe.py
+
+      - name: 整理产物 + 生成 SHA256 清单
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-staging | Out-Null
+          if (-not (Test-Path 'FoxPath.exe')) { throw '打包后没有找到 FoxPath.exe' }
+          Copy-Item 'FoxPath.exe' 'dist-staging\FoxPath.exe'
+          $lines = foreach ($f in (Get-ChildItem -File dist-staging | Sort-Object Name)) {
+            $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f.FullName).Hash
+            '{0}  {1}  {2} bytes' -f $h, $f.Name, $f.Length
+          }
+          $lines | Set-Content -Encoding utf8 dist-staging\SHA256SUMS.txt
+          Write-Host '===== SHA256 ====='
+          $lines | ForEach-Object { Write-Host $_ }
+
+      - name: 版本号自证（只打印，不拦发布）
+        shell: pwsh
+        run: |
+          $src = Get-Content -Raw github_direct.py
+          if ($src -match "APP_VERSION\s*=\s*'([0-9.]+)'") { $ver = $Matches[1] }
+          else { throw '在 github_direct.py 里找不到 APP_VERSION 常量' }
+          $vj = Get-Content -Raw version.json | ConvertFrom-Json
+          $exe = Get-Item 'FoxPath.exe'
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath 'FoxPath.exe').Hash.ToUpper()
+          Write-Host ("源码 APP_VERSION = " + $ver)
+          Write-Host ("version.json 版本 = " + $vj.version)
+          Write-Host ("exe 文件版本      = " + $exe.VersionInfo.FileVersion)
+          Write-Host ("本次构建 exe sha256 = " + $sha)
+          Write-Host ("本次构建 exe size   = " + $exe.Length)
+          if ($vj.version -ne $ver) {
+            Write-Host "::warning::version.json 的版本号($($vj.version))与源码 APP_VERSION($ver) 不一致 —— 发版前必须对齐"
+          }
+          # 把本机写 version.json 需要的那两个值单独打到 job summary，本机直接抄
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## 本机写 version.json 用这两个值"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```'
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "sha256 = $sha"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "size   = $($exe.Length)"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```'
+
+      - name: 上传到 Release
+        if: inputs.tag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          $draftArgs = @()
+          if ($env:DRAFT -eq 'true') { $draftArgs = @('--draft') }
+
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Release $env:TAG 不存在，创建"
+            gh release create $env:TAG @draftArgs --title $env:TAG `
+              --notes '由 GitHub Actions 从本仓库源码构建。指纹见 SHA256SUMS.txt。'
+            if ($LASTEXITCODE -ne 0) { throw "创建 Release 失败" }
+          } else {
+            Write-Host "Release $env:TAG 已存在，追加/覆盖附件"
+          }
+
+          gh release upload $env:TAG 'dist-staging\FoxPath.exe' 'dist-staging\SHA256SUMS.txt' --clobber
+          if ($LASTEXITCODE -ne 0) { throw "上传附件失败" }
+
+          Write-Host '===== Release 现有附件 ====='
+          gh release view $env:TAG --json assets --jq '.assets[] | "\(.name)  \(.size) B"'
+
+      - name: 上传产物（不发布时也能取）
+        uses: actions/upload-artifact@v4
+        with:
+          name: FoxPath-build-${{ github.sha }}
+          path: dist-staging/
+          if-no-files-found: error
+          retention-days: 30
