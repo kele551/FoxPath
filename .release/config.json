@@ -1,0 +1,40 @@
+{
+  "name": "狐径",
+  "runs_on": "windows-latest",
+  "branch": "main",
+  "python": "3.13",
+  "deps": [
+    "\"pyinstaller==6.22.3\""
+  ],
+  "build": [
+    "python build_exe.py"
+  ],
+  "outputs": [
+    "FoxPath.exe"
+  ],
+  "version_source": "github_direct.py:APP_VERSION",
+  "sign": {
+    "enabled": false,
+    "key_env": "RELEASE_SIGN_KEY",
+    "command": "",
+    "outputs": []
+  },
+  "checksums": {
+    "file": "SHA256SUMS.txt",
+    "files": [
+      "FoxPath.exe"
+    ]
+  },
+  "publish": {
+    "github": {
+      "owner": "kele551",
+      "repo": "FoxPath"
+    },
+    "gitcode": {
+      "owner": "kele551",
+      "repo": "FoxPath"
+    },
+    "extra": []
+  },
+  "commit_back": []
+}

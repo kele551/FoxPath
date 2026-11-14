@@ -1,0 +1,59 @@
+name: release
+
+# 通用「云端发版」——构建、签名、双平台上传、回写升级源全部在 runner 上完成。
+# 本机只负责把源码 push 上来，不再上传任何产物。
+#
+# 这份文件对所有 Windows 项目**完全一样**，不要为单个项目改它。
+# 项目之间的差异全部写在 .release/config.json 里。
+#
+# 触发方式：仓库 Actions 页面 → release → Run workflow。
+# 需要先在该仓库配好 secrets（Settings → Secrets and variables → Actions）：
+#   GITCODE_TOKEN     往 GitCode 发版必需（国内主源）
+#   RELEASE_SIGN_KEY  需要签名的项目必需；不需要签名的项目留空即可
+# GITHUB_TOKEN 由 Actions 自动提供，不用配。
+
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: 版本说明（留空则自动用「项目名 v版本号」）
+        required: false
+        default: ''
+      allow_replace:
+        description: 覆盖线上同名附件（仅在重发同一版本时勾选）
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建 + 发版
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+      RELEASE_SIGN_KEY: ${{ secrets.RELEASE_SIGN_KEY }}
+
+    steps:
+      - name: 检出源码（含 tag）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 云端发版
+        shell: pwsh
+        run: |
+          $extra = @()
+          if ("${{ inputs.allow_replace }}" -eq "true") { $extra += "--allow-replace" }
+          python .release/release_run.py --notes "${{ inputs.notes }}" @extra
