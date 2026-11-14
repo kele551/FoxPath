@@ -269,6 +269,9 @@ def main():
         ver = read_version(root, cfg['version_source'])
         log('版本号（来自源码）: %s' % ver)
     tag = 'v' + ver if ver else ''
+    if not tag and not a.skip_publish:
+        raise SystemExit('没拿到版本号（version_source 为空或取不到常量），拒绝发布 —— '
+                         '发一个版本号不明的包比不发更糟。只构建请加 --skip-publish')
 
     if not a.skip_build:
         for dep in (cfg.get('deps') or []):
