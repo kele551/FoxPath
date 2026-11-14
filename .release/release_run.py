@@ -234,6 +234,68 @@ def publish_github(owner, repo, tag, files, token, notes, replace):
     log('GitHub 回读核对通过（%d 个附件）' % len(files))
 
 
+def verify_platforms(pub, tag, name):
+    """发布后核对 GitCode 与 GitHub 是否一致（附件名 + 大小逐项比）。
+    只报告、绝不阻断：任何异常都吞掉，比对失败不影响已经成功的发版结论。"""
+    def side(cfg, call, token):
+        if not cfg:
+            return ('SKIP', {})
+        if not token:
+            return ('NOTOKEN', {})
+        try:
+            rel = call('GET', '/repos/%s/%s/releases/tags/%s'
+                       % (cfg['owner'], cfg['repo'], urllib.parse.quote(tag)), token, timeout=20) or {}
+        except Exception as e:
+            return ('MISSING' if ' 404 ' in (' %s ' % e) else 'ERROR(%s)' % type(e).__name__, {})
+        if (rel.get('tag_name') or '') != tag:
+            return ('MISSING', {})
+        auto = {tag + '.zip', tag + '.tar.gz', tag + '.tar.bz2', tag + '.tar'}
+        # 上面几个是 GitHub 自己附带的源码包，GitCode 没有，不算两个平台不一致。
+        return ('OK', {x.get('name'): x.get('size') for x in (rel.get('assets') or [])
+                       if x.get('name') not in auto and x.get('size') is not None})
+
+    try:
+        sg, ag = side(pub.get('gitcode'), gc_call, os.environ.get('GITCODE_TOKEN'))
+        sh, ah = side(pub.get('github'), gh_call, os.environ.get('GITHUB_TOKEN'))
+        log('两平台核对: GitCode=%s GitHub=%s' % (sg, sh))
+        bad = []
+        both = (sg == 'OK' and sh == 'OK')
+        # 只配了一个平台的项目（例如鲸采只发 GitHub）没有另一边可比，不算不一致。
+        one_side = sg in ('SKIP', 'NOTOKEN') or sh in ('SKIP', 'NOTOKEN')
+        if both:
+            for n in sorted(set(ag) | set(ah)):
+                g, h = ag.get(n), ah.get(n)
+                if g is None:
+                    bad.append('GitHub 有 %s，GitCode 没有' % n)
+                elif h is None:
+                    bad.append('GitCode 有 %s，GitHub 没有' % n)
+                elif g != h:
+                    bad.append('%s 大小不同（GitCode %s / GitHub %s）' % (n, g, h))
+        elif not one_side:
+            bad.append('有一边没核对成功（GitCode=%s GitHub=%s），未做逐项比对' % (sg, sh))
+        sumf = os.environ.get('GITHUB_STEP_SUMMARY')
+        if sumf:
+            with io.open(sumf, 'a', encoding='utf-8') as f:
+                f.write('\n## 两平台一致性核对 %s %s\n\n' % (name, tag))
+                if not bad and both:
+                    f.write('一致：GitCode 与 GitHub 附件名、大小逐项相同（%d 个）。\n' % len(ag))
+                elif not bad:
+                    f.write('单平台发布（GitCode=%s / GitHub=%s），无需双平台核对。\n' % (sg, sh))
+                else:
+                    f.write('**【不一致，需要处理】**\n\n')
+                    for x in bad:
+                        f.write('- %s\n' % x)
+                    f.write('\nGitCode 删附件没有可靠接口，只能去网页删；GitHub 可用 --allow-replace 覆盖。\n')
+        if bad:
+            log('!! 两平台不一致: %s' % '；'.join(bad))
+        elif both:
+            log('两平台一致（%d 个附件）' % len(ag))
+        else:
+            log('单平台发布，已跳过双平台核对')
+    except Exception as e:
+        log('平台核对自身出错，已跳过（不影响发版）: %s' % e)
+
+
 def read_version(root, src):
     """从 "文件名:常量名" 取版本号。取不到就报错 —— 宁可不发版，也不发一个版本号不明的包。"""
     fname, const = src.split(':', 1)
@@ -388,6 +450,8 @@ def main():
                 log('升级源已回写并提交到 %s（此刻起线上才提示升级）' % branch)
             else:
                 log('升级源没有变化，跳过提交')
+    if not a.skip_publish and tag:
+        verify_platforms(pub, tag, name)
     log('=== 完成: %s %s ===' % (name, tag))
 
 
