@@ -24,6 +24,11 @@ on:
         required: false
         type: boolean
         default: false
+      build_only:
+        description: 只构建、不上传（第一次接入时用它验证能跑通）
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -56,4 +61,5 @@ jobs:
         run: |
           $extra = @()
           if ("${{ inputs.allow_replace }}" -eq "true") { $extra += "--allow-replace" }
+          if ("${{ inputs.build_only }}" -eq "true") { $extra += "--skip-publish" }
           python .release/release_run.py --notes "${{ inputs.notes }}" @extra

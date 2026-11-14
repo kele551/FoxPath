@@ -238,7 +238,7 @@ def read_version(root, src):
     """从 "文件名:常量名" 取版本号。取不到就报错 —— 宁可不发版，也不发一个版本号不明的包。"""
     fname, const = src.split(':', 1)
     p = os.path.join(root, fname)
-    if not os.isfile(p):
+    if not os.path.isfile(p):
         raise SystemExit('version_source 指向的文件不存在: %s' % p)
     txt = io.open(p, encoding='utf-8', errors='replace').read()
     m = re.search(r'^%s\s*=\s*[\'"]([^\'"]+)[\'"]' % re.escape(const), txt, re.M)
@@ -283,6 +283,13 @@ def main():
             raise SystemExit('构建产物不存在: %s' % p)
         log('产物: %-32s %12d B' % (f, os.path.getsize(p)))
 
+    # 项目自带的发版闸门（版本一致 / 署名 / 仓库地址等）。
+    # 这些规则是项目专属知识，所以脚本放在项目仓库里，执行器只负责调用：
+    # 任一条非 0 就是"产物不合格"，不上传 —— 不合格的包不该发出去。
+    for cmd in (cfg.get('preflight') or []):
+        run(cmd, root)
+        log('闸门通过: %s' % cmd)
+
     sign = cfg.get('sign') or {}
     if sign.get('enabled'):
         key = os.environ.get(sign.get('key_env', 'RELEASE_SIGN_KEY'), '')
@@ -318,6 +325,18 @@ def main():
         with io.open(os.path.join(root, ck['file']), 'w', encoding='utf-8', newline='\n') as f:
             f.write('\n'.join(lines) + '\n')
         log('已写 %s（%d 行）' % (ck['file'], len(lines)))
+
+    # 把本次构建的指纹写进 job summary —— 本机写 version.json 时要的正是这两个值。
+    # 签名留本机做（version.json 不到 1 KB，直接 push 即可），所以这里只负责把数字交出去。
+    sumf = os.environ.get('GITHUB_STEP_SUMMARY')
+    if sumf:
+        with io.open(sumf, 'a', encoding='utf-8') as f:
+            f.write('\n## %s %s 构建指纹\n\n```\n' % (name, tag or '(仅构建)'))
+            for rel in files:
+                p = os.path.join(root, rel)
+                if os.path.isfile(p):
+                    f.write('%s  %s  %d bytes\n' % (sha256(p), rel, os.path.getsize(p)))
+            f.write('```\n\n本机写 version.json 时用上面的 sha256 / size，签名后直接 push。\n')
 
     upload = [os.path.join(root, f) for f in files]
     for f in (cfg.get('publish', {}).get('extra') or []):
