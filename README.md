@@ -362,3 +362,9 @@ MIT
 ---
 
 <p align="center"><sub>© 2026 海风（kele551） · MIT License · <a href="https://gitcode.com/kele551/FoxPath">GitCode 主仓库</a> · <a href="https://github.com/kele551/FoxPath">GitHub 镜像</a></sub></p>
+
+## 检索关键词 / Search keywords
+
+**中文**：GitHub 加速、GitHub 打不开、GitHub 加载慢、连接超时、DNS 解析异常、本地分流、PAC、hosts、hosts 文件、端口转发、网络工具、便携版、免安装、Windows 软件
+
+**English**: github acceleration, github accelerator, github not loading, github slow, dns, hosts file, pac file, proxy, network tool, portable app, no install, windows tool
