@@ -78,11 +78,10 @@ def main():
     ver = m.group(1)
     out = {'version': ver, 'notes': a.notes,
            'exe': {'sha256': sha256(a.exe),
-                   'url': 'https://gitcode.com/kele551/FoxPath/releases/download/v%s/FoxPath.exe' % ver,
+                   'url': 'https://github.com/kele551/FoxPath/releases/download/v%s/FoxPath.exe' % ver,
                    'size': os.path.getsize(a.exe)}}
-    # 2026-10-17: 主下载源切到 GitCode（国内、快、下载数可统计）；Gitee / GitHub 作回退镜像。
+    # 2026-11-25 红线第 36 条：只发 GitHub。GitCode（=AtomGit）纯被动镜像，不挂附件、不作下载源。
     out['exe']['mirrors'] = list(a.mirror) if a.mirror else [
-        'https://gitcode.com/kele551/FoxPath/releases/download/v%s/FoxPath.exe' % ver,
         'https://github.com/kele551/FoxPath/releases/download/v%s/FoxPath.exe' % ver,
     ]
     # ① 先写 version.json（签名对象是这份文件的**原始字节**，所以必须先落盘、再签名）

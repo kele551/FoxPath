@@ -3,7 +3,7 @@
 > 这里的每一行都是**能独立做完、且有明确验收**的事。规则很简单：
 > **一次一件事 → 先看「涉及文件」→ 做完贴出「验收命令」的输出 → 把状态改成 `done`**。
 > 大改动先开 Issue 说方案；验收命令必须**真的跑过**。
-> 关联的 issue 写在下表 `issue` 列（**GitCode / GitHub 两侧同步维护；AtomGit 只镜像代码，不收 issue**）（带 `good first issue` 标签的适合第一次上手）。
+> 关联的 issue 写在下表 `issue` 列（**issue 只在 GitHub 跟踪；GitCode/AtomGit 纯 Pull 镜像，不收 issue**）（带 `good first issue` 标签的适合第一次上手）。
 
 | id | 任务 | 难度 | 涉及文件 | 验收（跑什么） | issue | 状态 |
 |---|---|---|---|---|---|---|
@@ -15,7 +15,7 @@
 | F-06 | `docs/CODE_OF_CONDUCT.md` 是六份治理文档里唯一英文且无中文抬头/署名的 | ★ | `docs/CODE_OF_CONDUCT.md` | 首行有「狐径 FoxPath —— 作者：海风（kele551） · 仓库链接」，与其余五份同构（正文保留 Contributor Covenant 原文） | #7 | done |
 | F-07 | 演示页与演示视频文件名停在 v1.0.7（当前 v1.1.1），页面未注明录制版本 | ★ | `docs/demo/index.html` | 页面上注明「录制于 v1.0.7」，不让人误以为等于当前版本 | #8 | done |
 | F-08 | 候选 IP 池里没有 GitHub **上传**用的两个域（`uploads.github.com` / `objects.githubusercontent.com`），发版传附件时只能直连撞运气 | ★★ | `github_direct.py`（池常量）、`tests/` | 两个 host 都在池常量里；新增一条确定性测试（桩掉网络，不靠真连）断言它们在池内；`python -m py_compile github_direct.py` 与 `python tests\test_ip_sources.py` 全绿 | 无 | done（2026-11-13 复核：`uploads.github.com` 在 `PROXY_HOSTS`，`objects.githubusercontent.com` 本来就在 `PROXY_HOSTS_RAW`；`tests\test_ip_sources.py` 跑「全部通过」） |
-| F-09 | 源码里还留两处老仓库字样的注释/面板标签（`github_direct.py` 约 2713、2782 行），且 `meta.json` 的回落地址里没有 GitCode | ★ | `github_direct.py` | 按 `tools/preflight_release.py` ⑦ 的判据全仓 0 命中；`meta.json` 回落顺序与 `version.json` 升级源口径一致（GitCode 主、GitHub 兜）；`python tools/preflight_release.py` 全绿 | 无 | done（2026-11-13：⑦ 两项 PASS；`meta.json` 回落已是 `api.github.com/meta` → GitCode → GitHub raw；威胁模型注释改成 GitCode/GitHub；自检 29 项全绿） |
+| F-09 | 源码里还留两处老仓库字样的注释/面板标签（`github_direct.py` 约 2713、2782 行），且 `meta.json` 的回落地址里没有 GitCode | ★ | `github_direct.py` | 按 `tools/preflight_release.py` ⑦ 的判据全仓 0 命中；`meta.json` 回落顺序与 `version.json` 升级源口径一致；`python tools/preflight_release.py` 全绿 | 无 | done（2026-11-13 ⑦ 两项 PASS；**现行口径 2026-11-25 起只 GitHub**，回落已是 `api.github.com/meta` → GitHub raw；自检全绿） |
 
 > ⚠ 本机两个 Python 环境都**没装 pytest**，`pytest tests -q` 会直接报 "No module named pytest"。
 > 这批测试文件都能单独跑（`if __name__ == '__main__'`），用 `python tests\<文件名>.py` 即可，退出码 0 = 全过。

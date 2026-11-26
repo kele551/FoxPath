@@ -2,7 +2,7 @@
   "name": "狐径",
   "runs_on": "windows-latest",
   "branch": "main",
-  "python": "3.13",
+  "python": "3.15.2",
   "deps": [
     "\"pyinstaller==6.22.3\""
   ],
@@ -27,10 +27,6 @@
   },
   "publish": {
     "github": {
-      "owner": "kele551",
-      "repo": "FoxPath"
-    },
-    "gitcode": {
       "owner": "kele551",
       "repo": "FoxPath"
     },

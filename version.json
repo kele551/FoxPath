@@ -1,13 +1,12 @@
 {
-  "version": "1.2.5",
+  "version": "1.2.6",
   "notes": "",
   "exe": {
-    "sha256": "03399051364D6F97556D07E4F733CECCD889FA6B308B18847DA0EB9BA5B6AE4C",
-    "url": "https://gitcode.com/kele551/FoxPath/releases/download/v1.2.5/FoxPath.exe",
-    "size": 9058976,
+    "sha256": "28D520A1A2DF746ADB482B5D73BA2102A758B41F52E7A8A93D6EEADA672E70A2",
+    "url": "https://github.com/kele551/FoxPath/releases/download/v1.2.6/FoxPath.exe",
+    "size": 10407801,
     "mirrors": [
-      "https://gitcode.com/kele551/FoxPath/releases/download/v1.2.5/FoxPath.exe",
-      "https://github.com/kele551/FoxPath/releases/download/v1.2.5/FoxPath.exe"
+      "https://github.com/kele551/FoxPath/releases/download/v1.2.6/FoxPath.exe"
     ]
   }
 }

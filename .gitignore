@@ -48,7 +48,5 @@ secrets/
 *.pem
 *.key
 
-# 本机私有：发布令牌与发布脚本的本机配置（绝不入库）
-.gitee_token
-.gitcode_token
+# 本机私有：发布脚本的本机配置（绝不入库）
 tools/publish.local.json

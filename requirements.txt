@@ -10,11 +10,11 @@
 #   pyinstaller   —— 打包用（build_exe.py 调 `python -m PyInstaller`）
 #
 # 发布流水线 tools/publish.py **不需要装任何 Python 包**：2026-10-26 起改成纯标准库
-# （GitCode 走 urllib，GitHub 调本机登录态的 gh.exe）。以前这里写着要装 requests，
+# （GitHub 走 urllib API 或本机登录态的 gh.exe）。以前这里写着要装 requests，
 # 是假的 —— 那个库在本机根本没装过，publish.py 却因为 import 它而在发版当天现挂。
 #
 # 用法：
 #   pip install pyinstaller                   # 只打包
 #   pip install -r requirements.txt           # 同上（就这一条）
 
-pyinstaller>=6.0        # 打包（build_exe.py）
+pyinstaller==6.22.3        # 打包（build_exe.py）

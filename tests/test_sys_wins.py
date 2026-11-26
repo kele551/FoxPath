@@ -15,7 +15,8 @@ REPO = os.path.dirname(HERE)
 SRC = os.path.join(REPO, "github_direct.py")
 
 WANT_FUNCS = {"_sys_wins", "_cap_of", "_cap_fresh", "_wins_by_evidence", "_cap_verdict"}
-WANT_CONSTS = {"_SYS_CAP", "_POOL_CAP", "_SYS_CAP_TTL", "_SYS_WIN_RATIO", "_SYS_MIN_KBPS"}
+WANT_CONSTS = {"_SYS_CAP", "_POOL_CAP", "_SYS_CAP_TTL", "_SYS_WIN_RATIO",
+               "_SYS_MIN_KBPS", "_SYS_SWAP_MIN_KBPS"}
 
 FAILS = []
 
@@ -53,10 +54,11 @@ def main():
     ns = load_fragment()
     sys_wins, cap_verdict = ns["_sys_wins"], ns["_cap_verdict"]
     H = "github.com"
-    FAST, MID, SLOW = 400, 100, 20
-    min_k, ratio = ns["_SYS_MIN_KBPS"], ns["_SYS_WIN_RATIO"]
-    print("阈值: 直连门槛 %d KB/s、要快过 %s 倍才算赢、证据 %d 秒内新鲜\n"
-          % (min_k, ratio, ns["_SYS_CAP_TTL"]))
+    FAST, MID, SLOW, SLOWER = 400, 100, 20, 10
+    ratio = ns["_SYS_WIN_RATIO"]
+    swap_min = ns["_SYS_SWAP_MIN_KBPS"]
+    print("阈值: 换边下限 %d KB/s、要快过 %s 倍才算赢、证据 %d 秒内新鲜\n"
+          % (swap_min, ratio, ns["_SYS_CAP_TTL"]))
 
     def run(s, p, name, want):
         ns["_SYS_CAP"].clear()
@@ -88,8 +90,8 @@ def main():
         "刚好压线（直连 = 池子×%s）→ 切直连" % ratio, True)
     run(ev("2.2.2.2", MID), ev("1.1.1.1", edge + 1),
         "差一点点没到余量 → 不切（防来回横跳）", False)
-    run(ev("2.2.2.2", SLOW), ev("1.1.1.1", 1),
-        "直连自己不到门槛（<%d KB/s）→ 不切" % min_k, False)
+    run(ev("2.2.2.2", SLOWER), ev("1.1.1.1", 1),
+        "直连自己不到换边下限（<%d KB/s）→ 不切" % swap_min, False)
 
     print("")
     # ── 日志口径：比不出来就不能说"选 X"（判据吃的就是日志印的那两份，不再回表查）──

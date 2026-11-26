@@ -17,10 +17,10 @@
   1) uploads.github.com 进了 PROXY_HOSTS，因此自动进 PAC 与面板"接管域名"计数
   2) api.github.com / gist.github.com 仍然**不在**清单里（候选池全是 web 段，拿它连 api 是错的）
   3) uploads.github.com 归 github.com 那一池（is_github_host 认、is_raw_host 不认）
-  4) 官方 IP 表的源顺序 = 官方 → GitCode → GitHub raw；且清单里不许出现已停更的老仓库地址
-  5) api.github.com 挂 → 从 GitCode 取到地址，_META_SOURCE 记成 GitCode
-  6) GitCode 返回 200 但解析不出地址 → 继续往下一个源（审查 M-2 那条判据不许退回去）
-  7) 三个源全挂 → 退回内置表，且不许谎报"已同步官方 IP 表"
+  4) 官方 IP 表的源顺序 = api.github.com/meta → GitHub raw；清单里不许出现已停更的老仓库地址
+  5) api.github.com 挂 → 从 GitHub raw 取到地址，_META_SOURCE 记成 GitHub
+  6) GitHub raw 返回 200 但解析不出地址 → 继续往下一个源（审查 M-2 那条判据不许退回去）
+  7) 两个源全挂 → 退回内置表，且不许谎报"已同步官方 IP 表"
 
 用法：
     python tests\\test_ip_sources.py
@@ -122,7 +122,6 @@ def load(routes, meta_source=None):
 
 
 API_META = 'https://api.github.com/meta'
-GITCODE = 'https://gitcode.com/api/v5/repos/kele551/FoxPath/raw/meta.json?ref=main'
 GH_RAW = 'https://raw.githubusercontent.com/kele551/FoxPath/main/meta.json'
 
 GOOD = json.dumps({'ips': ['203.0.113.10'], 'web': ['198.51.100.0/24'], 'web6': ['2001:db8::1'],
@@ -143,7 +142,7 @@ def source_urls():
 
 
 def main():
-    ns = load({API_META: GOOD, GITCODE: GOOD, GH_RAW: GOOD})
+    ns = load({API_META: GOOD, GH_RAW: GOOD})
 
     # 1) uploads.github.com 进清单，并且一路传到 PAC
     check('PROXY_HOSTS 里有 uploads.github.com',
@@ -165,29 +164,29 @@ def main():
 
     # 4) 官方 IP 表的源顺序与地址卫生（按 ast 取 urls 元组，注释怎么改都不影响判据）
     urls = source_urls()
-    check('fetch_official_ips 的源顺序', urls, [API_META, GITCODE, GH_RAW])
+    check('fetch_official_ips 的源顺序', urls, [API_META, GH_RAW])
     # 关键字拆开拼：不然"禁止清单"自己会被扫成命中
     dead = 'gitee' + '.com/kele551'
-    check('三个源里没有已停更的老仓库地址', any(dead in u for u in urls), False)
+    check('两个源里没有已停更的老仓库地址', any(dead in u for u in urls), False)
 
-    # 5) api.github.com 挂掉 → GitCode 顶上，记账口径跟着换
-    ns = load({API_META: OSError(10060, 'timed out'), GITCODE: GOOD, GH_RAW: GOOD})
+    # 5) api.github.com 挂掉 → GitHub raw 顶上，记账口径跟着换
+    ns = load({API_META: OSError(10060, 'timed out'), GH_RAW: GOOD})
     out = ns['fetch_official_ips']()
-    check('GitCode 的 ips 进了候选', '203.0.113.10' in out, True)
-    check('GitCode 的 web 段也展开进了候选', '198.51.100.1' in out, True)
-    check('同步源记成 GitCode', ns['_META_SOURCE'][0], 'GitCode')
-    check('日志里说的就是 GitCode',
-          any('已同步官方 IP 表(GitCode)' in l for l in ns['logs']), True)
+    check('GitHub raw 的 ips 进了候选', '203.0.113.10' in out, True)
+    check('GitHub raw 的 web 段也展开进了候选', '198.51.100.1' in out, True)
+    check('同步源记成 GitHub', ns['_META_SOURCE'][0], 'GitHub')
+    check('日志里说的就是 GitHub',
+          any('已同步官方 IP 表(GitHub)' in l for l in ns['logs']), True)
 
-    # 6) GitCode 返回 200 但解析不出地址 → 继续下一个源（不许就此宣布成功）
-    ns = load({API_META: OSError(10060, 'timed out'), GITCODE: EMPTY, GH_RAW: GOOD})
+    # 6) GitHub raw 返回 200 但解析不出地址 → 不许就此宣布成功
+    ns = load({API_META: OSError(10060, 'timed out'), GH_RAW: EMPTY})
     out = ns['fetch_official_ips']()
-    check('空表会换下一个源', ns['_META_SOURCE'][0], 'GitHub')
+    check('空表会回退内置表', ns['_META_SOURCE'][0], '')
     check('空表当场要说清', any('返回成功但没有 IP' in l for l in ns['logs']), True)
 
-    # 7) 三个源全挂 → 内置表，且不许谎报
+    # 7) 两个源全挂 → 内置表，且不许谎报
     ns = load({API_META: OSError(10060, 'timed out'),
-               GITCODE: ConnectionError('断了'), GH_RAW: OSError(10060, 'timed out')})
+               GH_RAW: OSError(10060, 'timed out')})
     out = ns['fetch_official_ips']()
     check('全挂时仍有内置候选', out[:2], ['140.82.112.3', '20.205.243.166'])
     check('全挂时不写"已同步"', ns['_META_SOURCE'][0], '')

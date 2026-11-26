@@ -20,7 +20,7 @@
   6. 收尾：注册表/升级源/缓存全部还原，不留垃圾
   7. 一致性警告（WARN，不阻断发布）：
      ① 工作区副本与仓库副本的 sha256 是否一致（M-10，两份漂移了就等于"仓库里写的检查项没跑"）
-     ② 两平台已发布的发行版附件 sha256 是否一致、是否等于本地候选（M-11，限速：GitCode 间隔 ≥3 秒）
+     ② GitHub 主源已发布的发行版附件 sha256 是否等于本地候选（M-11）
 
 用法：python tools/preflight_release.py [候选exe路径] [--dry-run] [--skip-remote] [--help]
 """
@@ -61,18 +61,11 @@ REG = r'Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 HID = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden']
 
 # ── 远端附件比对（M-11）用到的常量 ─────────────────────────────────────
-# 2026-10-26：主源从 gitee 迁到 gitcode（gitee 那边账号还在但仓库已停更，再拿它当
-# 校验对象只会得到一个"永远红"的假警报）。口径与 tools/publish.py 保持一致：
-# GitCode = 主源，GitHub = 镜像，两个都要能读到发行版附件。
+# 2026-11-25 红线第 36 条：只发 GitHub，GitCode（=AtomGit）纯被动镜像、不挂附件。
+# 口径与 tools/publish.py 保持一致：GitHub = 主源，只验 GitHub 发行版附件。
 OWNER, PROJ = 'kele551', 'FoxPath'
 GH_API = 'https://api.github.com'
-GC_API = 'https://gitcode.com/api/v5'
-GC_MIN_GAP = 3.0               # GitCode 请求间隔 ≥3 秒（别把平台抓急，那是会自找 451 的）
 CORE_ASSETS = ('FoxPath.exe', 'version.json')
-# 令牌：优先环境变量 GITCODE_TOKEN（直接是令牌）；再 GITCODE_TOKEN_FILE / 本机配置 /
-# 仓库内 .gitcode_token（已 gitignore）。不给也能跑：匿名读发行版就够，只是更容易被限速
-# （脚本会如实报告，不静默放过）。
-GC_TOKEN_FILE = os.environ.get('GITCODE_TOKEN_FILE') or os.path.join(REPO, '.gitcode_token')
 
 USAGE = """狐径发版前自检 —— 用法
 
@@ -84,7 +77,7 @@ USAGE = """狐径发版前自检 —— 用法
   -h, --help         只打印这段说明就退出（不写注册表、不结束/启动任何进程）
       --dry-run      只跑静态检查：版本一致性 + 文档版本一致性 + 两份脚本是否漂移 +（可选）远端附件比对。
                      不写注册表、不结束/启动任何进程、不动系统代理 —— 只想确认脚本没坏时用这个
-      --skip-remote  跳过"两平台远端附件比对"（离线、或平台抽风时用）
+      --skip-remote  跳过"GitHub 远端附件比对"（离线、或平台抽风时用）
 
 会动到系统的地方（--dry-run 一律跳过）:
   · 冷启动演练与升级演练会启动/结束 FoxPath.exe；
@@ -360,45 +353,6 @@ def check_script_sync():
 
 
 # ── 网络小工具 + ①-c 远端附件比对（M-11）──────────────────────────────
-_GC_LAST = [0.0]
-
-
-def _gc_wait():
-    """GitCode 限速：**任何**一次 gitcode 请求之间至少隔 3 秒（API 与附件下载都算）。
-
-    2026-10-08 的教训（当时是 gitee）：密集抓平台接口会自己把平台抓出 451，然后把假象当事实。
-    """
-    wait = GC_MIN_GAP - (time.time() - _GC_LAST[0])
-    if wait > 0:
-        time.sleep(wait)
-
-
-def _gc_done():
-    _GC_LAST[0] = time.time()
-
-
-def _gc_json(path, timeout=30):
-    """GitCode v5 接口统一入口（走 _gc_wait 限速）。
-
-    令牌只从本机读、只放进查询参数，**任何情况下都不打印明文**（出错只报异常类型）。
-    """
-    _gc_wait()
-    tok = os.environ.get('GITCODE_TOKEN', '').strip()
-    if not tok:
-        try:
-            if os.path.exists(GC_TOKEN_FILE):
-                tok = io.open(GC_TOKEN_FILE, encoding='utf-8').read().strip()
-        except OSError:
-            tok = ''
-    url = GC_API + path + (('?' + urllib.parse.urlencode({'access_token': tok})) if tok else '')
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'FoxPath-preflight'})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode('utf-8', 'replace')), None
-    except Exception as e:
-        return None, type(e).__name__
-    finally:
-        _gc_done()
 
 
 def _get_bytes(url, headers=None, timeout=60, tries=2, deadline=900, expect=0, label=''):
@@ -452,30 +406,10 @@ def _asset_sha(data):
 
 
 def _remote_assets(tag):
-    """取两个平台该 tag 的附件：{平台: {附件名: (sha256, 字节数)}}、{平台: [附件名]}、{平台: 错误}。"""
+    """取 GitHub 主源该 tag 的附件：{平台: {附件名: (sha256, 字节数)}}、{平台: [附件名]}、{平台: 错误}。"""
     got, names, errs = {}, {}, {}
     # 平台自动生成的源码包（v1.0.6.zip / .tar.gz / .tar.bz2 / .tar）不算"我们上传的附件"，比清单时忽略掉
     auto = {tag + '.zip', tag + '.tar.gz', tag + '.tar.bz2', tag + '.tar'}
-    # GitCode（主源）：匿名 GET /releases/tags/<tag> 就能读，附件的 browser_download_url
-    # 是 releases/download 直链（2026-10-26 实测）。这里**下载回来自己算 sha256**，
-    # 不采信平台给的 digest 字段——M-11 要防的就是"线上那份字节不对"。
-    rel, err = _gc_json('/repos/%s/%s/releases/tags/%s' % (OWNER, PROJ, urllib.parse.quote(tag)))
-    if err or not rel:
-        errs['GitCode'] = err or '发行版不存在'
-    else:
-        assets = rel.get('assets') or []
-        names['GitCode'] = [a.get('name') for a in assets if a.get('name') not in auto]
-        got['GitCode'] = {}
-        for a in assets:
-            if a.get('name') in CORE_ASSETS:
-                _gc_wait()          # 附件下载同样限速 ≥3 秒
-                try:
-                    got['GitCode'][a['name']] = _asset_sha(
-                        _get_bytes(a.get('browser_download_url') or '',
-                                   expect=a.get('size') or 0,
-                                   label='GitCode %s' % a.get('name')))
-                finally:
-                    _gc_done()
     # GitHub 侧走 api.github.com（一直通）+ 附件 assets API（会跳到 objects.githubusercontent.com），
     # 不依赖时通时断的 github.com 下载页。
     try:
@@ -506,10 +440,10 @@ def _names(lst):
 
 
 def check_remote_assets(ver, cand_sha, vj_sha):
-    """M-11：拉两平台发行版附件比对 SHA256。
+    """M-11：拉 GitHub 主源发行版附件比对 SHA256。
 
     以前的自检只比"本地 version.json ↔ 本地 exe"，管不住"本地改了、附件忘了重传"。
-    这里把两个平台**已发布**的附件下载回来对指纹。远端拿不到（新版本还没发、平台抽风、
+    这里把 GitHub **已发布**的附件下载回来对指纹。远端拿不到（新版本还没发、平台抽风、
     网络不通）一律只算警告 —— 发版闸门不该被网络问题卡死。
 
     version.json 是文本，多算一个"CRLF→LF 归一化"的口径：本仓库 core.autocrlf=true，
@@ -517,18 +451,18 @@ def check_remote_assets(ver, cand_sha, vj_sha):
     """
     tag = 'v%s' % ver
     print()
-    print('①-c 远端附件比对（M-11：%s，限速 GitCode ≥3 秒/次，失败只警告）' % tag)
+    print('①-c 远端附件比对（M-11：%s，GitHub 主源，失败只警告）' % tag)
     vjp = os.path.join(REPO, 'version.json')
     alt = {'version.json': hashlib.sha256(
         open(vjp, 'rb').read().replace(b'\r\n', b'\n')).hexdigest().upper()}
     got, names, errs = _remote_assets(tag)
-    for plat in ('GitCode', 'GitHub'):
+    for plat in ('GitHub',):
         if plat in errs:
             check_warn('%s 能读到 %s 的发行版' % (plat, tag), False,
                        '%s（本次若为新版本、还没发布，属正常）' % errs[plat])
     for name, want, label in (('FoxPath.exe', cand_sha, '本地候选 exe'),
                               ('version.json', vj_sha, '本地 version.json')):
-        for plat in ('GitCode', 'GitHub'):
+        for plat in ('GitHub',):
             if name not in (got.get(plat) or {}):
                 continue
             r = got[plat][name]
@@ -541,19 +475,10 @@ def check_remote_assets(ver, cand_sha, vj_sha):
                 same, note = True, '（仅换行符 CRLF/LF 不同）'
             check_warn('%s / %s 指纹 == %s' % (plat, name, label), same,
                        '%s vs %s  %d B%s' % (r[0][:12], want[:12], r[1], note))
-    for name in CORE_ASSETS:
-        a = (got.get('GitCode') or {}).get(name)
-        b = (got.get('GitHub') or {}).get(name)
-        if a and b:
-            check_warn('%s 两平台指纹一致' % name, a[0] == b[0],
-                       '%s vs %s' % (a[0][:12], b[0][:12]))
-    ng = [n for n in (names.get('GitCode') or []) if n]
     nh = [n for n in (names.get('GitHub') or []) if n]
-    if ng and nh and set(ng) != set(nh):
-        print('     · 两平台附件清单不同：仅 GitCode 有 [%s]；仅 GitHub 有 [%s]'
-              % (_names([n for n in ng if n not in nh]), _names([n for n in nh if n not in ng])))
-        print('       （GitHub 侧的 exe 必须是 ASCII 名 FoxPath.exe，中文名会被平台破坏；'
-              '平台自动生成的源码包不计入比较；核心附件两平台一致才算过）')
+    if nh:
+        print('     · GitHub 附件清单: [%s]（GitHub 侧的 exe 必须是 ASCII 名 FoxPath.exe，'
+              '平台自动生成的源码包不计入比较）' % _names(nh))
 
 
 # ── ①-e 升级源的 Ed25519 验签（2026-10-16 升级通道加固）────────────────

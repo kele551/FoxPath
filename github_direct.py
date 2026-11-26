@@ -2,7 +2,7 @@
 """
 GitHub 直连助手 —— 绿色单文件版
 
-作者:  海风（kele551）    https://gitcode.com/kele551/FoxPath
+作者:  海风（kele551）    https://github.com/kele551/FoxPath
 协作:  小腾（只在源码里留档，不出现在界面上）
 
 干什么
@@ -69,7 +69,7 @@ except Exception:
     UPDATE_SIG_AVAILABLE = False
 
 APP_NAME = '狐径'
-APP_VERSION = '1.2.5'
+APP_VERSION = '1.2.6'
 # 署名（一处定义，界面/日志/属性/README 都用它，避免各写各的）
 AUTHOR = '海风（kele551）'
 AUTHOR_ASCII = 'HaiFeng (kele551)'
@@ -3036,26 +3036,21 @@ _last_meta_ok = [0.0]      # 上次成功拉到官方 IP 表的时间
 
 
 def fetch_official_ips():
-    """同步官方 IP 表。**三个源依次试**：
+    """同步官方 IP 表。**两个源依次试**：
 
     1. api.github.com/meta —— 官方最准，但在联通/移动的部分线路上根本不通；
-    2. GitCode 上本项目仓库里的 meta.json —— 国内三网都能拉 GitCode，这是关键兜底
-       （2026-10-26 实测 HTTP 200、1326 B、ips=12 web=40，与仓库里那份同尺寸）；
-    3. GitHub raw 的同一份 meta.json。
+    2. GitHub raw 的本项目 meta.json。
 
     以前只有一个源（api.github.com），拉不到就只剩内置那十几个旧地址 ——
     这就是"某些运营商的用户用不了"的直接原因。
 
-    【2026-10-26 补上第 2 个源】注释里一直写着"三个源"，代码里其实只有两个，
-    而那两个（api.github.com 与 raw.githubusercontent.com）走的**是同一条国际链路**：
-    第 1 个断了，第 3 个多半也断 —— 等于国内线路的用户根本没有兜底。
-    GitCode 插在中间才是真兜底，所以它排在 GitHub raw 前面。
+    【2026-11-25 红线第 36 条】GitCode（=AtomGit）只是 Pull 被动镜像、不再同步，
+    曾插在中间当兜底的 GitCode meta.json 源整条移除；两个源都走 GitHub 链路，
+    全挂时回退内置候选表。
     """
     global CANDIDATES
     urls = (
         'https://api.github.com/meta',
-        # GitCode 没有裸 raw 直链，用它的 API raw 口（和升级源 version.json 同一个形状）
-        'https://gitcode.com/api/v5/repos/kele551/FoxPath/raw/meta.json?ref=main',
         'https://raw.githubusercontent.com/kele551/FoxPath/main/meta.json',
     )
     last_err = None
@@ -3116,8 +3111,7 @@ def fetch_official_ips():
             if ip not in CANDIDATES:
                 CANDIDATES.append(ip)
         _last_meta_ok[0] = time.time()
-        _META_SOURCE[0] = ('官方' if 'api.github.com' in url else
-                           'GitCode' if 'gitcode.com' in url else 'GitHub')
+        _META_SOURCE[0] = ('官方' if 'api.github.com' in url else 'GitHub')
         log('已同步官方 IP 表(%s): 候选 %d 个(含 IPv6 %d 个)'
             % (_META_SOURCE[0], len(CANDIDATES),
                len([x for x in CANDIDATES if ':' in x])))
@@ -5638,19 +5632,18 @@ def autostart_on():
 #       交给一个独立小助手 (先让旧程序自己退出并还原代理 -> 覆盖 -> 再启动新的)。
 #       验签不过、没有 .sig、sha256 不符 —— 一律拒绝并保留旧版本, 绝不"先替换再校验"。
 # 不需要管理员权限: 安装目录的 ACL 允许普通用户写(实测过)。
-# 升级源: 仓库里的 version.json, GitCode raw 优先、GitHub 兜底;
+# 升级源: 仓库里的 version.json, 只走 GitHub raw;
 #         测试时可在数据目录放一个 update_url.txt 指到本地文件。
 UPDATE_URLS = (
-    # 2026-10-23: 按用户要求去掉 Gitee 兜底（老仓库地址一律不出现）；只留 GitCode + GitHub。
-    # GitCode 没有 Gitee 那种 raw 直链，用它的 API raw：/raw/version.json?ref=main
-    'https://gitcode.com/api/v5/repos/kele551/FoxPath/raw/version.json?ref=main',
+    # 2026-11-25 红线第 36 条：只发 GitHub。GitCode（=AtomGit）只作 Pull 被动镜像，
+    # 不再作为升级通道；Gitee 老仓库早已停更，地址一律不出现。
     'https://raw.githubusercontent.com/kele551/FoxPath/main/version.json',
 )
 
 # 【2026-10-16 升级通道加固】内置的 Ed25519 **公钥**（离线生成，公开无妨、本来就要随程序分发）。
 # 升级源 version.json 必须带一份同目录的 `version.json.sig`（128 个十六进制字符 = 64 字节签名），
 # 用这把公钥验过才认；验不过 / 没签名 / 签名格式不对，一律**拒绝这条候选**（详见 _verify_update_sig）。
-# 没有私钥就签不出合法签名，所以即便 GitCode / GitHub 账号被盗、有人推了恶意 version.json + 恶意 exe，
+# 没有私钥就签不出合法签名，所以即便 GitHub 账号被盗、有人推了恶意 version.json + 恶意 exe，
 # 客户端也不会装。私钥只在维护者机器上、绝不入库（见 docs/SECURITY.md）。
 # 能力边界（别夸大）：这挡的是"升级源被篡改"；挡不住维护者机器上的私钥本身被偷，
 # 也不等于 Windows 代码签名证书。
@@ -7115,13 +7108,14 @@ PANEL_HTML = """<!doctype html>
 <html lang="zh-CN" data-theme="dark">
 <head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>狐径 FoxPath __VERSION__</title>
 <style>
 /* ══════════════════════════════════════════════════════════════════════════
    设计令牌 —— 与《UI 整改方案》同一套（石墨灰 + 狐径橙），只改变量、不写字面量
    ══════════════════════════════════════════════════════════════════════════ */
 :root{
-  --font:"Microsoft YaHei UI","Microsoft YaHei","PingFang SC","Segoe UI",system-ui,sans-serif;
+  --font:"Manrope","Geist","Microsoft YaHei UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif;
   --mono:"Cascadia Mono",Consolas,"Courier New",monospace;
   --bg:#171a20; --bg-1:#1c2027; --card:#20252d; --card-2:#262d37;
   --line:#303844; --line-2:#3e4856;
@@ -7147,9 +7141,7 @@ PANEL_HTML = """<!doctype html>
 
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--txt)}
-body{font:var(--fs-body)/1.55 var(--font);-webkit-font-smoothing:antialiased;
-  background-image:radial-gradient(120% 60% at 50% -10%,rgba(240,136,62,.07),transparent 60%)}
-[data-theme="light"] body{background-image:none}
+body{font:var(--fs-body)/1.55 var(--font);-webkit-font-smoothing:antialiased}
 button,input{font:inherit;color:inherit}
 button{cursor:pointer;background:none;border:0}
 h1,h2,h3,p{margin:0}
@@ -8419,7 +8411,11 @@ $('btnIpClear').onclick=function(){
   }).catch(function(){_say('ipMsg','面板没有响应',8000,true);});
 };
 $('ipInput').addEventListener('keydown',function(e){
-  if(e.key==='Enter'){$('btnIpSave').click();}
+  if(e.key==='Enter'){
+    if(e.isComposing || e.keyCode===229){ return; }
+    e.preventDefault();
+    $('btnIpSave').click();
+  }
 });
 $('btnDiagCopy').onclick=copyDiag;
 $('btnDiagRe').onclick=function(){loadDiag();refresh(true);};

@@ -7,6 +7,9 @@
 
 > 自 2026-10-17 起**主源改为 GitCode（=AtomGit）**，Gitee 停在最后一版 v1.2.1（不再更新）；
 > 从 v1.2.2 起发行版只发 **GitCode + GitHub** 两处。
+>
+> **现行口径（2026-11-25 起）**：发行版、附件、升级源一律**只发 GitHub**（github.com/kele551/FoxPath）；
+> GitCode（=AtomGit）降为纯 Pull 被动镜像，不建版、不传附件、不验真、不主动 push。下面各历史条目里的 GitCode 下载地址属当时事实，下载请以 GitHub Releases 为准。
 
 ## v1.2.4（2026-10-31）
 

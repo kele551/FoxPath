@@ -42,8 +42,7 @@ an individual is officially representing the community in public spaces.
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the project maintainer through the repository issue tracker
-(<https://gitcode.com/kele551/FoxPath/issues> or
-<https://github.com/kele551/FoxPath/issues>).
+(<https://github.com/kele551/FoxPath/issues>).
 All complaints will be reviewed and investigated promptly and fairly.
 
 ## Attribution

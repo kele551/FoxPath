@@ -49,7 +49,7 @@ WANT_CONSTS = {'WEB_OK', 'WEB_STALL', 'WEB_REFUSED', 'WEB_BADGW',
                '_CONNECT_RETRY_BACKOFF', '_DIRECT_PROBE_FRESH', '_DIRECT_OK',
                '_FAIL_CNT', '_FAIL_LOCK',
                '_KBPS_TTL', '_LOSS', '_KBPS', '_LOSS_LOCK', '_KBPS_LOCK',
-               'STALL_WATCHDOG'}
+               'STALL_WATCHDOG', 'FIRST_BYTE_WAIT', 'RELAY_IDLE_TIMEOUT'}
 
 FAILS = []
 
@@ -77,14 +77,19 @@ class FakeSelect(object):
     """select.select 按脚本站位：'up'/'conn' = 那边可读，'timeout' = 空转超时，
     'exc' = 异常集非空。pair 固定是 [conn, up]（与 _relay 里同一写法）。"""
 
-    def __init__(self, script=None):
+    def __init__(self, script=None, clock=None):
         self.script = list(script or [])
         self.calls = 0
+        self.clock = clock
 
     def select(self, rlist, _w, _x, _timeout):
         self.calls += 1
         item = self.script.pop(0) if self.script else 'timeout'
         if item == 'timeout':
+            # 空转超时：假时钟不会自己走，手动越过看门狗/首字节等待阈值，
+            # 让源码的沉默判死分支能走到（否则首字节阶段会一直 continue 死循环）。
+            if self.clock is not None:
+                self.clock.t += 20.0
             return [], [], []
         if item == 'exc':
             return [], [], list(rlist)
@@ -160,7 +165,7 @@ def new_ns():
     env = {
         'time': clock, 'log': lambda m: logs.append(m),
         'threading': threading,
-        'select': FakeSelect(),
+        'select': FakeSelect(clock=clock),
         'socket': types.SimpleNamespace(),
         'RELAY_IDLE_TIMEOUT': 600,
         'STALL_WATCHDOG': 15.0,
@@ -181,8 +186,8 @@ def relay_ns(script, up_chunks=(), conn_chunks=()):
     FakeSelect 一律回"空转超时"，也就是真实链路里那种"对端不再吐字节"。
     """
     ns = new_ns()
-    ns['select'] = FakeSelect(script)
     clock = ns['_CLOCK']
+    ns['select'] = FakeSelect(script, clock=clock)
     up = FakeEnd(up_chunks, name='up')
     conn = FakeEnd(conn_chunks, name='conn')
     for end in (up, conn):
@@ -402,7 +407,7 @@ def main():
     check('断流不再白记：0 字节这类"彻底搬不动"首次即踢，其余满阈值踢(都触发自愈)',
           "_hot_drop(_key, used)" in src
           and "_wd = bool(out.get('stalled_watchdog'))" in src
-          and "_drop = (_n >= _STALL_DROP_POOL) or _no_data" in src
+          and "_drop = (_n >= _STALL_DROP_POOL) or (_no_data and not _fb)" in src
           and "if _drop:" in src, True)
     # 【2026-10-30 实测决策·钉死】看门狗(stalled_watchdog)一旦也算进"首次即踢",
     # 本机这批官方 IP 全是限速货 —— 每踢一个触发一次立即全池重测, 回收数一路掉

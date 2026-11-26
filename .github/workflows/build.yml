@@ -34,7 +34,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           # 与本地打包环境一致：Python 3.13
-          python-version: '3.13'
+          python-version: '3.15.2'
 
       - name: 安装 PyInstaller
         # 说明（写成事实，别误会）：**只有打包这一步需要 pyinstaller**。

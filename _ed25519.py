@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# 作者: 海风（kele551）   https://gitcode.com/kele551/FoxPath
+# 作者: 海风（kele551）   https://github.com/kele551/FoxPath
 """Ed25519 纯 Python 实现（签名 + 验签），零第三方依赖。
 
 【这份实现的来历】与同作者项目「热点新闻 hotnews」的 `_ed25519.py` 是**同一份实现**
@@ -14,7 +14,7 @@
   · 发布端（tools/publish.py、make_version_json.py）：用私钥给 version.json 签名
   · 客户端（github_direct.py）：用内置公钥验签，**验不过就拒绝这条升级源**
 
-这样即便 GitCode / GitHub 账号被盗、有人推了恶意 version.json + 恶意 exe，
+这样即便 GitHub 账号被盗、有人推了恶意 version.json + 恶意 exe，
 没有私钥就签不出合法签名，客户端会直接拒绝。
 （能力边界：这挡的是"升级源被篡改"，**挡不住**维护者机器上的私钥本身被偷，
 也不等于 Windows 代码签名证书 —— 见 docs/SECURITY.md 与 docs/CODE_SIGNING_POLICY.md。）
