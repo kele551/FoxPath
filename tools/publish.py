@@ -517,9 +517,9 @@ def verify(ver, assets):
         size = os.path.getsize(p)
         want = hashlib.sha256(open(p, 'rb').read()).hexdigest()
         dl = DEADLINE_BIG if size > 2 * 1024 * 1024 else DEADLINE_SMALL
-        for label, url in (
+        for label, url in [
                 ('GitHub', 'https://github.com/%s/%s/releases/download/%s/%s'
-                 % (OWNER, REPO, tag, quote(name)))):
+                 % (OWNER, REPO, tag, quote(name)))]:
             # GitHub 那条浏览器下载口只试一次：它 302 到 objects CDN，这台机器上
             # 要么几秒回来、要么慢得没边，卡在那里重试没有意义。
             # 拿不到立刻换 api.github.com 的附件口 —— 拿的是同一个附件对象，字节一样才算数。
