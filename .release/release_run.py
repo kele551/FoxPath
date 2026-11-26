@@ -34,7 +34,6 @@ import urllib.error, urllib.parse, urllib.request
 
 GC_API = 'https://gitcode.com/api/v5'
 GH_API = 'https://api.github.com'
-GH_UPLOAD = 'https://uploads.github.com'
 BLOCK = 1 << 18
 UA = 'harness-release'
 
@@ -101,6 +100,28 @@ def gh_call(method, path, token, payload=None, timeout=120):
     if st >= 300:
         raise RuntimeError('GitHub %s %s -> %s %s' % (method, path, st, str(body)[:300]))
     return body
+
+
+def gh_cli(args, token, repo_slug=None, timeout=3600):
+    """调 runner 预装的 gh CLI 建 Release / 传附件 / 回读；token 经 GH_TOKEN 注入，命令行不留明文。
+
+    参照开源主流做法（runner 镜像自带 gh，覆盖建 Release、上传、覆盖、重试），
+    不再手写 uploads.github.com 的流式 HTTP 上传。
+    """
+    cmd = ['gh']
+    if repo_slug:
+        cmd += ['-R', repo_slug]
+    cmd += list(args)
+    env = {**os.environ, 'GH_TOKEN': token}
+    log('$ gh %s' % ' '.join(str(x) for x in cmd[1:]))
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                       errors='replace', env=env, timeout=timeout)
+    out = (r.stdout or '') + (r.stderr or '')
+    if out.strip():
+        print(out.rstrip()[-4000:], flush=True)
+    if r.returncode != 0:
+        raise RuntimeError('gh 命令失败（%d）: %s' % (r.returncode, ' '.join(str(x) for x in cmd[1:])))
+    return r.stdout or ''
 
 
 def put_stream(url, path, headers=None, method='PUT'):
@@ -185,21 +206,21 @@ def publish_gitcode(owner, repo, tag, files, token, notes, branch):
     log('GitCode 回读核对通过（%d 个附件）' % len(files))
 
 
-def publish_github(owner, repo, tag, files, token, notes, replace):
-    base = '/repos/%s/%s' % (owner, repo)
-    try:
-        rel = gh_call('GET', '%s/releases/tags/%s' % (base, urllib.parse.quote(tag)), token)
-    except RuntimeError:
-        rel = None
-    if rel and rel.get('tag_name') == tag:
+def publish_github(owner, repo, tag, files, token, notes, replace, branch):
+    slug = '%s/%s' % (owner, repo)
+    # 1. 判 Release 是否已存在（gh 退出码 0 = 存在）。
+    probe = subprocess.run(['gh', 'release', 'view', tag, '-R', slug],
+                           capture_output=True, text=True, encoding='utf-8', errors='replace',
+                           env={**os.environ, 'GH_TOKEN': token})
+    exists = probe.returncode == 0
+    assets = {}
+    if exists:
+        rel = json.loads(gh_cli(['release', 'view', tag, '--json', 'assets'], token, slug))
+        assets = {a['name']: a for a in rel.get('assets') or []}
         log('GitHub 发行版已存在: %s' % tag)
-    else:
-        rel = gh_call('POST', base + '/releases', token, payload={
-            'tag_name': tag, 'name': tag, 'body': notes or tag,
-            'target_commitish': 'main', 'prerelease': False})
-        log('GitHub 发行版已创建: %s' % tag)
-    rid = rel['id']
-    assets = {a['name']: a for a in (rel.get('assets') or [])}
+
+    # 2. 逐文件判定：同名同大小跳过；同名不同大小且未授权覆盖即报错；其余收集待传。
+    to_upload = []
     for path in files:
         name = os.path.basename(path)
         size = os.path.getsize(path)
@@ -207,25 +228,26 @@ def publish_github(owner, repo, tag, files, token, notes, replace):
         if old and old.get('size') == size:
             log('  已在（同名同大小，跳过）: %s' % name)
             continue
-        if old:
-            if not replace:
-                raise RuntimeError('GitHub 上同名附件字节不同（线上 %s / 本地 %d）: %s\n'
-                                   '确认覆盖请加 --allow-replace（重发同一版本时用）。'
-                                   % (old.get('size'), size, name))
-            gh_call('DELETE', '%s/releases/assets/%s' % (base, old['id']), token)
-            log('  已删除旧资产: %s' % name)
-        t0 = time.time()
-        st, body = put_stream('%s/repos/%s/%s/releases/%s/assets?name=%s'
-                              % (GH_UPLOAD, owner, repo, rid, urllib.parse.quote(name)),
-                              path, headers={'Authorization': 'token ' + token,
-                                             'Content-Type': 'application/octet-stream',
-                                             'Accept': 'application/vnd.github+json'}, method='POST')
-        if st not in (200, 201):
-            raise RuntimeError('GitHub 附件失败 %s -> %s %s' % (name, st, body))
-        log('  已上传: %s %d B（%.1f 秒）' % (name, size, time.time() - t0))
+        if old and not replace:
+            raise RuntimeError('GitHub 上同名附件字节不同（线上 %s / 本地 %d）: %s\n'
+                               '确认覆盖请加 --allow-replace（重发同一版本时用）。'
+                               % (old.get('size'), size, name))
+        to_upload.append(path)
 
-    chk = gh_call('GET', '%s/releases/tags/%s' % (base, urllib.parse.quote(tag)), token) or {}
-    names = {a['name']: a['size'] for a in (chk.get('assets') or [])}
+    # 3. 不存在：gh release create 一步建 Release 并挂附件；已存在：gh release upload 补传。
+    if not exists:
+        gh_cli(['release', 'create', tag, '--target', branch, '--title', tag,
+                '--notes', notes] + to_upload, token, slug)
+        log('GitHub 发行版已创建: %s' % tag)
+    elif to_upload:
+        args = ['release', 'upload', tag]
+        if replace:
+            args.append('--clobber')
+        gh_cli(args + to_upload, token, slug)
+
+    # 4. 回读线上附件名/大小逐项比对，不符即失败（fail-closed）。
+    chk = json.loads(gh_cli(['release', 'view', tag, '--json', 'assets'], token, slug))
+    names = {a['name']: a['size'] for a in chk.get('assets') or []}
     for path in files:
         n = os.path.basename(path)
         if names.get(n) != os.path.getsize(path):
@@ -474,7 +496,7 @@ def main():
         gh = pub.get('github')
         if gh and os.environ.get('GITHUB_TOKEN'):
             publish_github(gh['owner'], gh['repo'], tag, upload,
-                           os.environ['GITHUB_TOKEN'], notes, a.allow_replace)
+                           os.environ['GITHUB_TOKEN'], notes, a.allow_replace, branch)
         elif gh:
             log('GitHub 跳过（没有 GITHUB_TOKEN）')
 
