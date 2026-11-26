@@ -429,8 +429,9 @@ def main():
             f.write('\n'.join(lines) + '\n')
         log('已写 %s（%d 行）' % (ck['file'], len(lines)))
 
-    # 把本次构建的指纹写进 job summary —— 本机写 version.json 时要的正是这两个值。
-    # 签名留本机做（version.json 不到 1 KB，直接 push 即可），所以这里只负责把数字交出去。
+    # 把本次构建/签名产物的指纹写进 job summary，便于在 Actions 日志里核对版本与大小。
+    # 打包、签名、自验签都已在 runner 上完成（私钥经 RELEASE_SIGN_KEY secret 注入），
+    # 本机不再打包、签名或上传任何产物。
     sumf = os.environ.get('GITHUB_STEP_SUMMARY')
     if sumf:
         with io.open(sumf, 'a', encoding='utf-8') as f:
@@ -439,7 +440,7 @@ def main():
                 p = os.path.join(root, rel)
                 if os.path.isfile(p):
                     f.write('%s  %s  %d bytes\n' % (sha256(p), rel, os.path.getsize(p)))
-            f.write('```\n\n本机写 version.json 时用上面的 sha256 / size，签名后直接 push。\n')
+            f.write('```\n\n')
 
     upload = [os.path.join(root, f) for f in files]
     for f in (cfg.get('publish', {}).get('extra') or []):
