@@ -33,7 +33,7 @@ jobs:
       - name: 安装 Python
         uses: actions/setup-python@v5
         with:
-          # 与本地打包环境一致：Python 3.13
+          # 与本地打包环境一致：Python 3.15.2
           python-version: '3.15.2'
 
       - name: 安装 PyInstaller

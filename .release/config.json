@@ -13,17 +13,23 @@
     "FoxPath.exe"
   ],
   "version_source": "github_direct.py:APP_VERSION",
+  "preflight": [
+    "python tools/preflight_release.py --dry-run --skip-remote"
+  ],
   "sign": {
-    "enabled": false,
+    "enabled": true,
     "key_env": "RELEASE_SIGN_KEY",
-    "command": "",
-    "outputs": []
+    "command": "python make_version_json.py --sign-key {key}",
+    "outputs": [
+      "version.json",
+      "version.json.sig"
+    ],
+    "pubkey_source": "github_direct.py:UPDATE_PUBKEY",
+    "version_file": "version.json"
   },
   "checksums": {
-    "file": "SHA256SUMS.txt",
-    "files": [
-      "FoxPath.exe"
-    ]
+    "file": "",
+    "files": []
   },
   "publish": {
     "github": {
@@ -32,5 +38,8 @@
     },
     "extra": []
   },
-  "commit_back": []
+  "commit_back": [
+    "version.json",
+    "version.json.sig"
+  ]
 }

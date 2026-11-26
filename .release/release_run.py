@@ -296,6 +296,44 @@ def verify_platforms(pub, tag, name):
         log('平台核对自身出错，已跳过（不影响发版）: %s' % e)
 
 
+def verify_local_signature(cfg, root, ver):
+    """签名后用内置公钥本地自验 version.json/.sig；验不过即中止（fail-closed）。
+
+    通用兜底：只有 config.sign.pubkey_source 配了「文件名:常量名」才做；
+    验签库默认取仓库根的 _ed25519.py（纯 Python，零第三方依赖）。
+    """
+    sign = cfg.get('sign') or {}
+    src = sign.get('pubkey_source')
+    if not src:
+        return
+    vfile = sign.get('version_file') or 'version.json'
+    fname, const = src.split(':', 1)
+    p = os.path.join(root, fname)
+    if not os.path.isfile(p):
+        raise SystemExit('自验签：公钥来源文件不存在: %s' % p)
+    txt = io.open(p, encoding='utf-8', errors='replace').read()
+    m = re.search(r'^%s\s*=\s*[\'"]([^\'"]+)[\'"]' % re.escape(const), txt, re.M)
+    if not m:
+        raise SystemExit('自验签：在 %s 里找不到常量 %s' % (fname, const))
+    pub = bytes.fromhex(m.group(1).strip())
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        import _ed25519
+    except Exception as e:
+        raise SystemExit('自验签：加载 _ed25519.py 失败（%s）—— 拒绝发布。' % type(e).__name__)
+    vjp = os.path.join(root, vfile)
+    sigp = vjp + '.sig'
+    if not (os.path.isfile(vjp) and os.path.isfile(sigp)):
+        raise SystemExit('自验签：缺 %s 或 %s' % (vfile, vfile + '.sig'))
+    raw = open(vjp, 'rb').read()
+    sig_txt = io.open(sigp, encoding='utf-8').read().strip()
+    sig = bytes.fromhex(sig_txt)
+    if not _ed25519.checkvalid(sig, raw, pub):
+        raise SystemExit('自验签失败：内置公钥验不过 %s.sig —— 拒绝发布（私钥与公钥不配对，或字节被改）。' % vfile)
+    log('签名本地自验通过（公钥 %s…）' % m.group(1)[:16])
+
+
 def read_version(root, src):
     """从 "文件名:常量名" 取版本号。取不到就报错 —— 宁可不发版，也不发一个版本号不明的包。"""
     fname, const = src.split(':', 1)
@@ -348,13 +386,6 @@ def main():
             raise SystemExit('构建产物不存在: %s' % p)
         log('产物: %-32s %12d B' % (f, os.path.getsize(p)))
 
-    # 项目自带的发版闸门（版本一致 / 署名 / 仓库地址等）。
-    # 这些规则是项目专属知识，所以脚本放在项目仓库里，执行器只负责调用：
-    # 任一条非 0 就是"产物不合格"，不上传 —— 不合格的包不该发出去。
-    for cmd in (cfg.get('preflight') or []):
-        run(cmd, root)
-        log('闸门通过: %s' % cmd)
-
     sign = cfg.get('sign') or {}
     if sign.get('enabled'):
         key = os.environ.get(sign.get('key_env', 'RELEASE_SIGN_KEY'), '')
@@ -378,6 +409,13 @@ def main():
         for f in (sign.get('outputs') or []):
             if not os.path.isfile(os.path.join(root, f)):
                 raise SystemExit('签名产物不存在: %s' % f)
+        verify_local_signature(cfg, root, ver)
+
+    # 项目自带的发版闸门（版本一致 / 署名 / 仓库地址 / 验签等）。
+    # 放在签名之后跑：验签项这时才拿得到 .sig；任一条非 0 即"产物不合格"，不上传。
+    for cmd in (cfg.get('preflight') or []):
+        run(cmd, root)
+        log('闸门通过: %s' % cmd)
 
     ck = cfg.get('checksums') or {}
     files = list(outputs) + list((sign.get('outputs') or []))
@@ -417,6 +455,10 @@ def main():
         return
 
     notes = a.notes
+    if not notes:
+        rn = os.path.join(root, 'docs', 'release-notes.md')
+        if os.path.isfile(rn):
+            notes = io.open(rn, encoding='utf-8-sig').read().strip()
     if not notes:
         notes = '%s %s' % (name, tag)
 

@@ -1,6 +1,6 @@
 name: release
 
-# 通用「云端发版」——构建、签名、双平台上传、回写升级源全部在 runner 上完成。
+# 通用「云端发版」——构建、签名、上传 GitHub、回写升级源全部在 runner 上完成。
 # 本机只负责把源码 push 上来，不再上传任何产物。
 #
 # 这份文件对所有 Windows 项目**完全一样**，不要为单个项目改它。
@@ -8,11 +8,14 @@ name: release
 #
 # 触发方式：仓库 Actions 页面 → release → Run workflow。
 # 需要先在该仓库配好 secrets（Settings → Secrets and variables → Actions）：
-#   GITCODE_TOKEN     往 GitCode 发版必需（国内主源）
+#   GITCODE_TOKEN     GitCode 已降为纯 Pull 被动镜像，不再上传附件，此 secret 仅占位兼容、可不配
 #   RELEASE_SIGN_KEY  需要签名的项目必需；不需要签名的项目留空即可
 # GITHUB_TOKEN 由 Actions 自动提供，不用配。
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       notes:
