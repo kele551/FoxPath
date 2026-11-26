@@ -478,7 +478,7 @@ def main():
             log('GitHub 跳过（没有 GITHUB_TOKEN）')
 
     back = cfg.get('commit_back') or []
-    if back:
+    if back and not a.skip_publish:
         changed = [f for f in back if os.path.isfile(os.path.join(root, f))]
         if changed:
             run('git add %s' % ' '.join('"%s"' % f for f in changed), root)
@@ -492,6 +492,8 @@ def main():
                 log('升级源已回写并提交到 %s（此刻起线上才提示升级）' % branch)
             else:
                 log('升级源没有变化，跳过提交')
+    elif back:
+        log('--skip-publish：不回写升级源到 %s（避免未发布的指纹污染线上升级链）' % branch)
     if not a.skip_publish and tag:
         verify_platforms(pub, tag, name)
     log('=== 完成: %s %s ===' % (name, tag))
