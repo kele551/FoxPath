@@ -584,8 +584,8 @@ def verify_signature(vj, vsig):
     # 带一个时间戳参数是防 CDN 给回半新半旧的缓存。
     bust = int(time.time())
     gh_base = 'https://raw.githubusercontent.com/%s/%s/%s' % (OWNER, REPO, BRANCH)
-    for label, mk in (
-            ('GitHub', lambda f: '%s/%s?v=%d' % (gh_base, f, bust))):
+    for label, mk in [
+            ('GitHub', lambda f: '%s/%s?v=%d' % (gh_base, f, bust))]:
         raw = _download(mk('version.json'), SOCK_TMO, 3, deadline=120,
                         label='%s version.json' % label)
         sig_raw = _download(mk('version.json.sig'), SOCK_TMO, 3, deadline=120,
